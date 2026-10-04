@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { getPins, getSchedules, getWeek, masked, rescan, setMasked } from './api.js'
+import { getPins, getSchedules, getUpdate, getWeek, installUpdate, masked, rescan, setMasked } from './api.js'
 import { addDays, startOfDay, weekStart } from './layout.js'
 import { lang, locale, setLang, t } from './i18n.js'
 import { CALENDAR_VIEWS, formatRoute, parseRoute } from './route.js'
@@ -158,6 +158,53 @@ watch(selectedId, (id) => {
 const now = ref(Date.now())
 // 読み直した回数。集計とサイドバーはこれを見て取り直す（週の範囲が変わらなくても数字は変わる）
 const version = ref(0)
+
+// 新しい版。あればヘッダーに出し、押したら入れ替えて（systemd の下なら）再起動を待って読み込み直す
+const updateInfo = ref(null)
+const updating = ref('')
+async function loadUpdate() {
+  try {
+    updateInfo.value = await getUpdate()
+  } catch {
+    // 確かめられなくても画面は使える
+  }
+}
+async function doUpdate() {
+  // 押した時点の状態で判定する（前に取った「エージェントが動いている」のままで断らない）
+  await loadUpdate()
+  const u = updateInfo.value
+  if (!u?.newer) return
+  const blocked = u.blocked && t(`update.${u.blocked}`)
+  if (blocked) return window.alert(blocked)
+  if (!window.confirm(t('update.confirm', { v: u.latest.version }))) return
+  updating.value = t('update.installing')
+  try {
+    const r = await installUpdate()
+    if (!r.restarting) {
+      updating.value = ''
+      return window.alert(t('update.restartYourself', { v: r.installed }))
+    }
+    updating.value = t('update.restarting')
+    // 再起動して新しい版が答えるまで待つ
+    for (;;) {
+      await new Promise((ok) => setTimeout(ok, 2000))
+      const now = await getUpdate().catch(() => null)
+      if (now?.current === r.installed) return location.reload()
+    }
+  } catch (e) {
+    updating.value = ''
+    window.alert(String(e.message ?? e))
+  }
+}
+onMounted(loadUpdate)
+const updateTimer = setInterval(loadUpdate, 30 * 60 * 1000)
+onUnmounted(() => clearInterval(updateTimer))
+
+// セッションを開く。tab を渡したらそのタブで（「ここで始める」から開くときは会話）
+function openSession(id, tab) {
+  selectedId.value = id
+  if (tab) detailTab.value = tab
+}
 
 // ピン留めした会話（サイドバーの上）
 const pins = ref([])
@@ -319,6 +366,9 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
       <button class="icon-btn" :title="t('reload')" :aria-label="t('reload')" :disabled="loading" @click="reload">
         <span :class="{ spin: loading }">↻</span>
       </button>
+      <button v-if="updateInfo?.newer" class="btn small update" :title="updateInfo.latest.page" @click="doUpdate">
+        {{ updating || t('update.available', { v: updateInfo.latest.version }) }}
+      </button>
       <button
         class="icon-btn mask"
         :class="{ on: masked }"
@@ -418,7 +468,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
           v-model:owner="repoOwner"
           :version="version"
           :colors="data.repos"
-          @open-session="(id) => (selectedId = id)"
+          @open-session="openSession"
           @open-settings="showSettings = true"
           @changed="load"
         />
@@ -449,6 +499,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
 .brand{display:flex; align-items:center; gap:10px; margin-right:24px; padding:4px 8px 4px 4px; border:0; border-radius:8px; background:none; color:inherit; font:inherit; cursor:pointer}
 .brand:hover{background:var(--hover)}
 .icon-btn.mask.on{background:var(--accent-soft); color:var(--accent)}
+.btn.small.update{height:30px; padding:0 12px; font-size:13px; color:var(--accent); border-color:var(--accent)}
 /* ロゴ（タブのアイコンと同じ絵）: 紫のカレンダーの用紙に、プロンプト「>」から AI の光へ流れる日付のマス。文字は黒・やや太め */
 .logo{display:block; width:32px; height:32px}
 .name{font-size:22px; color:#111; font-weight:600; letter-spacing:-.01em}

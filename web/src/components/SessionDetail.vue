@@ -210,8 +210,11 @@ watch(
         </button>
         <button class="btn" @click="copy">{{ copied ? t('detail.copied') : t('detail.copy') }}</button>
       </div>
+      <!-- 端末で開いているセッションは裏で重ねて開かない（同じ記録に 2 か所から書く）。端末の /remote-control なら続けられる -->
+      <p v-if="isClaude && running === 'interactive' && !resume" class="muted small">{{ t('detail.openInTerminal') }}</p>
       <div v-if="resume" class="resume">
-        <span v-if="resume.error" class="chip warn">{{ resume.error }}</span>
+        <span v-if="resume.error && /open in a terminal/.test(resume.error)" class="muted small">{{ t('detail.openInTerminal') }}</span>
+        <span v-else-if="resume.error" class="chip warn">{{ resume.error }}</span>
         <template v-else>
           <span class="chip wip">{{ resume.status === 'running' ? t('detail.alreadyRunning') : t('detail.started') }}</span>
           <a v-if="resume.url" :href="resume.url" target="_blank" rel="noopener">{{ t('detail.openInClaude') }}</a>
@@ -232,7 +235,15 @@ watch(
       </nav>
 
       <Changes v-if="tab === 'changes' && !s.machine" :id="s.id" :commits="s.commits" :github="s.github" class="conv" />
-      <Conversation v-else-if="tab === 'conversation'" :id="s.id" :key="convKey" :blocked="blocked" class="conv" @sent="load(s.id)" />
+      <Conversation
+        v-else-if="tab === 'conversation'"
+        :id="s.id"
+        :key="convKey"
+        :blocked="blocked"
+        :following="!!s.sending"
+        class="conv"
+        @sent="load(s.id)"
+      />
       <template v-else>
       <h3 class="section-title">
         {{ t('detail.summary') }}

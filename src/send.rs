@@ -337,6 +337,8 @@ pub fn rule_label((tool, content): &(String, Option<String>)) -> String {
 pub struct Running {
     set: Arc<Mutex<HashSet<String>>>,
     pending: Arc<Mutex<HashMap<String, Pending>>>,
+    /// 本体を入れ替えている最中。新しい実行を受け付けない（入れ替えのあとの再起動で途中で切れるので）
+    updating: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// 答えを待っている許可の問い合わせ
@@ -354,10 +356,54 @@ impl Running {
     /// 印を付ける。すでに付いていれば None。戻り値を手放すと印が外れる
     pub fn claim(&self, id: &str) -> Option<Claim> {
         let mut set = self.set.lock().unwrap_or_else(|e| e.into_inner());
+        // 入れ替えの判定と同じ鍵の中で見る（判定と新しい実行が入れ違わないように）
+        if self.updating() {
+            return None;
+        }
         set.insert(id.to_string()).then(|| Claim {
             set: self.set.clone(),
             id: id.to_string(),
         })
+    }
+
+    pub fn updating(&self) -> bool {
+        self.updating.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 本体の入れ替えを始める。何も動いていなければ、以後の新しい実行を止めて true。
+    /// 動いていれば何も変えずに false。判定と止める切り替えは、実行の印と同じ鍵の中で行う
+    pub fn begin_update(&self) -> bool {
+        let set = self.set.lock().unwrap_or_else(|e| e.into_inner());
+        let idle = set.is_empty()
+            && self
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty();
+        if idle {
+            self.updating
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        idle
+    }
+
+    /// 入れ替えをやめた・再起動しないときに、実行の受け付けを戻す
+    pub fn end_update(&self) {
+        self.updating
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 何も動いていない（実行中の指示も、答えを待っている問い合わせも無い）。入れ替えて再起動してよいか
+    pub fn idle(&self) -> bool {
+        self.set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+            && self
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
     }
 
     pub fn contains(&self, id: &str) -> bool {
@@ -487,6 +533,9 @@ pub fn start(
     };
     let Some(claim) = running.claim(&job.id) else {
         discard(&job.cleanup);
+        if running.updating() {
+            bail!("Agent Calendar is updating; try again in a minute");
+        }
         bail!("an instruction is already running for this session");
     };
     let spawned = tokio::process::Command::new(&job.program)
@@ -1061,6 +1110,21 @@ read rest || true"#,
             assert_eq!(rest[1]["ok"], true);
         }
         assert!(running.answer("never", true, false).is_err());
+        assert!(running.idle());
+        let held = running.claim("busy").unwrap();
+        assert!(!running.idle());
+        // 動いているあいだは入れ替えを始めない
+        assert!(!running.begin_update());
+        drop(held);
+        assert!(running.idle());
+        // 入れ替えを始めたら、新しい実行は受け付けない。やめたら戻る
+        assert!(running.begin_update());
+        assert!(running.claim("new").is_none());
+        let refused =
+            start(&running, job(&script, "s-up", &dir, String::new()), || {}).unwrap_err();
+        assert!(refused.to_string().contains("updating"));
+        running.end_update();
+        assert!(running.claim("new").is_some());
     }
 
     #[tokio::test]

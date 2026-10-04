@@ -23,7 +23,13 @@ tmp="$(mktemp -d)"
 trap 'rm -r "$tmp"' EXIT
 
 echo "downloading $url"
-curl -fsSL "$url" -o "$tmp/agent-calendar.tar.gz"
+if ! curl -fsSL "$url" -o "$tmp/agent-calendar.tar.gz"; then
+  echo "error: could not download a release for $target." >&2
+  echo "If no release has been published yet, build from source instead:" >&2
+  echo "  git clone https://github.com/$repo && cd agent-calendar" >&2
+  echo "  (cd web && npm ci && npm run build) && cargo install --path ." >&2
+  exit 1
+fi
 tar xzf "$tmp/agent-calendar.tar.gz" -C "$tmp"
 mkdir -p "$dir"
 install -m 755 "$tmp/agent-calendar-$target/agent-calendar" "$dir/agent-calendar"

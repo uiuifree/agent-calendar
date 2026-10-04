@@ -46,10 +46,14 @@ jobs:
           mkdir "$name"
           cp target/${{ matrix.target }}/release/agent-calendar README.md README.ja.md LICENSE-MIT LICENSE-APACHE "$name"/
           tar czf "$name.tar.gz" "$name"
+          # 画面の「更新する」と agent-calendar update は、これで取ってきた配布物を確かめてから入れ替える
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: agent-calendar-${{ matrix.target }}
-          path: agent-calendar-${{ matrix.target }}.tar.gz
+          path: |
+            agent-calendar-${{ matrix.target }}.tar.gz
+            agent-calendar-${{ matrix.target }}.tar.gz.sha256
 
   # 4 つのビルドが並んで下書きを作ると下書きが重複するので、1 つのジョブでまとめて置く
   release:
@@ -63,4 +67,6 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           draft: true
-          files: dist/*.tar.gz
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256

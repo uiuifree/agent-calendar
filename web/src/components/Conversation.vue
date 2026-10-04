@@ -11,6 +11,8 @@ const props = defineProps({
   id: { type: String, required: true },
   // 送れないときの理由（null なら送れる）
   blocked: { type: String, default: null },
+  // ほかの画面（「ここで始める」や別のタブ）から実行中。数秒おきに履歴を読み直して進み具合を見せる
+  following: { type: Boolean, default: false },
 })
 const emit = defineEmits(['sent'])
 
@@ -26,9 +28,14 @@ async function load(scroll = true) {
   error.value = ''
   try {
     const r = await getTranscript(props.id)
-    items.value = r.items
+    // 古い履歴を読み足していたら、その分は残す（読み直しで消さない）
+    if (!scroll && start.value < r.start && items.value.length) {
+      items.value = [...items.value.slice(0, r.start - start.value), ...r.items]
+    } else {
+      items.value = r.items
+      start.value = r.start
+    }
     total.value = r.total
-    start.value = r.start
     if (scroll) {
       await nextTick()
       list.value?.scrollTo({ top: list.value.scrollHeight })
@@ -59,6 +66,23 @@ async function older() {
 }
 
 watch(() => props.id, () => load(), { immediate: true })
+
+// 実行中は履歴を読み直す。いちばん下を見ているときだけ、新しい発言に合わせて下へ送る
+let follow = null
+async function refresh() {
+  const el = list.value
+  const atBottom = !el || el.scrollHeight - el.scrollTop - el.clientHeight < 80
+  await load(false)
+  if (atBottom) await scrollDown()
+}
+watch(
+  () => props.following,
+  (on) => {
+    clearInterval(follow)
+    follow = on ? setInterval(refresh, 3000) : null
+  },
+  { immediate: true },
+)
 
 // 送る
 const prompt = ref('')
@@ -108,7 +132,10 @@ async function pollAsks() {
 }
 const askTimer = setInterval(pollAsks, 3000)
 watch(() => props.id, pollAsks, { immediate: true })
-onUnmounted(() => clearInterval(askTimer))
+onUnmounted(() => {
+  clearInterval(askTimer)
+  clearInterval(follow)
+})
 
 async function send() {
   if (!canSend.value) return

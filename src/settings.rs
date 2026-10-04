@@ -19,6 +19,16 @@ pub struct Settings {
     /// 手元のリポジトリを探すフォルダ（直下の git リポジトリを見る）。clone もこの中に置く
     #[serde(default)]
     pub repo_roots: Vec<String>,
+    /// 1 日 1 回、新しい版が出ていないか GitHub に確かめる（出ていれば画面に知らせる）
+    #[serde(default = "yes")]
+    pub update_check: bool,
+    /// 新しい版があれば、エージェントが何も動いていないときに勝手に入れ替えて再起動する
+    #[serde(default)]
+    pub auto_update: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// 組織・フォルダはそれぞれこの数まで
@@ -33,6 +43,8 @@ impl Default for Settings {
             summary_minutes: 60,
             github_owners: Vec::new(),
             repo_roots: Vec::new(),
+            update_check: true,
+            auto_update: false,
         }
     }
 }
@@ -168,6 +180,8 @@ mod tests {
             summary_minutes: 120,
             github_owners: vec!["uiuifree".into(), "my-org".into()],
             repo_roots: vec![root.to_string_lossy().into_owned()],
+            update_check: false,
+            auto_update: true,
         };
         save(&conn, &mine).unwrap();
         assert_eq!(load(&conn).unwrap(), mine);
@@ -232,6 +246,8 @@ mod tests {
         .unwrap();
         let old = load(&conn).unwrap();
         assert_eq!((old.start_hour, old.github_owners.len()), (9, 0));
+        // 前の版の設定には更新の項目が無い。確認だけオン・入れ替えはオフで読む
+        assert!(old.update_check && !old.auto_update);
         conn.execute("UPDATE settings SET value = 'broken'", [])
             .unwrap();
         assert_eq!(load(&conn).unwrap(), Settings::default());

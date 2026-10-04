@@ -7,11 +7,12 @@ import { MAX_IMAGES, pickImages, toPayload } from '../images.js'
 import { renderMarkdown } from '../markdown.js'
 import PermissionAsk from './PermissionAsk.vue'
 
-// リポジトリで新しいセッションを始める。途中経過を出し、終わったらできたセッションを開ける
+// リポジトリで新しいセッションを始める。始まったら（セッションの ID が届いたら）ダイアログを閉じて、
+// カレンダーでセッションを押したときと同じく右のパネルに会話を開く。実行は裏で続き、会話の画面で進み具合と許可の確認を見る
 const props = defineProps({
   repo: { type: Object, required: true }, // { name, local, … }
 })
-const emit = defineEmits(['close', 'opened', 'ran'])
+const emit = defineEmits(['close', 'opened', 'ran', 'failed'])
 useEscape(() => emit('close'))
 
 const agent = ref('claude')
@@ -63,7 +64,10 @@ async function run() {
       branch: branch.value.trim(),
     }
     await startSession(input, (ev) => {
-      if (ev.kind === 'session') sessionId.value = ev.id
+      if (ev.kind === 'session') {
+        sessionId.value = ev.id
+        emit('opened', ev.id)
+      }
       else if (ev.kind === 'worktree') workspace.value = ev
       else live.value.push(ev)
     })
@@ -72,6 +76,9 @@ async function run() {
   } finally {
     running.value = false
     finished.value = true
+    // 会話の画面へ移ったあと（ダイアログは隠れている）に失敗したら、理由を親に渡して見えるところに出す
+    const end = live.value.at(-1)
+    if (sessionId.value && end?.kind === 'done' && !end.ok) emit('failed', end.text ?? '')
     emit('ran')
   }
 }
@@ -137,8 +144,7 @@ function onKey(e) {
 
       <div class="actions">
         <button class="btn" @click="emit('close')">{{ t('repos.close') }}</button>
-        <button v-if="finished && sessionId" class="btn primary" @click="emit('opened', sessionId)">{{ t('repos.openSession') }}</button>
-        <button v-else class="btn primary" :disabled="!canRun" @click="run">{{ running ? t('repos.running') : t('repos.run') }}</button>
+        <button class="btn primary" :disabled="!canRun" @click="run">{{ running ? t('repos.running') : t('repos.run') }}</button>
       </div>
     </div>
   </div>

@@ -71,6 +71,13 @@ agent-calendar serve
 
 and open <http://127.0.0.1:8082/>.
 
+### Updates
+
+Agent Calendar checks GitHub Releases once a day and shows **Update to vX.Y.Z** in the header when a new version is out.
+Clicking it downloads the release for your machine, verifies it against the published sha256, replaces the binary and
+restarts the service (when it runs under systemd). Updates never start while an agent is running. You can also turn on
+automatic updates in Settings, or run `agent-calendar update` (`--check` to only look). Builds from source are not replaced.
+
 ### From source
 
 ```sh

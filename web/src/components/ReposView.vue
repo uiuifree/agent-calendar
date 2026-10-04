@@ -1,6 +1,6 @@
 <script setup>
 import { computed, ref, watch } from 'vue'
-import { cloneRepo, getRepoSessions, getRepos, rescan } from '../api.js'
+import { cloneRepo, getRepoSessions, getRepos, getSession, rescan } from '../api.js'
 import { locale, t } from '../i18n.js'
 import { DAY_MS } from '../layout.js'
 import { repoColor } from '../colors.js'
@@ -22,6 +22,15 @@ const query = ref('')
 const cloneRoot = ref('')
 const cloning = ref(null) // clone 中のリポジトリ（owner/name）
 const starting = ref(null) // 「ここで始める」を開いているリポジトリ
+// 始まって会話の画面へ移ったあとも、終わるまではダイアログを隠したまま残す（終わりの失敗の理由を受け取るため）
+const startHidden = ref(false)
+function closeStart() {
+  starting.value = null
+  startHidden.value = false
+}
+function startFailed(text) {
+  error.value = t('repos.startFailed', { e: text })
+}
 
 const owner = computed({ get: () => props.owner, set: (o) => emit('update:owner', o) })
 
@@ -101,16 +110,21 @@ async function clone(r) {
   }
 }
 
-// できたセッションを開く。終わった直後はまだ読み直しが済んでいないことがあるので、先に読み直す
+// できたセッションを開く。始まった直後や終わった直後は、まだ記録を読み直していないことがあるので、
+// 読み直してセッションが見えるまで少し待つ（記録が書き出されるまで最大 10 秒）
 async function opened(id) {
-  starting.value = null
-  try {
-    await rescan()
-  } catch (e) {
-    error.value = String(e.message ?? e)
+  startHidden.value = true
+  for (let i = 0; i < 10; i++) {
+    try {
+      await rescan()
+      await getSession(id)
+      break
+    } catch {
+      await new Promise((ok) => setTimeout(ok, 1000))
+    }
   }
   emit('changed')
-  emit('open-session', id)
+  emit('open-session', id, 'conversation')
 }
 </script>
 
@@ -168,8 +182,8 @@ async function opened(id) {
               </span>
               <span v-if="r.description" class="desc">{{ r.description }}</span>
             </span>
-            <a v-if="r.pushed_at" class="num date link" :class="{ fresh: fresh(Date.parse(r.pushed_at)) }" :href="`${r.url}/commits`" target="_blank" rel="noopener noreferrer" :title="t('repos.commits')">{{ day(Date.parse(r.pushed_at)) }}</a>
-            <span v-else class="muted">—</span>
+            <a v-if="r.pushed_at" class="num date link pushed" :class="{ fresh: fresh(Date.parse(r.pushed_at)) }" :href="`${r.url}/commits`" target="_blank" rel="noopener noreferrer" :title="t('repos.commits')">{{ day(Date.parse(r.pushed_at)) }}</a>
+            <span v-else class="muted pushed">—</span>
             <span class="acts">
               <button v-if="r.sessions" class="link-btn" :aria-expanded="openRepo === r.local" @click="toggleSessions(r)">
                 {{ t('repos.sessions', { n: r.sessions }) }} {{ openRepo === r.local ? '▾' : '▸' }}
@@ -205,8 +219,8 @@ async function opened(id) {
               </span>
               <span v-if="r.description" class="desc">{{ r.description }}</span>
             </span>
-            <a v-if="r.pushed_at" class="num date link" :class="{ fresh: fresh(Date.parse(r.pushed_at)) }" :href="`${r.url}/commits`" target="_blank" rel="noopener noreferrer" :title="t('repos.commits')">{{ day(Date.parse(r.pushed_at)) }}</a>
-            <span v-else class="muted">—</span>
+            <a v-if="r.pushed_at" class="num date link pushed" :class="{ fresh: fresh(Date.parse(r.pushed_at)) }" :href="`${r.url}/commits`" target="_blank" rel="noopener noreferrer" :title="t('repos.commits')">{{ day(Date.parse(r.pushed_at)) }}</a>
+            <span v-else class="muted pushed">—</span>
             <button class="btn small" :disabled="!cloneRoot || cloning !== null" @click="clone(r)">
               {{ cloning === `${r.owner}/${r.name}` ? t('repos.cloning') : t('repos.clone') }}
             </button>
@@ -214,12 +228,20 @@ async function opened(id) {
         </div>
       </template>
     </template>
-    <StartDialog v-if="starting" :repo="starting" @close="starting = null" @opened="opened" @ran="emit('changed')" />
+    <StartDialog
+      v-if="starting"
+      v-show="!startHidden"
+      :repo="starting"
+      @close="startHidden || closeStart()"
+      @opened="opened"
+      @failed="startFailed"
+      @ran="startHidden ? closeStart() : emit('changed')"
+    />
   </div>
 </template>
 
 <style scoped>
-.repos{max-width:960px}
+.repos{max-width:960px; container-type:inline-size}
 .owners{display:flex; gap:4px; flex-wrap:wrap; border-bottom:1px solid var(--rule); margin:4px 0 12px}
 .owners button{border:0; background:none; padding:8px 16px; color:var(--muted); font-weight:500; border-bottom:3px solid transparent; margin-bottom:-1px}
 .owners button.on{color:var(--accent); border-bottom-color:var(--accent)}
@@ -257,6 +279,14 @@ async function opened(id) {
 .date.link:hover{color:var(--accent); text-decoration:underline}
 .btn.small{height:30px; padding:0 12px; font-size:13px}
 .acts{display:flex; align-items:center; gap:12px}
+/* 右にパネルが出るなどして表が狭いときは、GitHub の更新日を名前の下に回し、ボタンを右にまとめる（名前の列を潰さない） */
+@container (max-width: 680px){
+  .row{grid-template-columns:minmax(0, 1fr) auto; row-gap:2px}
+  .row.head > :nth-child(2){display:none}
+  .row .pushed{grid-column:1; grid-row:2; font-size:12px; padding-left:18px}
+  .row > :last-child{grid-column:2; grid-row:1 / span 2}
+  .acts{flex-direction:column; align-items:flex-end; gap:6px}
+}
 .link-btn{border:0; background:none; padding:0; font:inherit; font-size:13px; color:var(--accent); cursor:pointer}
 .link-btn:hover{text-decoration:underline}
 .sessions{border-top:1px solid var(--rule-soft); padding:4px 16px 8px 34px; max-height:360px; overflow-y:auto}

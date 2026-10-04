@@ -146,6 +146,11 @@ fn one_with(conn: &Connection, id: &str, model: &str, lang: Lang, claude: &str) 
 /// 二重に作らない（Claude を 2 回呼ぶうえ、古い内容で作ったほうが後から上書きしうる）
 static BUSY: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
+/// いま要約を作っているか（本体の入れ替えは、作り終わるまで待つ）
+pub fn busy() -> bool {
+    !BUSY.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+}
+
 /// 印を付ける。すでに付いていれば None。戻り値を手放すと外れる
 fn claim(id: &str) -> Option<Busy> {
     let mut busy = BUSY.lock().unwrap_or_else(|e| e.into_inner());
@@ -393,6 +398,7 @@ mod tests {
         assert!(one_with(&conn, "live", "sonnet", Lang::Ja, &ok).is_ok());
         // 作っている最中（裏の自動の要約など）なら断る。終われば外れる
         let held = claim("live").unwrap();
+        assert!(busy());
         assert!(claim("live").is_none());
         assert!(one_with(&conn, "live", "sonnet", Lang::Ja, &ok).is_err());
         drop(held);

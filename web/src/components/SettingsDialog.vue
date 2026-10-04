@@ -1,6 +1,6 @@
 <script setup>
 import { onMounted, ref } from 'vue'
-import { getSettings, saveSettings } from '../api.js'
+import { checkUpdate, getSettings, getUpdate, saveSettings } from '../api.js'
 import { useEscape } from '../dialog.js'
 import { locale, t } from '../i18n.js'
 
@@ -24,7 +24,24 @@ const SUMMARY = [15, 30, 60, 120, 180, 360]
 const hourLabel = (h) => `${h}:00`
 const span = (m) => (m < 60 ? t('settings.minutes', { n: m }) : t('settings.hourUnit', { n: m / 60 }))
 
+// 版: いまの版と、確かめた最新の版
+const version = ref(null)
+const checking = ref(false)
+async function checkNow() {
+  checking.value = true
+  try {
+    version.value = await checkUpdate()
+  } catch (e) {
+    error.value = String(e.message ?? e)
+  } finally {
+    checking.value = false
+  }
+}
+
 onMounted(async () => {
+  getUpdate()
+    .then((v) => (version.value = v))
+    .catch(() => {})
   try {
     const r = await getSettings()
     form.value = { ...r.settings }
@@ -91,6 +108,18 @@ async function save() {
           <textarea v-model="roots" rows="3" spellcheck="false" placeholder="/home/me/projects" />
           <small class="muted">{{ t('settings.rootsHint') }}</small>
         </label>
+        <div class="field">
+          <span>{{ t('settings.updates') }}</span>
+          <label class="check"><input v-model="form.update_check" type="checkbox" /> {{ t('settings.updateCheck') }}</label>
+          <label class="check"><input v-model="form.auto_update" type="checkbox" /> {{ t('settings.autoUpdate') }}</label>
+          <span class="row small muted">
+            <span v-if="version">
+              {{ t('settings.version', { current: version.current, latest: version.latest?.version ?? '—' }) }}
+              <template v-if="version.error"> · {{ /no release/.test(version.error) ? t('settings.noRelease') : version.error }}</template>
+            </span>
+            <button class="btn tiny" type="button" :disabled="checking" @click="checkNow">{{ t('settings.checkNow') }}</button>
+          </span>
+        </div>
         <div class="actions">
           <button class="btn" @click="emit('close')">{{ t('settings.cancel') }}</button>
           <button class="btn primary" @click="save">{{ saved ? t('settings.saved') : t('settings.save') }}</button>
@@ -112,5 +141,8 @@ select{height:36px; border:1px solid var(--outline); border-radius:8px; padding:
 input,textarea{border:1px solid var(--outline); border-radius:8px; padding:8px 10px; font:inherit; background:var(--ground)}
 textarea{resize:vertical; font-family:"Roboto Mono","Noto Sans Mono CJK JP",monospace; font-size:13px}
 small{font-size:12px; line-height:1.5}
+.check{display:flex; align-items:center; gap:8px; font-size:14px}
+.small{font-size:12px}
+.btn.tiny{height:26px; padding:0 10px; font-size:12px}
 .actions{display:flex; justify-content:flex-end; gap:8px; margin-top:8px}
 </style>

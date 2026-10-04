@@ -59,6 +59,10 @@ export const setPin = (id, pinned) => post(`/api/session/${encodeURIComponent(id
 export const summarizeSession = (id) => post(`/api/session/${encodeURIComponent(id)}/summarize`)
 export const getSettings = () => j('/api/settings')
 export const saveSettings = (s) => post('/api/settings', s)
+// 新しい版: 確かめた結果・今すぐ確かめる・入れ替える（systemd の下なら再起動する）
+export const getUpdate = () => j('/api/update')
+export const checkUpdate = () => post('/api/update/check')
+export const installUpdate = () => post('/api/update/install')
 // 会話の履歴。新しい側から limit 件。end を渡すとそれより前（古い側）
 export const getTranscript = (id, end = null, limit = 200) =>
   j(`/api/session/${encodeURIComponent(id)}/transcript?limit=${limit}${end == null ? '' : `&end=${end}`}`)

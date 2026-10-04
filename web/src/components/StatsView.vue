@@ -121,7 +121,7 @@ async function assign(repo, ev) {
 </template>
 
 <style scoped>
-.stats{max-width:960px; padding-top:8px}
+.stats{max-width:960px; padding-top:8px; container-type:inline-size}
 .bar{display:flex; align-items:center; gap:12px; margin-bottom:16px}
 .label{font-size:16px; color:var(--ink)}
 .segmented{display:inline-flex; border:1px solid var(--outline); border-radius:18px; overflow:hidden}
@@ -138,4 +138,13 @@ async function assign(repo, ev) {
 .assign{width:10em; height:30px; border:1px solid var(--rule); border-radius:6px; background:var(--ground); padding:0 8px}
 .assign:focus{border-color:var(--accent); outline:none}
 .foot{font-size:12px; margin-top:20px; line-height:1.7}
+/* 数字は折り返さない（「40.3 時間」が 2 行に割れないように） */
+.r{white-space:nowrap}
+.repo td:first-child{white-space:nowrap}
+/* 右にパネルが出るなどして狭いときは、セッション数の列を省き、割り当ての欄を縮める（右にはみ出さない） */
+@container (max-width: 680px){
+  .table th:nth-child(3), .table td:nth-child(3){display:none}
+  .assign{width:7.5em}
+  .cards .card{min-width:0; flex:1}
+}
 </style>

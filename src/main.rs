@@ -22,6 +22,7 @@ mod share;
 mod stats;
 mod summarize;
 mod transcript;
+mod update;
 
 use anyhow::{Result, bail};
 
@@ -47,6 +48,9 @@ USAGE:
     agent-calendar remote add '<connection string>' [--name ai-node]   on this machine: register it
     agent-calendar remote list | remote remove <name>
 
+  Updates (from GitHub Releases, verified with the published sha256):
+    agent-calendar update [--check]        install the latest release, or only show whether one is available
+
 The summary language defaults to Japanese when $LANG starts with \"ja\", English otherwise.
 ";
 
@@ -58,6 +62,11 @@ async fn main() -> Result<()> {
         return Ok(());
     };
     match cmd.as_str() {
+        "update" => {
+            // 通信は blocking の client なので、非同期の外で行う
+            let only_check = args.iter().any(|a| a == "--check");
+            tokio::task::spawn_blocking(move || run_update(only_check)).await??;
+        }
         "scan" => {
             let mut conn = db::open()?;
             let n = scan::run(&mut conn)?;
@@ -119,4 +128,30 @@ pub fn opt(args: &[String], flag: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1))
         .filter(|v| !v.starts_with("--"))
         .cloned()
+}
+
+/// `agent-calendar update [--check]`: 最新のリリースを確かめ、新しければ（--check でなければ）入れ替える
+fn run_update(only_check: bool) -> Result<()> {
+    let latest = update::check()?;
+    println!(
+        "installed {} / latest {} ({})",
+        update::CURRENT,
+        latest.version,
+        latest.page
+    );
+    if !update::is_newer(&latest.version, update::CURRENT) {
+        println!("already up to date");
+        return Ok(());
+    }
+    if only_check {
+        return Ok(());
+    }
+    let work = std::env::temp_dir().join(format!("agent-calendar-update-{}", std::process::id()));
+    let exe = update::install(&latest, &work)?;
+    println!(
+        "updated {} to {}. restart it (Linux: systemctl --user restart agent-calendar)",
+        exe.display(),
+        latest.version
+    );
+    Ok(())
 }

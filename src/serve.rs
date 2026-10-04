@@ -1,6 +1,6 @@
 use crate::{
     db, diff, github, opt, pins, pricing, remote, repo, resume, scan, schedule, send, settings,
-    stats, summarize, transcript,
+    stats, summarize, transcript, update,
 };
 use anyhow::{Context, Result};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -36,8 +36,203 @@ struct App {
     summary: Option<SummarizeOpts>,
     /// 画面から指示を送って実行中のセッション
     running: send::Running,
+    /// 新しい版の確認の結果（画面に知らせる）
+    update: Mutex<UpdateState>,
     /// gh で取った組織ごとのリポジトリの一覧（取った時刻つき）。画面を切り替えるたびに GitHub へ行かないように
     gh_cache: Mutex<HashMap<String, (std::time::Instant, Vec<github::Remote>)>>,
+}
+
+/// 新しい版の確認の結果
+#[derive(Default, Clone, Serialize)]
+struct UpdateState {
+    latest: Option<update::Latest>,
+    /// 確かめた時刻（unix ミリ秒）
+    checked_at: Option<i64>,
+    error: Option<String>,
+    /// 入れ替えたが、まだ再起動していない（systemd の外で動いているとき）
+    installed: Option<String>,
+}
+
+/// 新しい版を確かめる間隔と、確かめるかどうかを見る間隔
+const UPDATE_EVERY: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+const UPDATE_TICK: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// systemd のサービスとして動いているか（それなら、終われば systemd が新しい本体で起こし直す）
+fn under_systemd() -> bool {
+    std::env::var_os("INVOCATION_ID").is_some()
+}
+
+/// 確かめて結果を残す
+async fn check_update(app: &App) -> UpdateState {
+    let got = tokio::task::spawn_blocking(update::check).await;
+    let mut st = app.update.lock().unwrap_or_else(|e| e.into_inner());
+    st.checked_at = Some(chrono::Utc::now().timestamp_millis());
+    match got {
+        Ok(Ok(latest)) => {
+            st.latest = Some(latest);
+            st.error = None;
+        }
+        Ok(Err(e)) => st.error = Some(format!("{e:#}")),
+        Err(e) => st.error = Some(e.to_string()),
+    }
+    st.clone()
+}
+
+/// 入れ替えてよいか。だめなら理由（開発中のビルド・このマシン向けの配布物が無い・エージェントが動いている）
+fn install_blocker(app: &App, latest: &update::Latest) -> Option<&'static str> {
+    let exe = std::env::current_exe().unwrap_or_default();
+    if update::dev_build(&exe) {
+        return Some("dev");
+    }
+    if latest.asset.is_none() || latest.checksum.is_none() {
+        return Some("no_asset");
+    }
+    if !app.running.idle() || summarize::busy() {
+        return Some("busy");
+    }
+    None
+}
+
+/// 入れ替える。systemd の下なら少し待って終わり、新しい本体で起こし直してもらう。戻り値は再起動するか
+async fn install_update(app: Shared, latest: update::Latest) -> Result<bool> {
+    let work = db::path()
+        .parent()
+        .map(|p| p.join("update"))
+        .unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&work);
+    // ここから再起動までは新しい実行を受け付けない（動いていれば始めない）
+    if !app.running.begin_update() {
+        anyhow::bail!("an agent is running; try again when it has finished");
+    }
+    let l = latest.clone();
+    let installed = tokio::task::spawn_blocking(move || update::install(&l, &work)).await;
+    if !matches!(installed, Ok(Ok(_))) {
+        app.running.end_update();
+    }
+    installed??;
+    println!("[update] installed {}", latest.version);
+    let restart = under_systemd();
+    if !restart {
+        // 再起動しないなら、いまの本体のまま受け付けを戻す（入れ替えは次の起動から効く）
+        app.running.end_update();
+    }
+    if restart {
+        tokio::spawn(async {
+            // 画面に「再起動しています」を返し終えてから終わる
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            std::process::exit(0);
+        });
+    } else {
+        app.update
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .installed = Some(latest.version);
+    }
+    Ok(restart)
+}
+
+/// 1 日 1 回、新しい版を確かめる。「自動で入れ替える」がオンで、何も動いていなければ入れ替える
+async fn update_loop(app: Shared) {
+    loop {
+        let set = app
+            .db
+            .lock()
+            .ok()
+            .and_then(|c| settings::load(&c).ok())
+            .unwrap_or_default();
+        let due = app
+            .update
+            .lock()
+            .map(|s| {
+                s.checked_at.is_none_or(|t| {
+                    chrono::Utc::now().timestamp_millis() - t >= UPDATE_EVERY.as_millis() as i64
+                })
+            })
+            .unwrap_or(false);
+        if set.update_check && due {
+            check_update(&app).await;
+        }
+        // 入れ替えは、確かめた版について何も動いていない時が来るまで毎回見る（確かめるのは 1 日 1 回のまま）
+        let st = app.update.lock().map(|s| s.clone()).unwrap_or_default();
+        if let Some(latest) = st
+            .latest
+            .filter(|l| update::is_newer(&l.version, update::CURRENT))
+            && set.auto_update
+            && st.installed.is_none()
+            && install_blocker(&app, &latest).is_none()
+            && let Err(e) = install_update(app.clone(), latest).await
+        {
+            eprintln!("[update] failed: {e:#}");
+        }
+        tokio::time::sleep(UPDATE_TICK).await;
+    }
+}
+
+fn update_json(app: &App, st: &UpdateState) -> Value {
+    let newer = st
+        .latest
+        .as_ref()
+        .filter(|l| update::is_newer(&l.version, update::CURRENT));
+    json!({
+        "current": update::CURRENT,
+        "latest": st.latest,
+        "newer": newer.is_some(),
+        "blocked": newer.and_then(|l| install_blocker(app, l)),
+        "checked_at": st.checked_at,
+        "error": st.error,
+        "installed": st.installed,
+    })
+}
+
+async fn update_handler(State(app): State<Shared>) -> ApiResult<Json<Value>> {
+    let st = app
+        .update
+        .lock()
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .clone();
+    Ok(Json(update_json(&app, &st)))
+}
+
+/// 画面の「今すぐ確かめる」
+async fn update_check_handler(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    same_origin(&headers)?;
+    let st = check_update(&app).await;
+    Ok(Json(update_json(&app, &st)))
+}
+
+/// 画面の「更新する」。入れ替えて、systemd の下なら再起動する
+async fn update_install_handler(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    same_origin(&headers)?;
+    let latest = app
+        .update
+        .lock()
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .latest
+        .clone()
+        .filter(|l| update::is_newer(&l.version, update::CURRENT));
+    let Some(latest) = latest else {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            anyhow::anyhow!("no newer version"),
+        ));
+    };
+    if let Some(why) = install_blocker(&app, &latest) {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            anyhow::anyhow!("cannot update now: {why}"),
+        ));
+    }
+    let version = latest.version.clone();
+    let restarting = install_update(app.clone(), latest).await?;
+    Ok(Json(
+        json!({ "installed": version, "restarting": restarting }),
+    ))
 }
 
 /// GitHub の一覧を使い回す長さ（画面の「読み直す」で取り直せる）
@@ -70,7 +265,9 @@ pub async fn run(args: &[String]) -> Result<()> {
         summary: summarize,
         running: send::Running::default(),
         gh_cache: Mutex::new(HashMap::new()),
+        update: Mutex::new(UpdateState::default()),
     });
+    tokio::spawn(update_loop(state.clone()));
     // 前回の停止で「実行中」のまま残った予定の実行を閉じてから、予定を動かし始める
     let closed = schedule::recover(&db::open()?)?;
     if closed > 0 {
@@ -90,6 +287,9 @@ pub async fn run(args: &[String]) -> Result<()> {
         .route("/session/{id}/changes", get(changes_handler))
         .route("/session/{id}/diff", get(diff_handler))
         .route("/pins", get(pins_handler))
+        .route("/update", get(update_handler))
+        .route("/update/check", post(update_check_handler))
+        .route("/update/install", post(update_install_handler))
         .route("/repo-sessions", get(repo_sessions_handler))
         .route(
             "/session/{id}/send",
@@ -1581,6 +1781,7 @@ mod tests {
             summary: None,
             running: send::Running::default(),
             gh_cache: Mutex::new(HashMap::new()),
+            update: Mutex::new(UpdateState::default()),
         });
         (app, root)
     }
@@ -1814,6 +2015,41 @@ mod tests {
             status(changes_handler(State(app.clone()), Path("none".into()), q(None, None)).await),
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn update_status_and_refusals() {
+        let (app, _) = test_app("update-api");
+        // まだ確かめていない
+        let Json(v) = update_handler(State(app.clone())).await.unwrap();
+        assert_eq!(
+            (v["current"].as_str(), v["newer"].as_bool()),
+            (Some(update::CURRENT), Some(false))
+        );
+        let refuse = |app: Shared| async move {
+            update_install_handler(State(app), local_headers())
+                .await
+                .unwrap_err()
+                .0
+        };
+        assert_eq!(refuse(app.clone()).await, StatusCode::CONFLICT); // 新しい版が無い
+        // 新しい版がある。テストは target/ の下の開発中のビルドで動くので、入れ替えは断る
+        app.update.lock().unwrap().latest = Some(update::Latest {
+            version: "999.0.0".into(),
+            page: "https://example/releases/v999.0.0".into(),
+            asset: Some("https://example/a.tar.gz".into()),
+            checksum: Some("https://example/a.sha256".into()),
+        });
+        let Json(v) = update_handler(State(app.clone())).await.unwrap();
+        assert_eq!(
+            (v["newer"].as_bool(), v["blocked"].as_str()),
+            (Some(true), Some("dev"))
+        );
+        assert_eq!(refuse(app.clone()).await, StatusCode::CONFLICT);
+        // 別のオリジンからは受けない
+        let mut evil = local_headers();
+        evil.insert("origin", "http://evil.example".parse().unwrap());
+        assert!(update_install_handler(State(app), evil).await.is_err());
     }
 
     #[tokio::test]
