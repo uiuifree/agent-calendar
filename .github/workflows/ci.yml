@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: web + fmt / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      # 画面はバイナリに埋め込むので、Rust より先にビルドする
+      - name: 画面のテストとビルド
+        working-directory: web
+        run: |
+          npm ci
+          npm test
+          npm run build
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: フォーマット検査
+        run: cargo fmt --check
+      - name: Clippy（警告をエラー扱い）
+        run: cargo clippy --all-targets -- -D warnings
+      - name: テスト
+        run: cargo test

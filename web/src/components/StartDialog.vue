@@ -1,0 +1,173 @@
+<script setup>
+import { computed, onUnmounted, ref } from 'vue'
+import { startSession } from '../api.js'
+import { useEscape } from '../dialog.js'
+import { locale, t } from '../i18n.js'
+import { MAX_IMAGES, pickImages, toPayload } from '../images.js'
+import { renderMarkdown } from '../markdown.js'
+import PermissionAsk from './PermissionAsk.vue'
+
+// リポジトリで新しいセッションを始める。途中経過を出し、終わったらできたセッションを開ける
+const props = defineProps({
+  repo: { type: Object, required: true }, // { name, local, … }
+})
+const emit = defineEmits(['close', 'opened', 'ran'])
+useEscape(() => emit('close'))
+
+const agent = ref('claude')
+const mode = ref('edit') // 許可の初期値は「ファイルの編集まで」（ユーザーの指定）
+const prompt = ref('')
+const running = ref(false)
+const live = ref([])
+const sessionId = ref(null)
+// 別の作業場所（git worktree）を新しいブランチで切ってそこで始める。切った場所は最初の 1 行で届く
+const worktree = ref(false)
+const branch = ref('')
+const workspace = ref(null) // { path, branch }
+const finished = ref(false)
+const canRun = computed(() => !running.value && !finished.value && prompt.value.trim().length > 0)
+
+// 画像（会話の入力欄と同じく、貼り付けとドロップで足す）
+const attachments = ref([])
+const attachError = ref('')
+function addImages(files) {
+  const { accepted, error } = pickImages([...files], attachments.value.length)
+  attachError.value = error ? t(error, { n: MAX_IMAGES }) : ''
+  attachments.value.push(...accepted.map((file) => ({ file, url: URL.createObjectURL(file) })))
+  return accepted.length > 0
+}
+function onPaste(e) {
+  if (addImages(e.clipboardData?.files ?? [])) e.preventDefault()
+}
+function removeImage(i) {
+  URL.revokeObjectURL(attachments.value[i].url)
+  attachments.value.splice(i, 1)
+}
+onUnmounted(() => {
+  for (const a of attachments.value) URL.revokeObjectURL(a.url)
+})
+
+async function run() {
+  if (!canRun.value) return
+  running.value = true
+  live.value = []
+  try {
+    const images = await Promise.all(attachments.value.map((a) => toPayload(a.file)))
+    const input = {
+      dir: props.repo.local,
+      agent: agent.value,
+      mode: mode.value,
+      prompt: prompt.value.trim(),
+      images,
+      worktree: worktree.value,
+      branch: branch.value.trim(),
+    }
+    await startSession(input, (ev) => {
+      if (ev.kind === 'session') sessionId.value = ev.id
+      else if (ev.kind === 'worktree') workspace.value = ev
+      else live.value.push(ev)
+    })
+  } catch (e) {
+    live.value.push({ kind: 'done', ok: false, text: String(e.message ?? e) })
+  } finally {
+    running.value = false
+    finished.value = true
+    emit('ran')
+  }
+}
+
+function onKey(e) {
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault()
+    run()
+  }
+}
+</script>
+
+<template>
+  <div class="backdrop" @click.self="emit('close')">
+    <div class="dialog" role="dialog" aria-modal="true" :aria-label="t('repos.startTitle', { name: repo.name })" :lang="locale()" @dragover.prevent @drop.prevent="addImages($event.dataTransfer?.files ?? [])">
+      <h2>{{ t('repos.startTitle', { name: repo.name }) }}</h2>
+      <p class="muted small"><code>{{ repo.local }}</code></p>
+      <div class="row">
+        <select v-model="agent" :disabled="running || finished" :aria-label="t('plans.form.agent')">
+          <option value="claude">{{ t('source.claude') }}</option>
+          <option value="codex">{{ t('source.codex') }}</option>
+        </select>
+        <select v-model="mode" :disabled="running || finished" :aria-label="t('plans.form.mode')">
+          <option value="read">{{ t('conv.modeRead') }}</option>
+          <option value="edit">{{ t('conv.modeEdit') }}</option>
+          <option value="auto">{{ t('conv.modeAuto') }}</option>
+        </select>
+      </div>
+      <label class="check">
+        <input v-model="worktree" type="checkbox" :disabled="running || finished" />
+        {{ t('repos.worktree') }}
+      </label>
+      <input
+        v-if="worktree"
+        v-model="branch"
+        class="branch"
+        type="text"
+        spellcheck="false"
+        :placeholder="t('repos.branchPlaceholder')"
+        :aria-label="t('repos.branch')"
+        :disabled="running || finished"
+      />
+      <textarea v-model="prompt" rows="4" :placeholder="t('plans.form.prompt')" :disabled="running || finished" @keydown="onKey" @paste="onPaste" />
+      <div v-if="attachments.length" class="thumbs">
+        <span v-for="(a, i) in attachments" :key="a.url" class="thumb">
+          <img :src="a.url" alt="" />
+          <button v-if="!running && !finished" class="x" :aria-label="t('conv.removeImage')" @click="removeImage(i)">✕</button>
+        </span>
+      </div>
+      <p v-if="attachError" class="chip warn">{{ attachError }}</p>
+      <p class="muted small">{{ t('repos.startNote') }} {{ t('conv.attach', { n: MAX_IMAGES }) }}</p>
+
+      <p v-if="workspace" class="ws">{{ t('repos.workspace', { branch: workspace.branch }) }}<br /><code>{{ workspace.path }}</code></p>
+      <div v-if="live.length || running" class="live">
+        <template v-for="(ev, i) in live" :key="i">
+          <div v-if="ev.kind === 'text'" class="md" v-html="renderMarkdown(ev.text)" />
+          <div v-else-if="ev.kind === 'tool'" class="tool"><span class="name">{{ ev.name }}</span> {{ ev.text }}</div>
+          <PermissionAsk v-else-if="ev.kind === 'permission'" :ask="ev" />
+          <p v-else-if="ev.kind === 'done' && !ev.ok" class="chip warn">{{ t('conv.failed', { e: ev.text ?? '' }) }}</p>
+        </template>
+        <p v-if="running" class="muted small">{{ t('repos.running') }}</p>
+      </div>
+
+      <div class="actions">
+        <button class="btn" @click="emit('close')">{{ t('repos.close') }}</button>
+        <button v-if="finished && sessionId" class="btn primary" @click="emit('opened', sessionId)">{{ t('repos.openSession') }}</button>
+        <button v-else class="btn primary" :disabled="!canRun" @click="run">{{ running ? t('repos.running') : t('repos.run') }}</button>
+      </div>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.backdrop{position:fixed; inset:0; background:rgba(32,33,36,.4); display:grid; place-items:center; z-index:20}
+.dialog{width:min(640px, calc(100vw - 32px)); max-height:calc(100vh - 48px); overflow-y:auto; background:var(--ground); border-radius:28px; padding:24px;
+  box-shadow:0 4px 8px 3px rgba(60,64,67,.15), 0 1px 3px rgba(60,64,67,.3)}
+h2{font-size:22px; font-weight:400; margin:0 0 4px}
+.small{font-size:12px}
+.row{display:flex; gap:8px; margin:12px 0 8px}
+.check{display:flex; align-items:center; gap:8px; font-size:13px; margin:0 0 8px}
+.branch{width:100%; height:36px; border:1px solid var(--outline); border-radius:8px; padding:0 10px; font:inherit; font-family:"Roboto Mono","Noto Sans Mono CJK JP",monospace; font-size:13px; margin-bottom:8px}
+.ws{margin:12px 0 0; font-size:13px; color:var(--accent)}
+.ws code{font-size:12px; color:var(--ink-soft)}
+select{height:36px; border:1px solid var(--outline); border-radius:8px; padding:0 8px; background:var(--ground)}
+textarea{width:100%; resize:vertical; border:1px solid var(--outline); border-radius:8px; padding:8px 10px; font:inherit; background:var(--ground)}
+textarea:focus{outline:2px solid var(--accent); border-color:transparent}
+.thumbs{display:flex; flex-wrap:wrap; gap:8px; margin-top:8px}
+.thumbs img{display:block; width:72px; height:72px; object-fit:cover; border:1px solid var(--rule); border-radius:8px}
+.thumb{position:relative}
+.thumb .x{position:absolute; top:-6px; right:-6px; width:20px; height:20px; padding:0; border:1px solid var(--rule); border-radius:50%;
+  background:var(--ground); font-size:11px; line-height:1; color:var(--ink-soft)}
+.live{margin-top:12px; padding:10px 12px; border:1px solid var(--rule-soft); border-radius:12px; background:var(--panel); max-height:320px; overflow-y:auto}
+.md{line-height:1.75; word-break:break-word; margin:8px 0; white-space:normal}
+.md :deep(p){margin:.4em 0}
+.md :deep(pre){overflow-x:auto}
+.tool{font-size:12px; color:var(--ink-soft); font-family:"Roboto Mono","Noto Sans Mono CJK JP",monospace; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.tool .name{font-weight:500; color:var(--ink)}
+.actions{display:flex; justify-content:flex-end; gap:8px; margin-top:16px}
+</style>

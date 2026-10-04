@@ -1,0 +1,40 @@
+# agent-calendar
+
+> A local web app that turns Claude Code and Codex CLI session transcripts into a day / week / month
+> calendar, with per-session AI summaries, active time per project, API-price cost estimates, and
+> resume via Claude Code Remote Control. Single Rust binary with the web UI embedded. Runs on 127.0.0.1.
+
+## When to use it
+
+- You use Claude Code and/or Codex CLI and want to see when and on what you worked, per day and per project
+- You want an estimate of what your Claude Code usage would cost at API prices, including subagents and advisor calls
+- You want to resume a Claude Code session in the background and continue it from the Claude app on a phone
+- You want to start or continue agent sessions from a browser, with screenshots, in your local clones of GitHub repositories
+
+## When not to use it
+
+- You need exact billing: costs are estimates at API list prices, not your subscription bill
+- You need a team or hosted dashboard: it is single-user and local only
+- You need Codex costs: Codex sessions show token counts only
+- You use native Windows: run it inside WSL2 instead
+
+## Commands
+
+- `agent-calendar serve [--port 8082] [--no-summarize] [--summary-model sonnet] [--summary-lang en|ja]`
+- `agent-calendar scan` – re-read changed transcripts into the SQLite index
+- `agent-calendar summarize [--limit N] [--model M] [--lang en|ja]` – summarize idle sessions via `claude -p`
+- `agent-calendar service install` – Linux systemd user service
+
+## Behavior
+
+- Reads `~/.claude/projects/*/*.jsonl` and `~/.codex/sessions/**/rollout-*.jsonl`; index in `~/.local/share/agent-calendar/agent-calendar.db`
+- Groups sessions by git repository (worktrees fold into the main repository)
+- Active time: 10-minute buckets merged across sessions, gaps of 30 minutes or less count as continuous
+- Summaries send only prompts and agent text (no tool I/O) through the user's own `claude -p --no-session-persistence`
+- Server accepts only Host 127.0.0.1/localhost/[::1] on its port; POSTs need a JSON body and are refused from other origins
+- Depends on undocumented transcript formats; tested with Claude Code 2.1.288 and Codex CLI 0.154.0
+
+## Links
+
+- Repository: https://github.com/uiuifree/agent-calendar
+- README (Japanese): https://github.com/uiuifree/agent-calendar/blob/main/README.ja.md

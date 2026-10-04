@@ -1,0 +1,57 @@
+/* Google カレンダーに寄せた配色（ライトだけ）。白地、文字は #1f1f1f、罫は薄い灰、
+   押せるものは青（#0b57d0）、角の丸いボタン。予定の色は colors.js の 8 色 */
+:root{
+  color-scheme: light;
+  --ground:#ffffff; --panel:#f8fafd; --hover:#f1f3f4;
+  --ink:#1f1f1f; --ink-soft:#444746; --muted:#5f6368;
+  --rule:#dadce0; --rule-soft:#eceff1; --outline:#747775;
+  --accent:#0b57d0; --accent-soft:#d3e3fd; --accent-faint:#e8f0fe;
+  --now:#ea4335;
+  --done:#5f6368; --wip:#0b57d0; --talk:#b06000; --warn:#b3261e;
+  --radius:8px;
+}
+*{box-sizing:border-box}
+html,body,#app{margin:0;height:100%}
+body{
+  background:var(--ground); color:var(--ink);
+  font-family:"Google Sans","Roboto","Noto Sans JP","Noto Sans CJK JP","Hiragino Sans","Yu Gothic",system-ui,sans-serif;
+  font-size:14px; line-height:1.6; -webkit-font-smoothing:antialiased;
+}
+button,input,select{font:inherit; color:inherit}
+button{cursor:pointer}
+:focus-visible{outline:2px solid var(--accent); outline-offset:2px}
+.mono{font-family:"Roboto Mono","Noto Sans Mono CJK JP",Menlo,Consolas,monospace; font-size:.88em}
+.num{font-variant-numeric:tabular-nums}
+.muted{color:var(--muted)}
+
+/* ボタン: 角の丸い枠線ボタン。主ボタンは青で塗る */
+.btn{display:inline-flex; align-items:center; gap:6px; height:36px; padding:0 16px; border:1px solid var(--outline);
+  border-radius:18px; background:var(--ground); color:var(--ink-soft); font-weight:500}
+.btn:hover{background:var(--hover)}
+.btn:disabled{opacity:.5; cursor:default}
+.btn.primary{background:var(--accent); border-color:var(--accent); color:#fff}
+.btn.primary:hover{background:#0842a0}
+.icon-btn{width:36px; height:36px; border:0; border-radius:50%; background:none; color:var(--ink-soft); font-size:18px}
+.icon-btn:hover{background:var(--hover)}
+
+/* 状態のチップ（枠線と文字色） */
+.chip{display:inline-flex; align-items:center; height:22px; padding:0 8px; border:1px solid currentColor; border-radius:11px;
+  font-size:12px; font-weight:500; white-space:nowrap}
+.chip.done{color:var(--done)}
+.chip.wip{color:var(--wip)}
+.chip.talk{color:var(--talk)}
+.chip.warn{color:var(--warn)}
+.chip.src{color:var(--ink-soft); border-color:var(--rule)}
+
+.section-title{font-size:14px; font-weight:500; color:var(--ink); margin:20px 0 8px; display:flex; align-items:center; gap:8px}
+
+.table{border-collapse:collapse; width:100%}
+.table th{text-align:left; border-bottom:1px solid var(--rule); padding:8px 12px; color:var(--muted); font-size:12px; font-weight:500; white-space:nowrap}
+.table td{border-bottom:1px solid var(--rule-soft); padding:8px 12px; vertical-align:top}
+.table tr:last-child td{border-bottom:none}
+.table .r{text-align:right}
+
+.note{background:var(--accent-faint); border-radius:var(--radius); padding:10px 14px}
+.note .title{font-weight:500; color:var(--accent)}
+
+code,.code{font-family:"Roboto Mono","Noto Sans Mono CJK JP",monospace; font-size:12px; background:var(--hover); border-radius:4px; padding:1px 6px}

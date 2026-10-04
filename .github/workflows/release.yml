@@ -1,0 +1,66 @@
+name: Release
+
+# v* のタグを push すると、各 OS 向けのバイナリを作って「下書き」のリリースに置く。
+# 公開（Publish release）は人が GitHub の画面で行う
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+          # Intel Mac 用も Apple Silicon のランナーで作る（Intel のランナー macos-13 は廃止された）
+          - { target: x86_64-apple-darwin, os: macos-14 }
+          - { target: aarch64-apple-darwin, os: macos-14 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: 画面のビルド
+        working-directory: web
+        run: npm ci && npm run build
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: ビルド
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: まとめる
+        run: |
+          name=agent-calendar-${{ matrix.target }}
+          mkdir "$name"
+          cp target/${{ matrix.target }}/release/agent-calendar README.md README.ja.md LICENSE-MIT LICENSE-APACHE "$name"/
+          tar czf "$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-calendar-${{ matrix.target }}
+          path: agent-calendar-${{ matrix.target }}.tar.gz
+
+  # 4 つのビルドが並んで下書きを作ると下書きが重複するので、1 つのジョブでまとめて置く
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: dist/*.tar.gz
