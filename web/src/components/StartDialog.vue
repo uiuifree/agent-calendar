@@ -1,6 +1,6 @@
 <script setup>
-import { computed, onUnmounted, ref } from 'vue'
-import { startSession } from '../api.js'
+import { computed, onUnmounted, ref, watch } from 'vue'
+import { getBranches, startSession } from '../api.js'
 import { useEscape } from '../dialog.js'
 import { locale, t } from '../i18n.js'
 import { MAX_IMAGES, pickImages, toPayload } from '../images.js'
@@ -24,6 +24,18 @@ const sessionId = ref(null)
 // 別の作業場所（git worktree）を新しいブランチで切ってそこで始める。切った場所は最初の 1 行で届く
 const worktree = ref(false)
 const branch = ref('')
+// どのブランチから切るか。空は origin の既定のブランチ（分からなければ手元のいまの HEAD）。
+// 一覧は手元にある記録から（origin のものと手元のもの）。取れなくても既定のまま始められる
+const base = ref('')
+const branches = ref(null) // { default, branches }
+watch(worktree, async (on) => {
+  if (!on || branches.value) return
+  try {
+    branches.value = await getBranches(props.repo.local)
+  } catch {
+    branches.value = { default: null, branches: [] }
+  }
+})
 const workspace = ref(null) // { path, branch }
 const finished = ref(false)
 const canRun = computed(() => !running.value && !finished.value && prompt.value.trim().length > 0)
@@ -62,6 +74,7 @@ async function run() {
       images,
       worktree: worktree.value,
       branch: branch.value.trim(),
+      base: base.value,
     }
     await startSession(input, (ev) => {
       if (ev.kind === 'session') {
@@ -111,6 +124,13 @@ function onKey(e) {
         <input v-model="worktree" type="checkbox" :disabled="running || finished" />
         {{ t('repos.worktree') }}
       </label>
+      <label v-if="worktree" class="base">
+        {{ t('repos.base') }}
+        <select v-model="base" :disabled="running || finished">
+          <option value="">{{ branches?.default ? t('repos.baseDefault', { name: branches.default }) : t('repos.baseHead') }}</option>
+          <option v-for="b in branches?.branches ?? []" :key="b" :value="b">{{ b }}</option>
+        </select>
+      </label>
       <input
         v-if="worktree"
         v-model="branch"
@@ -131,7 +151,7 @@ function onKey(e) {
       <p v-if="attachError" class="chip warn">{{ attachError }}</p>
       <p class="muted small">{{ t('repos.startNote') }} {{ t('conv.attach', { n: MAX_IMAGES }) }}</p>
 
-      <p v-if="workspace" class="ws">{{ t('repos.workspace', { branch: workspace.branch }) }}<br /><code>{{ workspace.path }}</code></p>
+      <p v-if="workspace" class="ws">{{ t('repos.workspace', { branch: workspace.branch, base: workspace.base }) }}<br /><code>{{ workspace.path }}</code></p>
       <div v-if="live.length || running" class="live">
         <template v-for="(ev, i) in live" :key="i">
           <div v-if="ev.kind === 'text'" class="md" v-html="renderMarkdown(ev.text)" />
@@ -158,6 +178,8 @@ h2{font-size:22px; font-weight:400; margin:0 0 4px}
 .small{font-size:12px}
 .row{display:flex; gap:8px; margin:12px 0 8px}
 .check{display:flex; align-items:center; gap:8px; font-size:13px; margin:0 0 8px}
+.base{display:flex; align-items:center; gap:8px; font-size:13px; margin:0 0 8px}
+.base select{flex:1; min-width:0}
 .branch{width:100%; height:36px; border:1px solid var(--outline); border-radius:8px; padding:0 10px; font:inherit; font-family:"Roboto Mono","Noto Sans Mono CJK JP",monospace; font-size:13px; margin-bottom:8px}
 .ws{margin:12px 0 0; font-size:13px; color:var(--accent)}
 .ws code{font-size:12px; color:var(--ink-soft)}

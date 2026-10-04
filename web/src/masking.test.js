@@ -68,6 +68,12 @@ it('ツールの名前・GitHub のリンク・ファイルのパス', () => {
   expect(m.github.repo).toBe(`https://github.com/${m.owners[0]}/${m.github.repo.split('/').pop()}`)
   expect(m.github.branch).toMatch(/\/tree\/feature\/example$/)
   expect(m.github.compare).toBe(null)
+  // 「ここで始める」で選ぶブランチ: main はそのまま、ほかは作り物
+  const b = maskData({ default: 'main', branches: ['main', 'client-acme/billing'] })
+  expect(b.default).toBe('main')
+  expect(b.branches[0]).toBe('main')
+  expect(b.branches[1]).toMatch(/^feature\//)
+  expect(maskData({ default: null }).default).toBe(null)
   expect(m.files[0].path).toMatch(/\.rs$/)
   expect(m.files[0].path).not.toContain('billing')
   expect(m.files[0].added).toBe(3)

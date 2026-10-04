@@ -304,6 +304,7 @@ pub async fn run(args: &[String]) -> Result<()> {
         .route("/schedules/{id}/run", post(run_schedule))
         .route("/dirs", get(known_dirs))
         .route("/repos", get(repos_handler))
+        .route("/repos/branches", get(branches_handler))
         .route("/repos/clone", post(clone_handler))
         .route(
             "/repos/start",
@@ -437,7 +438,6 @@ async fn check_host(
     next.run(req).await
 }
 
-/// 書き込みと起動の口は、この画面からの呼び出しだけを受ける。
 /// 他のサイトのページの枠（iframe）の中には出させない。見えない枠に入れて、その上で
 /// 「許可」や「ここで始める」を押させる手口を断つ
 async fn no_framing(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
@@ -451,6 +451,7 @@ async fn no_framing(req: axum::extract::Request, next: axum::middleware::Next) -
     res
 }
 
+/// 書き込みと起動の口は、この画面からの呼び出しだけを受ける。
 /// 他のサイトのページから 127.0.0.1 へ投げられた POST は Origin が違うので断る
 /// （JSON 本文を必須にしているので、フォーム送信のような単純なリクエストも通らない）
 fn same_origin(headers: &HeaderMap) -> ApiResult<()> {
@@ -1489,6 +1490,37 @@ struct StartBody {
     /// そのブランチ名。空なら feature/日時
     #[serde(default)]
     branch: String,
+    /// どのブランチから切るか。空なら origin の既定のブランチ
+    #[serde(default)]
+    base: String,
+}
+
+#[derive(Deserialize)]
+struct BranchesQuery {
+    dir: String,
+}
+
+/// 「ここで始める」で出発点に選べるブランチ（作業を始めてよいリポジトリだけ）
+async fn branches_handler(
+    State(app): State<Shared>,
+    Query(q): Query<BranchesQuery>,
+) -> ApiResult<Json<Value>> {
+    let set = {
+        let conn = app.db.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        settings::load(&conn)?
+    };
+    let found = tokio::task::spawn_blocking(move || {
+        github::startable(&set, &q.dir)
+            .then(|| (github::default_branch(&q.dir), github::branches(&q.dir)))
+    })
+    .await?;
+    let Some((default, branches)) = found else {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            anyhow::anyhow!("not a repository of the GitHub owners in settings"),
+        ));
+    };
+    Ok(Json(json!({ "default": default, "branches": branches })))
 }
 
 /// 「ここで始める」で切るブランチの既定の名前（この PC の時刻）
@@ -1533,13 +1565,13 @@ async fn start_handler(
             "" => default_branch(chrono::Local::now()),
             name => name.to_string(),
         };
-        let (dir, br) = (b.dir.clone(), branch.clone());
-        let path = tokio::task::spawn_blocking(move || {
-            schedule::new_worktree(&dir, &br, &schedule::worktrees_dir())
+        let (dir, br, from) = (b.dir.clone(), branch.clone(), b.base.trim().to_string());
+        let (path, base) = tokio::task::spawn_blocking(move || {
+            schedule::new_worktree(&dir, &br, &from, &schedule::worktrees_dir())
         })
         .await?
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
-        let line = json!({ "kind": "worktree", "path": path, "branch": branch });
+        let line = json!({ "kind": "worktree", "path": path, "branch": branch, "base": base });
         (path, Some(format!("{line}\n")))
     } else {
         (b.dir.clone(), None)
@@ -1719,6 +1751,29 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn pages_cannot_be_framed() {
+        use tower::ServiceExt;
+        let app = Router::new()
+            .route("/api/x", get(|| async { "ok" }))
+            .fallback(asset)
+            .layer(axum::middleware::from_fn(no_framing));
+        // API の答えにも、画面のファイルにも付く
+        for uri in ["/api/x", "/"] {
+            let req = axum::http::Request::builder()
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.headers()["x-frame-options"], "DENY", "{uri}");
+            assert_eq!(
+                res.headers()["content-security-policy"],
+                "frame-ancestors 'none'",
+                "{uri}"
+            );
+        }
+    }
+
     #[test]
     fn local_machine_label() {
         assert_eq!(label_for("6.6.87.2-microsoft-standard-WSL2", "box"), "WSL");
@@ -1751,29 +1806,6 @@ mod tests {
         };
         assert_eq!(
             app.clone()
-    #[tokio::test]
-    async fn pages_cannot_be_framed() {
-        use tower::ServiceExt;
-        let app = Router::new()
-            .route("/api/x", get(|| async { "ok" }))
-            .fallback(asset)
-            .layer(axum::middleware::from_fn(no_framing));
-        // API の答えにも、画面のファイルにも付く
-        for uri in ["/api/x", "/"] {
-            let req = axum::http::Request::builder()
-                .uri(uri)
-                .body(axum::body::Body::empty())
-                .unwrap();
-            let res = app.clone().oneshot(req).await.unwrap();
-            assert_eq!(res.headers()["x-frame-options"], "DENY", "{uri}");
-            assert_eq!(
-                res.headers()["content-security-policy"],
-                "frame-ancestors 'none'",
-                "{uri}"
-            );
-        }
-    }
-
                 .oneshot(req("127.0.0.1:8082"))
                 .await
                 .unwrap()
@@ -1897,9 +1929,19 @@ mod tests {
             images: Vec::new(),
             worktree: false,
             branch: String::new(),
+            base: String::new(),
         };
         let ours = root.join("agent-calendar").to_string_lossy().into_owned();
         let theirs = root.join("theirs").to_string_lossy().into_owned();
+        // ブランチの一覧も、作業を始めてよいリポジトリだけ
+        let branches = |dir: &str| {
+            branches_handler(State(app.clone()), Query(BranchesQuery { dir: dir.into() }))
+        };
+        let Json(v) = branches(&ours).await.unwrap();
+        assert_eq!(v, json!({ "default": null, "branches": [] })); // 中身の無い作り物のリポジトリ
+        for dir in [theirs.as_str(), "/tmp"] {
+            assert_eq!(branches(dir).await.unwrap_err().0, StatusCode::BAD_REQUEST);
+        }
         for b in [
             start(ours.clone(), "claude", "  "),
             start(ours.clone(), "gpt", "見て"),

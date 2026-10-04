@@ -103,6 +103,12 @@ export const getRepos = (refresh = false) => j(`/api/repos${refresh ? '?refresh=
 export const getRepoSessions = (repo) => j(`/api/repo-sessions?repo=${encodeURIComponent(unmask(repo))}`)
 export const cloneRepo = (owner, name, root) => post('/api/repos/clone', { owner, name, root })
 // リポジトリで新しいセッションを始める。最初に { kind: 'session', id } が届く
+// 「ここで始める」で出発点に選べるブランチ（default は origin の既定のブランチ。分からなければ null）
+// スクショ用の表示では別のブランチが同じ作り物の名前になることがあるので、重なりは 1 つにする
+export const getBranches = async (dir) => {
+  const r = await j(`/api/repos/branches?dir=${encodeURIComponent(unmask(dir))}`)
+  return { ...r, branches: [...new Set(r.branches)] }
+}
 export const startSession = (input, onEvent) => streamPost('/api/repos/start', input, onEvent)
 
 // 予定

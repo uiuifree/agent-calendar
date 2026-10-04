@@ -482,25 +482,57 @@ pub fn ensure_worktree(dir: &str, id: i64, base: &Path) -> Result<(String, Strin
     Ok((path.to_string_lossy().into_owned(), branch))
 }
 
-/// 「ここで始める」で切る作業場所。いまの HEAD から新しいブランチを作り、別の作業フォルダに置く。
-/// 手元の作業コピーには触らない。ブランチがすでにあれば断る（人の作業を上書きしない）。戻り値は作業フォルダ
-pub fn new_worktree(dir: &str, branch: &str, base: &Path) -> Result<String> {
-    let top = git_toplevel(dir).context("a worktree needs a git repository")?;
-    let valid = Command::new("git")
-        .args(["check-ref-format", "--branch", branch])
+fn valid_branch(name: &str) -> bool {
+    !name.starts_with('-')
+        && Command::new("git")
+            .args(["check-ref-format", "--branch", name])
+            .output()
+            .is_ok_and(|o| o.status.success())
+}
+
+fn has_ref(top: &str, name: &str) -> bool {
+    Command::new("git")
+        .args(["-C", top, "rev-parse", "--verify", "--quiet", name])
         .output()
-        .is_ok_and(|o| o.status.success());
-    if !valid || branch.starts_with('-') {
+        .is_ok_and(|o| o.status.success())
+}
+
+/// 新しいブランチの出発点。戻り値は (git に渡す名前, 画面に出す名前)。
+/// 空なら origin の既定のブランチ（分からなければいまの HEAD）。名前を選んだときは origin のものを先に見て、
+/// origin に無ければ手元のブランチ（GitHub にある状態から始めるのが基本なので）
+fn start_point(top: &str, from: &str) -> Result<(String, String)> {
+    if from.is_empty() {
+        return Ok(match crate::github::default_branch(top) {
+            Some(d) => (format!("refs/remotes/origin/{d}"), format!("origin/{d}")),
+            None => ("HEAD".into(), "HEAD".into()),
+        });
+    }
+    if !valid_branch(from) {
+        bail!("not a valid branch name: {from}");
+    }
+    let remote = format!("refs/remotes/origin/{from}");
+    if has_ref(top, &remote) {
+        return Ok((remote, format!("origin/{from}")));
+    }
+    let local = format!("refs/heads/{from}");
+    if has_ref(top, &local) {
+        return Ok((local, from.to_string()));
+    }
+    bail!("no such branch: {from}");
+}
+
+/// 「ここで始める」で切る作業場所。`from`（空なら既定のブランチ）から新しいブランチを作り、別の作業フォルダに置く。
+/// 手元の作業コピーには触らない。ブランチがすでにあれば断る（人の作業を上書きしない）。
+/// 戻り値は (作業フォルダ, 出発点)
+pub fn new_worktree(dir: &str, branch: &str, from: &str, base: &Path) -> Result<(String, String)> {
+    let top = git_toplevel(dir).context("a worktree needs a git repository")?;
+    if !valid_branch(branch) {
         bail!("not a valid branch name: {branch}");
     }
-    let exists = Command::new("git")
-        .args(["-C", &top, "rev-parse", "--verify", "--quiet"])
-        .arg(format!("refs/heads/{branch}"))
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if exists {
+    if has_ref(&top, &format!("refs/heads/{branch}")) {
         bail!("the branch {branch} already exists");
     }
+    let (start, shown) = start_point(&top, from)?;
     let path = base.join(format!(
         "{}-{}",
         &crate::share::sha256_hex(top.as_bytes())[..8],
@@ -510,9 +542,11 @@ pub fn new_worktree(dir: &str, branch: &str, base: &Path) -> Result<String> {
         bail!("{} already exists", path.display());
     }
     std::fs::create_dir_all(base)?;
+    // origin のブランチから切っても、そこを push 先にはしない（--no-track。既定のブランチへ push させない）
     let out = Command::new("git")
-        .args(["-C", &top, "worktree", "add", "-b", branch])
+        .args(["-C", &top, "worktree", "add", "--no-track", "-b", branch])
         .arg(&path)
+        .arg(&start)
         .output()
         .context("cannot run git")?;
     if !out.status.success() {
@@ -521,7 +555,7 @@ pub fn new_worktree(dir: &str, branch: &str, base: &Path) -> Result<String> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok(path.to_string_lossy().into_owned())
+    Ok((path.to_string_lossy().into_owned(), shown))
 }
 
 pub fn worktrees_dir() -> std::path::PathBuf {
@@ -1166,7 +1200,7 @@ mod tests {
                     .success()
             )
         };
-        git(&["init", "-q"]);
+        git(&["init", "-q", "-b", "master"]);
         git(&[
             "-c",
             "user.email=a@b",
@@ -1181,13 +1215,86 @@ mod tests {
         // 「ここで始める」の作業場所: 新しいブランチで切る。同じブランチ・おかしな名前は断る
         let wbase = dir.join("start-wts");
         let r = repo.to_str().unwrap();
-        let ws = new_worktree(r, "feature/try-1", &wbase).unwrap();
+        // origin/HEAD が分からないうちは、いまの HEAD から切る
+        let (ws, from) = new_worktree(r, "feature/try-1", "", &wbase).unwrap();
         assert!(ws.ends_with("-feature-try-1"));
+        assert_eq!(from, "HEAD");
         assert!(Path::new(&ws).join(".git").exists());
-        assert!(new_worktree(r, "feature/try-1", &wbase).is_err());
-        assert!(new_worktree(r, "bad..name", &wbase).is_err());
-        assert!(new_worktree(r, "-x", &wbase).is_err());
-        assert!(new_worktree(dir.to_str().unwrap(), "y", &wbase).is_err()); // git ではない
+        assert!(new_worktree(r, "feature/try-1", "", &wbase).is_err());
+        assert!(new_worktree(r, "bad..name", "", &wbase).is_err());
+        assert!(new_worktree(r, "-x", "", &wbase).is_err());
+        assert!(new_worktree(dir.to_str().unwrap(), "y", "", &wbase).is_err()); // git ではない
+        // 出発点: origin の既定のブランチ（1 つ前のコミット）と、手元だけのブランチ（その先のコミット）を用意する
+        let rev = |dir: &str, name: &str| {
+            let o = Command::new("git")
+                .args(["-C", dir, "rev-parse", name])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        git(&["remote", "add", "origin", "https://github.com/x/y.git"]);
+        git(&["config", "branch.autoSetupMerge", "true"]);
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ]);
+        git(&["update-ref", "refs/remotes/origin/release", "HEAD"]);
+        git(&[
+            "-c",
+            "user.email=a@b",
+            "-c",
+            "user.name=a",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "y",
+        ]);
+        git(&["branch", "local-only"]);
+        git(&["branch", "release"]); // 手元の release は origin より先に進んでいる
+        let origin_main = rev(r, "refs/remotes/origin/main");
+        assert_ne!(origin_main, rev(r, "HEAD"));
+        // 空なら既定のブランチから（いまの HEAD からではない）。そこを push 先にはしない
+        let (ws, from) = new_worktree(r, "feature/try-2", "", &wbase).unwrap();
+        assert_eq!(from, "origin/main");
+        assert_eq!(rev(&ws, "HEAD"), origin_main);
+        assert!(!has_ref(r, "feature/try-2@{upstream}"));
+        // 選んだブランチから。origin と手元の両方にあれば origin、origin に無ければ手元
+        let (ws, from) = new_worktree(r, "feature/try-3", "release", &wbase).unwrap();
+        assert_eq!(
+            (from.as_str(), rev(&ws, "HEAD")),
+            ("origin/release", origin_main)
+        );
+        let (ws, from) = new_worktree(r, "feature/try-4", "local-only", &wbase).unwrap();
+        assert_eq!(from, "local-only");
+        assert_eq!(rev(&ws, "HEAD"), rev(r, "HEAD"));
+        // 無いブランチ・ブランチ名でないものは断る
+        assert!(new_worktree(r, "feature/try-5", "nope", &wbase).is_err());
+        assert!(new_worktree(r, "feature/try-5", "main~1", &wbase).is_err());
+        assert!(new_worktree(r, "feature/try-5", "-x", &wbase).is_err());
+        assert_eq!(
+            (
+                crate::github::default_branch(r).as_deref(),
+                crate::github::branches(r)
+            ),
+            (
+                Some("main"),
+                [
+                    "feature/try-1",
+                    "feature/try-2",
+                    "feature/try-3",
+                    "feature/try-4",
+                    "local-only",
+                    "main",
+                    "master",
+                    "release"
+                ]
+                .map(String::from)
+                .to_vec()
+            )
+        );
         let base = dir.join("wts");
         let (path, branch) = ensure_worktree(repo.to_str().unwrap(), 7, &base).unwrap();
         assert_eq!(branch, "agent-calendar/schedule-7");

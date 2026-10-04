@@ -170,12 +170,9 @@ const RULES = {
   title: fakeTitle, subject: fakeTitle, name: (v) => (isJa(v) || v.includes(' ') ? fakeTitle(v) : repoName(v)),
   text: fakeText, summary: fakeText, prompt: fakeText, description: fakeText, next: fakeText, bullets: fakeText,
   // ブランチ名か、GitHub のブランチのページ（詳細の github.branch）
-  branch: (v) =>
-    v.startsWith('https://')
-      ? fakeGithub(v)
-      : v === 'main' || v === 'master'
-        ? v
-        : `feature/${pick(['login-fix', 'search-speedup', 'settings', 'csv-import'], v)}`,
+  branch: fakeBranch,
+  // 「ここで始める」で選ぶ出発点のブランチ（一覧と既定のブランチ）
+  branches: fakeBranch, default: fakeBranch,
   label: (v) => (v === 'WSL' || v === 'this PC' ? v : 'server'),
   owner: orgName, owners: orgName, github_owners: orgName, roots: () => '/home/me/projects', repo_roots: () => '/home/me/projects', dirs: fakePath,
   project: projectName, known_projects: projectName,
@@ -183,6 +180,11 @@ const RULES = {
   resume_command: (v) =>
     v.replace(/^cd ('(?:[^']|'\\'')*'|\S+)/, (_, p) => `cd ${fakePath(p.startsWith("'") ? p.slice(1, -1).replaceAll("'\\''", "'") : p)}`),
   rule: (v) => v.replace(/\(.*\)/, '(npm test:*)'), patch: fakePatch, error: fakeText,
+}
+
+function fakeBranch(v) {
+  if (v.startsWith('https://')) return fakeGithub(v)
+  return v === 'main' || v === 'master' ? v : `feature/${pick(['login-fix', 'search-speedup', 'settings', 'csv-import'], v)}`
 }
 
 // 受け取ったデータ全体を、項目の名前を見ながらたどって置き換える。

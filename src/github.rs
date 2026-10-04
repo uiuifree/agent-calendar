@@ -200,20 +200,56 @@ pub fn startable(set: &Settings, dir: &str) -> bool {
     })
 }
 
+fn git_out(dir: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// origin の既定のブランチ（origin/HEAD が指す先）。clone したものなら分かる。分からなければ None
+pub fn default_branch(dir: &str) -> Option<String> {
+    git_out(
+        dir,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    )
+    .and_then(|h| h.strip_prefix("origin/").map(str::to_string))
+}
+
+/// 「ここで始める」で出発点に選べるブランチ: origin にあるものと手元にあるもの（名前順、重複なし）。
+/// 手元にある記録だけを見る（GitHub へは取りに行かない）
+pub fn branches(dir: &str) -> Vec<String> {
+    let refs = git_out(
+        dir,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads",
+            "refs/remotes/origin",
+        ],
+    )
+    .unwrap_or_default();
+    let names: std::collections::BTreeSet<String> = refs
+        .lines()
+        .filter_map(|r| {
+            r.strip_prefix("refs/heads/")
+                .or_else(|| r.strip_prefix("refs/remotes/origin/"))
+        })
+        .filter(|n| *n != "HEAD")
+        .map(str::to_string)
+        .collect();
+    names.into_iter().collect()
+}
+
 /// セッションの詳細から GitHub へ飛ぶリンク: リポジトリ、ブランチ（push 済みのときだけ）、
 /// 既定のブランチとの比較（PR を作る画面。push 済みで既定のブランチ以外のときだけ）。origin が GitHub でなければ None
 pub fn links(dir: &str, branch: &str) -> Option<serde_json::Value> {
-    let git = |args: &[&str]| -> Option<String> {
-        let out = Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .ok()?;
-        out.status
-            .success()
-            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
-    };
+    let git = |args: &[&str]| git_out(dir, args);
     let repo = format!(
         "https://github.com/{}",
         slug(&git(&["remote", "get-url", "origin"])?)?
@@ -227,8 +263,7 @@ pub fn links(dir: &str, branch: &str) -> Option<serde_json::Value> {
         ])
         .is_some();
     // origin/HEAD が分からなければ、比較は出さない（どこと比べるか決められない）
-    let default = git(&["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
-        .and_then(|h| h.strip_prefix("origin/").map(str::to_string));
+    let default = default_branch(dir);
     let path = |b: &str| {
         b.replace('%', "%25")
             .replace('#', "%23")
