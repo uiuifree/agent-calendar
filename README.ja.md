@@ -64,7 +64,7 @@ agent-calendar service install     # systemd のユーザーサービスとし�
 agent-calendar serve
 ```
 
-を動かして <http://127.0.0.1:8082/> を開きます。
+を動かして <http://127.0.0.1:23848/> を開きます。
 
 ### 更新
 
@@ -84,10 +84,10 @@ cargo install --path .
 ## 使い方
 
 ```text
-agent-calendar serve [--port 8082] [--no-summarize] [--summary-model sonnet] [--summary-lang en|ja]
+agent-calendar serve [--port 23848] [--no-summarize] [--summary-model sonnet] [--summary-lang en|ja]
 agent-calendar scan
 agent-calendar summarize [--limit 20] [--model sonnet] [--lang en|ja]
-agent-calendar service install [--port 8082] [--no-summarize] [--summary-lang en|ja]
+agent-calendar service install [--port 23848] [--no-summarize] [--summary-lang en|ja]
 ```
 
 `serve` は 5 分ごとに記録を読み直し、止まったセッションを 1 時間ごとに 1 回 10 件まで要約します（7〜22 時）。

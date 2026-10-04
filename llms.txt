@@ -20,7 +20,7 @@
 
 ## Commands
 
-- `agent-calendar serve [--port 8082] [--no-summarize] [--summary-model sonnet] [--summary-lang en|ja]`
+- `agent-calendar serve [--port 23848] [--no-summarize] [--summary-model sonnet] [--summary-lang en|ja]`
 - `agent-calendar scan` – re-read changed transcripts into the SQLite index
 - `agent-calendar summarize [--limit N] [--model M] [--lang en|ja]` – summarize idle sessions via `claude -p`
 - `agent-calendar service install` – Linux systemd user service

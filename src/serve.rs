@@ -24,6 +24,10 @@ use std::time::Duration;
 #[folder = "web/dist"]
 struct Assets;
 
+/// 画面のポートの既定。8080・8081・8082・3000・5173 のような開発でよく使う番号と重ならないように、
+/// share（23847）の隣にする。変えるときは `--port`
+pub const DEFAULT_PORT: &str = "23848";
+
 /// 色を割り当てるリポジトリの数（画面のパレットが 8 色）。残りは「その他」
 const COLOR_SLOTS: usize = 8;
 /// 裏の処理が設定を見に行く間隔。実際に動かすかは設定の時間帯と間隔で決める
@@ -248,7 +252,7 @@ struct SummarizeOpts {
 }
 
 pub async fn run(args: &[String]) -> Result<()> {
-    let port = opt(args, "--port").unwrap_or_else(|| "8082".into());
+    let port = opt(args, "--port").unwrap_or_else(|| DEFAULT_PORT.into());
     let summarize = if args.iter().any(|a| a == "--no-summarize") {
         None
     } else {

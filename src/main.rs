@@ -30,7 +30,7 @@ const USAGE: &str = "\
 agent-calendar — a local calendar for AI coding agent sessions (Claude Code, Codex)
 
 USAGE:
-    agent-calendar serve [--port 8082] [--no-summarize] [--summary-model sonnet] [--summary-lang en|ja]
+    agent-calendar serve [--port 23848] [--no-summarize] [--summary-model sonnet] [--summary-lang en|ja]
         Serve the calendar on http://127.0.0.1:<port>/ . By default it rescans every 5 minutes and
         summarizes idle sessions every hour (10 per round), between 7:00 and 22:00.
         Change the hours and intervals from the settings in the page.
@@ -38,7 +38,7 @@ USAGE:
         Re-read changed transcripts into the index.
     agent-calendar summarize [--limit 20] [--model sonnet] [--lang en|ja]
         Summarize idle sessions now. Summaries use `claude -p` (your Claude Code login).
-    agent-calendar service install [--port 8082] [--no-summarize] [--summary-lang en|ja]
+    agent-calendar service install [--port 23848] [--no-summarize] [--summary-lang en|ja]
         Linux only: register and start a systemd user service that runs `serve`.
 
   Collect sessions from another machine (over HTTPS with a pinned certificate and a token):

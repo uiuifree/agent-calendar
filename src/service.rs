@@ -48,7 +48,7 @@ pub fn install(args: &[String]) -> Result<()> {
             file.display()
         );
     } else {
-        let port = opt(args, "--port").unwrap_or_else(|| "8082".into());
+        let port = opt(args, "--port").unwrap_or_else(|| crate::serve::DEFAULT_PORT.into());
         println!(
             "installed {}\nopen http://127.0.0.1:{port}/",
             file.display()

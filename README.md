@@ -69,7 +69,7 @@ or anywhere:
 agent-calendar serve
 ```
 
-and open <http://127.0.0.1:8082/>.
+and open <http://127.0.0.1:23848/>.
 
 ### Updates
 
@@ -89,10 +89,10 @@ cargo install --path .
 ## Usage
 
 ```text
-agent-calendar serve [--port 8082] [--no-summarize] [--summary-model sonnet] [--summary-lang en|ja]
+agent-calendar serve [--port 23848] [--no-summarize] [--summary-model sonnet] [--summary-lang en|ja]
 agent-calendar scan
 agent-calendar summarize [--limit 20] [--model sonnet] [--lang en|ja]
-agent-calendar service install [--port 8082] [--no-summarize] [--summary-lang en|ja]
+agent-calendar service install [--port 23848] [--no-summarize] [--summary-lang en|ja]
 ```
 
 `serve` rescans every 5 minutes and summarizes idle sessions every hour (10 per round) between 7:00 and 22:00;

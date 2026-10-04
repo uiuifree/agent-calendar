@@ -41,7 +41,7 @@ case ":$PATH:" in
 esac
 
 if [ "$os" = "unknown-linux-gnu" ] && command -v systemctl >/dev/null 2>&1; then
-  echo "next: run 'agent-calendar service install' to start it in the background, then open http://127.0.0.1:8082/"
+  echo "next: run 'agent-calendar service install' to start it in the background, then open http://127.0.0.1:23848/"
 else
-  echo "next: run 'agent-calendar serve' and open http://127.0.0.1:8082/"
+  echo "next: run 'agent-calendar serve' and open http://127.0.0.1:23848/"
 fi
