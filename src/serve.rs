@@ -4,7 +4,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::http::{Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -310,9 +310,14 @@ pub async fn run(args: &[String]) -> Result<()> {
             post(start_handler).layer(DefaultBodyLimit::max(SEND_BODY_LIMIT)),
         )
         .with_state(state);
-    let app = Router::new().nest("/api", api).fallback(asset).layer(
-        axum::middleware::from_fn_with_state(Arc::new(port.clone()), check_host),
-    );
+    let app = Router::new()
+        .nest("/api", api)
+        .fallback(asset)
+        .layer(axum::middleware::from_fn(no_framing))
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::new(port.clone()),
+            check_host,
+        ));
 
     // 記録には社内の依頼文も入るので、外には出さない
     let addr = format!("127.0.0.1:{port}");
@@ -433,6 +438,19 @@ async fn check_host(
 }
 
 /// 書き込みと起動の口は、この画面からの呼び出しだけを受ける。
+/// 他のサイトのページの枠（iframe）の中には出させない。見えない枠に入れて、その上で
+/// 「許可」や「ここで始める」を押させる手口を断つ
+async fn no_framing(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let mut res = next.run(req).await;
+    let h = res.headers_mut();
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    res
+}
+
 /// 他のサイトのページから 127.0.0.1 へ投げられた POST は Origin が違うので断る
 /// （JSON 本文を必須にしているので、フォーム送信のような単純なリクエストも通らない）
 fn same_origin(headers: &HeaderMap) -> ApiResult<()> {
@@ -1733,6 +1751,29 @@ mod tests {
         };
         assert_eq!(
             app.clone()
+    #[tokio::test]
+    async fn pages_cannot_be_framed() {
+        use tower::ServiceExt;
+        let app = Router::new()
+            .route("/api/x", get(|| async { "ok" }))
+            .fallback(asset)
+            .layer(axum::middleware::from_fn(no_framing));
+        // API の答えにも、画面のファイルにも付く
+        for uri in ["/api/x", "/"] {
+            let req = axum::http::Request::builder()
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.headers()["x-frame-options"], "DENY", "{uri}");
+            assert_eq!(
+                res.headers()["content-security-policy"],
+                "frame-ancestors 'none'",
+                "{uri}"
+            );
+        }
+    }
+
                 .oneshot(req("127.0.0.1:8082"))
                 .await
                 .unwrap()
