@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { getPins, getSchedules, getWeek, rescan } from './api.js'
+import { getPins, getSchedules, getWeek, masked, rescan, setMasked } from './api.js'
 import { addDays, startOfDay, weekStart } from './layout.js'
 import { lang, locale, setLang, t } from './i18n.js'
 import { CALENDAR_VIEWS, formatRoute, parseRoute } from './route.js'
@@ -284,7 +284,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
     <header class="top">
       <button class="icon-btn" :aria-label="t('sidebar.menu')" :aria-expanded="sidebarOpen" @click="sidebarOpen = !sidebarOpen">☰</button>
       <button class="brand" :title="t('backToCalendar')" @click="backToCalendar">
-        <span class="logo" aria-hidden="true"><i /><i /><i /></span>
+        <img class="logo" src="/favicon.svg" alt="" width="32" height="32" />
         <span class="name">{{ t('appName') }}</span>
       </button>
       <template v-if="CALENDAR.includes(view)">
@@ -297,9 +297,10 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
       </template>
       <span class="spacer" />
       <span v-if="error" class="chip warn">{{ error }}</span>
-      <div class="segmented" role="tablist">
+      <!-- 表示の単位（日・週・月）はカレンダーのときだけ。集計・予定・リポジトリへはサイドバーから -->
+      <div v-if="CALENDAR_VIEWS.includes(view)" class="segmented" role="tablist">
         <button
-          v-for="v in VIEWS"
+          v-for="v in CALENDAR_VIEWS"
           :key="v"
           role="tab"
           :aria-selected="view === v"
@@ -317,6 +318,16 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
       </div>
       <button class="icon-btn" :title="t('reload')" :aria-label="t('reload')" :disabled="loading" @click="reload">
         <span :class="{ spin: loading }">↻</span>
+      </button>
+      <button
+        class="icon-btn mask"
+        :class="{ on: masked }"
+        :title="masked ? t('mask.off') : t('mask.on')"
+        :aria-label="masked ? t('mask.off') : t('mask.on')"
+        :aria-pressed="masked"
+        @click="setMasked(!masked)"
+      >
+        ◐
       </button>
       <button class="icon-btn" :title="t('settings.title')" :aria-label="t('settings.title')" @click="showSettings = true">⚙</button>
     </header>
@@ -337,6 +348,8 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
         @pick="(d) => (anchor = startOfDay(d))"
         :pins="pins"
         :selected-id="selectedId"
+        :page="CALENDAR_VIEWS.includes(view) ? 'calendar' : view"
+        @go="(p) => (view = p === 'calendar' ? lastCalendar : p)"
         @more="view = 'stats'"
         @create="creating = null"
         @select="(id) => (selectedId = id)"
@@ -435,11 +448,10 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
 .top{display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:8px 16px 8px 8px; border-bottom:1px solid var(--rule); min-height:64px}
 .brand{display:flex; align-items:center; gap:10px; margin-right:24px; padding:4px 8px 4px 4px; border:0; border-radius:8px; background:none; color:inherit; font:inherit; cursor:pointer}
 .brand:hover{background:var(--hover)}
-.logo{display:grid; grid-template-columns:repeat(3, 6px); gap:2px; padding:6px; border:2px solid var(--accent); border-radius:6px}
-.logo i{height:6px; border-radius:1px; background:var(--accent)}
-.logo i:nth-child(2){background:#d50000}
-.logo i:nth-child(3){background:#0b8043}
-.name{font-size:22px; color:var(--ink-soft); font-weight:400}
+.icon-btn.mask.on{background:var(--accent-soft); color:var(--accent)}
+/* ロゴ（タブのアイコンと同じ絵）: 紫のカレンダーの用紙に、プロンプト「>」から AI の光へ流れる日付のマス。文字は黒・やや太め */
+.logo{display:block; width:32px; height:32px}
+.name{font-size:22px; color:#111; font-weight:600; letter-spacing:-.01em}
 .arrows{display:flex}
 .range{font-size:22px; font-weight:400; margin:0 0 0 8px; color:var(--ink)}
 .spacer{flex:1}

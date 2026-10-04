@@ -15,4 +15,5 @@
 - Changes tab with a GitHub-style file list and diffs; links to the repository, branch and compare page on GitHub
 - Start a session in a separate git worktree on a new branch; per-repository session list in the Repositories view
 - Calendar stays at `/`; other views, the open session, its tab and full screen are kept in the URL
+- Screenshot mode that replaces names and text with sample content for sharing screenshots
 - English and Japanese UI; single binary with the web UI embedded; `service install` for systemd

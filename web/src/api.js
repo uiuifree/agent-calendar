@@ -1,9 +1,33 @@
 // agent-calendar serve（Rust）が出す API。
 // POST は JSON 本文を付ける（サーバーは JSON でない POST を受けない）
+import { maskData, unmask } from './masking.js'
+
+// スクショ用の表示（中身を作り物に置き換える）。切り替えたら読み込み直す
+const MASK_KEY = 'agent-calendar.mask'
+export const masked = (() => {
+  try {
+    return localStorage.getItem(MASK_KEY) === '1'
+  } catch {
+    return false
+  }
+})()
+export function setMasked(on) {
+  try {
+    localStorage.setItem(MASK_KEY, on ? '1' : '0')
+  } catch {
+    // 覚えられなくても、この読み込みのあいだだけは切り替わる
+  }
+  location.reload()
+}
+// 作り物の値で保存・送信すると本物のデータが書き換わるので、スクショ用の表示のあいだは書き込みを止める
+const MASK_ERROR = 'Turn off screenshot mode to change data (スクショ用の表示を切ってから操作してください)'
+
 const j = async (path, init) => {
+  if (masked && init?.method === 'POST') throw new Error(MASK_ERROR)
   const r = await fetch(path, init)
   if (!r.ok) throw new Error(await r.text() || `${path}: ${r.status}`)
-  return r.json()
+  const data = await r.json()
+  return masked ? maskData(data) : data
 }
 const post = (path, body = {}) =>
   j(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
@@ -24,7 +48,8 @@ export const answerPermission = (requestId, allow, remember = false) =>
 const q = (commit, path) =>
   [commit && `commit=${encodeURIComponent(commit)}`, path && `path=${encodeURIComponent(path)}`].filter(Boolean).join('&')
 export const getChanges = (id, commit = null) => j(`/api/session/${encodeURIComponent(id)}/changes?${q(commit)}`)
-export const getDiff = (id, path, commit = null) => j(`/api/session/${encodeURIComponent(id)}/diff?${q(commit, path)}`)
+// スクショ用の表示では、作り物のパスを本物に戻して問い合わせる
+export const getDiff = (id, path, commit = null) => j(`/api/session/${encodeURIComponent(id)}/diff?${q(commit, unmask(path))}`)
 // そのセッションで、画面の答えを待っている許可の問い合わせ（会話を開き直したときに出し直す）
 export const getAsks = (id) => j(`/api/session/${encodeURIComponent(id)}/asks`)
 // ピン留め
@@ -40,6 +65,7 @@ export const getTranscript = (id, end = null, limit = 200) =>
 
 // 途中経過を 1 行ずつ（NDJSON）返す POST。届いた順に onEvent へ渡す
 async function streamPost(path, body, onEvent) {
+  if (masked) throw new Error(MASK_ERROR)
   const r = await fetch(path, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -70,7 +96,7 @@ export const sendInstruction = (id, prompt, mode, onEvent, images = []) =>
 // リポジトリ: 設定で選んだ組織の GitHub のリポジトリと手元の clone。refresh で GitHub から取り直す
 export const getRepos = (refresh = false) => j(`/api/repos${refresh ? '?refresh=true' : ''}`)
 // そのリポジトリのセッション（このマシンのもの、新しい順）
-export const getRepoSessions = (repo) => j(`/api/repo-sessions?repo=${encodeURIComponent(repo)}`)
+export const getRepoSessions = (repo) => j(`/api/repo-sessions?repo=${encodeURIComponent(unmask(repo))}`)
 export const cloneRepo = (owner, name, root) => post('/api/repos/clone', { owner, name, root })
 // リポジトリで新しいセッションを始める。最初に { kind: 'session', id } が届く
 export const startSession = (input, onEvent) => streamPost('/api/repos/start', input, onEvent)

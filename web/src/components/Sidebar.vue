@@ -22,8 +22,17 @@ const props = defineProps({
   hiddenRepos: { type: Array, required: true },
   pins: { type: Array, default: () => [] }, // ピン留めしたセッション（最近動いた順）
   selectedId: { type: String, default: null },
+  page: { type: String, default: 'calendar' }, // いまの画面（calendar / stats / plans / repos）
 })
-const emit = defineEmits(['pick', 'update:hosts', 'update:hiddenRepos', 'more', 'create', 'select'])
+const emit = defineEmits(['pick', 'update:hosts', 'update:hiddenRepos', 'more', 'create', 'select', 'go'])
+
+// 画面の切り替え（Google カレンダーの左上と同じく、作成の下に並べる）。キーはショートカット
+const PAGES = [
+  { id: 'calendar', icon: '▦', key: 'd / w / m' },
+  { id: 'stats', icon: '◔', key: 's' },
+  { id: 'plans', icon: '⏱', key: 'a' },
+  { id: 'repos', icon: '⑂', key: 'r' },
+]
 
 // 小さな月のカレンダー。表示中の週に合わせて月を動かし、矢印でも動かせる
 const month = ref(new Date(props.anchor))
@@ -96,6 +105,19 @@ const toggleRepo = (repo) =>
 <template>
   <nav class="sidebar">
     <button class="create" @click="emit('create')"><span class="plus">＋</span>{{ t('sidebar.create') }}</button>
+    <nav class="pages" :aria-label="t('sidebar.pages')">
+      <button
+        v-for="p in PAGES"
+        :key="p.id"
+        class="page"
+        :class="{ on: page === p.id }"
+        :aria-current="page === p.id ? 'page' : undefined"
+        :title="`${t(`pages.${p.id}`)} (${p.key})`"
+        @click="emit('go', p.id)"
+      >
+        <span class="icon" aria-hidden="true">{{ p.icon }}</span>{{ t(`pages.${p.id}`) }}
+      </button>
+    </nav>
     <section v-if="pins.length" class="pins">
       <h3>{{ t('sidebar.pinned') }}</h3>
       <button v-for="p in pins" :key="p.id" class="pin" :class="{ selected: p.id === selectedId }" @click="emit('select', p.id)">
@@ -171,6 +193,13 @@ const toggleRepo = (repo) =>
 .create:hover{background:var(--accent-faint); box-shadow:0 1px 3px rgba(60,64,67,.3), 0 4px 8px 3px rgba(60,64,67,.15)}
 .create .plus{font-size:18px; line-height:1; color:var(--accent)}
 section{margin-bottom:20px}
+.pages{display:flex; flex-direction:column; gap:2px; margin:0 0 16px}
+.page{display:flex; align-items:center; gap:12px; height:36px; padding:0 12px; border:0; border-radius:18px; background:none;
+  font-size:14px; color:var(--ink); text-align:left}
+.page:hover{background:var(--hover)}
+.page.on{background:var(--accent-soft); color:#041e49; font-weight:500}
+.page .icon{width:18px; text-align:center; color:var(--ink-soft)}
+.page.on .icon{color:var(--accent)}
 .pins{margin-top:16px}
 .pin{display:flex; flex-direction:column; align-items:flex-start; width:100%; border:0; background:none; padding:6px 8px; border-radius:8px; text-align:left; min-width:0}
 .pin:hover{background:var(--hover)}

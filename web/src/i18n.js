@@ -5,8 +5,13 @@ const MESSAGES = {
   en: {
     appName: 'Agent Calendar',
     tagline: 'Claude Code & Codex sessions',
-    views: { day: 'Day', week: 'Week', month: 'Month', stats: 'Stats', plans: 'Schedules', repos: 'Repositories' },
+    views: { day: 'Day', week: 'Week', month: 'Month' },
     backToCalendar: 'Back to the calendar (today)',
+    pages: { calendar: 'Calendar', stats: 'Stats', plans: 'Schedules', repos: 'Repositories' },
+    mask: {
+      on: 'Screenshot mode: replace titles, repositories and text with sample content (numbers and times stay real)',
+      off: 'Turn off screenshot mode',
+    },
     today: 'Today',
     prev: 'Previous',
     next: 'Next',
@@ -27,7 +32,7 @@ const MESSAGES = {
     unpricedHint: 'Includes models without a known price (shown lower than actual)',
     apiPrice: 'At API prices',
     close: 'Close',
-    sidebar: { create: 'Create', menu: 'Main menu', insights: 'Time insights', moreInsights: 'More insights', hosts: 'Hosts', repos: 'Repositories', pinned: 'Pinned' },
+    sidebar: { create: 'Create', pages: 'Pages', menu: 'Main menu', insights: 'Time insights', moreInsights: 'More insights', hosts: 'Hosts', repos: 'Repositories', pinned: 'Pinned' },
     settings: {
       title: 'Settings',
       window: 'Update automatically between',
@@ -234,8 +239,13 @@ const MESSAGES = {
   ja: {
     appName: 'Agent Calendar',
     tagline: 'Claude Code と Codex のセッション',
-    views: { day: '日', week: '週', month: '月', stats: '集計', plans: '予定', repos: 'リポジトリ' },
+    views: { day: '日', week: '週', month: '月' },
     backToCalendar: 'カレンダーに戻る（今日）',
+    pages: { calendar: 'カレンダー', stats: '集計', plans: '予定', repos: 'リポジトリ' },
+    mask: {
+      on: 'スクショ用の表示: 題・リポジトリ・文章を作り物に置き換える（時間や件数は本物のまま）',
+      off: 'スクショ用の表示を切る',
+    },
     today: '今日',
     prev: '前へ',
     next: '次へ',
@@ -256,7 +266,7 @@ const MESSAGES = {
     unpricedHint: '単価の分からないモデルを含む（少なめに出ている）',
     apiPrice: 'API 単価換算',
     close: '閉じる',
-    sidebar: { create: '作成', menu: 'メインメニュー', insights: '時間の分析情報', moreInsights: 'その他の分析情報', hosts: 'ホスト', repos: 'リポジトリ', pinned: 'ピン留め' },
+    sidebar: { create: '作成', pages: '画面', menu: 'メインメニュー', insights: '時間の分析情報', moreInsights: 'その他の分析情報', hosts: 'ホスト', repos: 'リポジトリ', pinned: 'ピン留め' },
     settings: {
       title: '設定',
       window: '自動で更新する時間帯',

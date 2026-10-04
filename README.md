@@ -1,3 +1,5 @@
+<p align="center"><img src="web/public/favicon.svg" width="72" alt=""></p>
+
 # agent-calendar
 
 [English](README.md) | [日本語](README.ja.md)
@@ -9,6 +11,8 @@ summary of each session, active time and an API-price cost estimate per project,
 and ways to continue a session. You can also schedule an agent to run a prompt in a repository at set times.
 
 Everything runs on your machine. The page is served on `127.0.0.1` only.
+
+![The week view: each block is an agent session, colored by repository](docs/images/calendar-en.png)
 
 ## What you get
 
@@ -31,7 +35,19 @@ Everything runs on your machine. The page is served on `127.0.0.1` only.
 - **Screenshots** – paste or drop images (PNG, JPEG, GIF, WebP; up to 5, 5 MB each) into an instruction.
 - **Other machines** – collect sessions from another machine over HTTPS (pinned certificate and token) with
   `share` / `remote add`.
+- **Screenshot mode** (◐ in the header) – replaces repository names, titles, conversations, paths and diffs with
+  sample content while keeping times, counts and costs real, so you can share screenshots. Editing is disabled while it is on.
 - English and Japanese UI.
+
+### Screenshots
+
+| Session details | Changes |
+|---|---|
+| ![Summary, cost, commits and the conversation of a session](docs/images/session-en.png) | ![A GitHub-style diff of the session's changes](docs/images/changes-en.png) |
+| **Repositories** | **Stats** |
+| ![Repositories of your GitHub organizations next to local clones](docs/images/repos-en.png) | ![Active time and API-price cost per project](docs/images/stats-en.png) |
+
+The screenshots are taken in screenshot mode, so names and text are sample content.
 
 ## Install
 
