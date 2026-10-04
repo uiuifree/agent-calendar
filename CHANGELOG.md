@@ -13,7 +13,7 @@
 - Collect sessions from another machine over HTTPS with a pinned certificate (`share` / `remote add`)
 - Permission choices read-only / edit / auto; Claude's permission prompts appear on the page with allow, deny, or always allow here
 - Changes tab with a GitHub-style file list and diffs; links to the repository, branch and compare page on GitHub
-- Start a session in a separate git worktree on a new branch, cut from the default branch or a branch you pick; per-repository session list in the Repositories view
+- Start a session in a separate git worktree on a new branch, cut from the default branch or a branch you pick; choose the model when starting; per-repository session list in the Repositories view
 - Calendar stays at `/`; other views, the open session, its tab and full screen are kept in the URL
 - Daily update check against GitHub Releases; one-click (or automatic) update verified with sha256
 - Screenshot mode that replaces names and text with sample content for sharing screenshots

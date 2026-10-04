@@ -176,10 +176,43 @@ pub fn command(source: &str, id: &str, mode: Mode) -> (&'static str, Vec<String>
     }
 }
 
-/// 新しいセッションを始めるときの起動のしかた（予定の実行で使う）
-pub fn command_new(source: &str, mode: Mode) -> (&'static str, Vec<String>) {
+/// モデルの名前として受けてよい形か（`opus` のような別名か、`claude-opus-4-1` のような正式な名前）。
+/// `-` で始まるものは CLI の別のオプションとして読まれるので断る。その名前のモデルがあるかは CLI が決める
+pub fn valid_model(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= 100
+        && !model.starts_with('-')
+        && model
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._:/-[]".contains(c))
+}
+
+/// モデルを選ばずに始めたときに CLI が使うモデル（本人の設定に書いてあれば）。画面の「既定」に添えて見せる。
+/// Claude Code は `~/.claude/settings.json` の model、Codex は `~/.codex/config.toml` の先頭の model。
+/// 書いていなければ None（CLI の側の既定になるので、こちらからは分からない）
+pub fn cli_default_model(source: &str, home: &std::path::Path) -> Option<String> {
+    let model = if source == "codex" {
+        let text = std::fs::read_to_string(home.join(".codex/config.toml")).ok()?;
+        text.lines()
+            .take_while(|l| !l.trim_start().starts_with('['))
+            .find_map(|l| {
+                let (key, value) = l.split_once('=')?;
+                (key.trim() == "model").then(|| value.trim().trim_matches('"').to_string())
+            })?
+    } else {
+        let text = std::fs::read_to_string(home.join(".claude/settings.json")).ok()?;
+        serde_json::from_str::<Value>(&text).ok()?["model"]
+            .as_str()?
+            .to_string()
+    };
+    valid_model(&model).then_some(model)
+}
+
+/// 新しいセッションを始めるときの起動のしかた（「ここで始める」と予定の実行で使う）。
+/// model が空なら CLI の既定のモデルに任せる
+pub fn command_new(source: &str, mode: Mode, model: &str) -> (&'static str, Vec<String>) {
     let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-    if source == "codex" {
+    let (program, mut args) = if source == "codex" {
         let sandbox = codex_sandbox(mode);
         let mut args = s(&["exec", "-", "--json", "--skip-git-repo-check", "-c"]);
         args.push(format!("sandbox_mode=\"{sandbox}\""));
@@ -197,7 +230,11 @@ pub fn command_new(source: &str, mode: Mode) -> (&'static str, Vec<String>) {
                 perm,
             ]),
         )
+    };
+    if !model.is_empty() {
+        args.extend(s(&["--model", model]));
     }
+    (program, args)
 }
 
 /// 許可の問い合わせ（control_request の can_use_tool）を画面に出す形にする
@@ -815,9 +852,47 @@ mod tests {
             command("claude", "s1", Mode::Auto).1.last().unwrap(),
             "auto"
         );
-        assert_eq!(command_new("claude", Mode::Auto).1.last().unwrap(), "auto");
+        assert_eq!(
+            command_new("claude", Mode::Auto, "").1.last().unwrap(),
+            "auto"
+        );
+        // モデルを選んだときだけ --model を付ける（選ばなければ CLI の既定）
+        for agent in ["claude", "codex"] {
+            let a = command_new(agent, Mode::Edit, "opus").1;
+            assert_eq!(a[a.len() - 2..], ["--model", "opus"], "{agent}");
+            assert!(
+                !command_new(agent, Mode::Edit, "")
+                    .1
+                    .contains(&"--model".to_string())
+            );
+        }
+        assert!(valid_model("opus") && valid_model("claude-opus-4-1") && valid_model("opus[1m]"));
+        assert!(!valid_model("") && !valid_model("--dangerously-skip-permissions"));
+        assert!(!valid_model("a b") && !valid_model(&"x".repeat(101)));
+        // CLI の既定のモデルは本人の設定から読む。書いていない・読めないなら分からない
+        let home = crate::db::temp_dir("cli-default");
+        assert_eq!(cli_default_model("claude", &home), None);
+        assert_eq!(cli_default_model("codex", &home), None);
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(home.join(".claude/settings.json"), r#"{"model":"fable"}"#).unwrap();
+        std::fs::write(
+            home.join(".codex/config.toml"),
+            "approval = 1\nmodel = \"gpt-x\"\n[profiles.a]\nmodel = \"other\"\n",
+        )
+        .unwrap();
+        assert_eq!(cli_default_model("claude", &home).as_deref(), Some("fable"));
+        assert_eq!(cli_default_model("codex", &home).as_deref(), Some("gpt-x"));
+        std::fs::write(home.join(".claude/settings.json"), r#"{"model":"--x"}"#).unwrap();
+        std::fs::write(
+            home.join(".codex/config.toml"),
+            "[profiles.a]\nmodel = \"other\"\n",
+        )
+        .unwrap();
+        assert_eq!(cli_default_model("claude", &home), None);
+        assert_eq!(cli_default_model("codex", &home), None);
         assert!(
-            command_new("codex", Mode::Auto)
+            command_new("codex", Mode::Auto, "")
                 .1
                 .last()
                 .unwrap()
@@ -828,7 +903,7 @@ mod tests {
             Mode::Auto
         );
         assert_eq!(
-            command_new("claude", Mode::Read).1,
+            command_new("claude", Mode::Read, "").1,
             [
                 "-p",
                 "--output-format",
@@ -838,7 +913,7 @@ mod tests {
                 "plan"
             ]
         );
-        let (p, a) = command_new("codex", Mode::Edit);
+        let (p, a) = command_new("codex", Mode::Edit, "");
         assert_eq!(
             (p, a[..2].to_vec()),
             ("codex", vec!["exec".to_string(), "-".to_string()])

@@ -309,6 +309,7 @@ pub async fn run(args: &[String]) -> Result<()> {
         .route("/dirs", get(known_dirs))
         .route("/repos", get(repos_handler))
         .route("/repos/branches", get(branches_handler))
+        .route("/models", get(models_handler))
         .route("/repos/clone", post(clone_handler))
         .route(
             "/repos/start",
@@ -1497,6 +1498,39 @@ struct StartBody {
     /// どのブランチから切るか。空なら origin の既定のブランチ
     #[serde(default)]
     base: String,
+    /// 使うモデル。空なら CLI の既定
+    #[serde(default)]
+    model: String,
+}
+
+/// 「ここで始める」で選べるモデルの候補。このマシンのこれまでの記録に出てきたモデル（最近使った順）と、
+/// 選ばなかったときに CLI が使うモデル（本人の設定にあれば）。使えるモデルの一覧を CLI から取る口は無いので、記録からの見立て
+fn models_json(conn: &Connection, home: &std::path::Path) -> Result<Value> {
+    let mut stmt = conn.prepare(
+        "SELECT u.model FROM usage u JOIN sessions s ON s.id = u.session_id
+         WHERE s.machine = '' AND s.source = ?1 GROUP BY u.model ORDER BY MAX(u.bucket) DESC, u.model",
+    )?;
+    let mut out = serde_json::Map::new();
+    for source in ["claude", "codex"] {
+        let models = stmt
+            .query_map([source], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            // 記録には `<synthetic>` のような、モデルの名前でないものも入る
+            .filter(|m| send::valid_model(m))
+            .take(10)
+            .collect::<Vec<_>>();
+        out.insert(
+            source.into(),
+            json!({ "cli_default": send::cli_default_model(source, home), "models": models }),
+        );
+    }
+    Ok(Value::Object(out))
+}
+
+async fn models_handler(State(app): State<Shared>) -> ApiResult<Json<Value>> {
+    let conn = app.db.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(Json(models_json(&conn, &db::home())?))
 }
 
 #[derive(Deserialize)]
@@ -1550,6 +1584,10 @@ async fn start_handler(
     if b.agent != "claude" && b.agent != "codex" {
         return Err(bad("the agent must be claude or codex".into()));
     }
+    let model = b.model.trim().to_string();
+    if !model.is_empty() && !send::valid_model(&model) {
+        return Err(bad(format!("not a model name: {model}")));
+    }
     let set = {
         let conn = app.db.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
         settings::load(&conn)?
@@ -1580,7 +1618,7 @@ async fn start_handler(
     } else {
         (b.dir.clone(), None)
     };
-    let (program, mut args) = send::command_new(&b.agent, b.mode);
+    let (program, mut args) = send::command_new(&b.agent, b.mode, &model);
     // 画面から動かすので、許可の問い合わせは画面で受ける（Claude だけ）
     let (stdin, cleanup) = send::attach(
         &b.agent,
@@ -1755,6 +1793,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn model_candidates_come_from_the_records() {
+        let dir = db::temp_dir("models");
+        let conn = db::open_at(&dir.join("t.db")).unwrap();
+        seed(&conn, "old", "/r/a", 1000, "");
+        seed(&conn, "new", "/r/a", 2000, "");
+        seed(&conn, "far", "/r/a", 3000, "");
+        seed(&conn, "cx", "/r/a", 1500, "");
+        conn.execute_batch(
+            "UPDATE sessions SET machine = 'ai-node' WHERE id = 'far';
+             UPDATE sessions SET source = 'codex' WHERE id = 'cx';
+             INSERT INTO usage VALUES ('old', 1000, 'claude-opus-5', 'main', 0, 0, 1, 0, 0, 0);
+             INSERT INTO usage VALUES ('new', 2000, 'claude-fable-5-1', 'main', 0, 0, 1, 0, 0, 0);
+             INSERT INTO usage VALUES ('new', 2000, 'claude-haiku-4-5', 'subagent', 0, 0, 1, 0, 0, 0);
+             INSERT INTO usage VALUES ('new', 500, 'claude-sonnet-5', 'main', 0, 0, 1, 0, 0, 0);
+             INSERT INTO usage VALUES ('new', 2000, '<synthetic>', 'main', 0, 0, 1, 0, 0, 0);
+             INSERT INTO usage VALUES ('far', 3000, 'claude-sonnet-5', 'main', 0, 0, 1, 0, 0, 0);
+             INSERT INTO usage VALUES ('cx', 1500, 'gpt-x', 'main', 0, 0, 1, 0, 0, 0);",
+        )
+        .unwrap();
+        // そのモデルを最後に使った時刻の新しい順（セッションが新しくても、その中で昔使っただけのモデルは後ろ）。
+        // 別のマシンの記録・モデルの名前でないものは出さない
+        let v = models_json(&conn, &dir).unwrap();
+        assert_eq!(
+            v["claude"]["models"],
+            json!([
+                "claude-fable-5-1",
+                "claude-haiku-4-5",
+                "claude-opus-5",
+                "claude-sonnet-5"
+            ])
+        );
+        assert_eq!(
+            v["codex"],
+            json!({ "cli_default": null, "models": ["gpt-x"] })
+        );
+        assert_eq!(v["claude"]["cli_default"], Value::Null);
+    }
+
     #[tokio::test]
     async fn pages_cannot_be_framed() {
         use tower::ServiceExt;
@@ -1885,6 +1962,7 @@ mod tests {
             archived: false,
             pushed_at: String::new(),
             url: String::new(),
+            default_branch: "main".into(),
         };
         app.gh_cache.lock().unwrap().insert(
             "uiuifree".into(),
@@ -1934,6 +2012,7 @@ mod tests {
             worktree: false,
             branch: String::new(),
             base: String::new(),
+            model: String::new(),
         };
         let ours = root.join("agent-calendar").to_string_lossy().into_owned();
         let theirs = root.join("theirs").to_string_lossy().into_owned();
@@ -1951,6 +2030,10 @@ mod tests {
             start(ours.clone(), "gpt", "見て"),
             start(theirs, "claude", "見て"),
             start("/tmp".into(), "claude", "見て"),
+            StartBody {
+                model: "--dangerously-skip-permissions".into(),
+                ..start(ours.clone(), "claude", "見て")
+            },
         ] {
             let e = start_handler(State(app.clone()), local_headers(), Json(b))
                 .await

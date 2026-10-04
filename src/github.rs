@@ -92,9 +92,11 @@ pub struct Remote {
     pub archived: bool,
     pub pushed_at: String,
     pub url: String,
+    /// GitHub の既定のブランチ（「ここで始める」の出発点。空のリポジトリなどで分からなければ空）
+    pub default_branch: String,
 }
 
-const LIST_FIELDS: &str = "name,description,isPrivate,isArchived,pushedAt,url";
+const LIST_FIELDS: &str = "name,description,isPrivate,isArchived,pushedAt,url,defaultBranchRef";
 
 fn parse_list(owner: &str, json: &str) -> Result<Vec<Remote>> {
     let v: Vec<Value> = serde_json::from_str(json).context("gh output is not a JSON list")?;
@@ -108,6 +110,10 @@ fn parse_list(owner: &str, json: &str) -> Result<Vec<Remote>> {
                 archived: r["isArchived"].as_bool().unwrap_or(false),
                 pushed_at: r["pushedAt"].as_str().unwrap_or("").to_string(),
                 url: r["url"].as_str().unwrap_or("").to_string(),
+                default_branch: r["defaultBranchRef"]["name"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
             })
         })
         .collect())
@@ -433,7 +439,7 @@ mod tests {
         let ok = fake_gh(
             &dir,
             "ok",
-            r#"echo '[{"name":"agent-calendar","description":null,"isPrivate":false,"isArchived":false,"pushedAt":"2026-10-04T00:00:00Z","url":"https://github.com/uiuifree/agent-calendar"},{"description":"no name"}]'"#,
+            r#"echo '[{"name":"agent-calendar","description":null,"isPrivate":false,"isArchived":false,"pushedAt":"2026-10-04T00:00:00Z","url":"https://github.com/uiuifree/agent-calendar","defaultBranchRef":{"name":"develop"}},{"description":"no name"}]'"#,
         );
         let l = list_with(&set, "uiuifree", &["sh", &ok]).unwrap();
         assert_eq!(l.len(), 1);
@@ -441,9 +447,10 @@ mod tests {
             (
                 l[0].owner.as_str(),
                 l[0].name.as_str(),
-                l[0].description.as_str()
+                l[0].description.as_str(),
+                l[0].default_branch.as_str()
             ),
-            ("uiuifree", "agent-calendar", "")
+            ("uiuifree", "agent-calendar", "", "develop")
         );
         let args = std::fs::read_to_string(dir.join("args")).unwrap();
         assert!(args.starts_with("repo list uiuifree --limit 1000 --json "));

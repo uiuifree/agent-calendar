@@ -1,6 +1,6 @@
 <script setup>
-import { computed, onUnmounted, ref, watch } from 'vue'
-import { getBranches, startSession } from '../api.js'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { getBranches, getModels, startSession } from '../api.js'
 import { useEscape } from '../dialog.js'
 import { locale, t } from '../i18n.js'
 import { MAX_IMAGES, pickImages, toPayload } from '../images.js'
@@ -16,18 +16,33 @@ const emit = defineEmits(['close', 'opened', 'ran', 'failed'])
 useEscape(() => emit('close'))
 
 const agent = ref('claude')
-const mode = ref('edit') // 許可の初期値は「ファイルの編集まで」（ユーザーの指定）
+const mode = ref('auto') // 許可の初期値は「自動判定」（ユーザーの指定）
 const prompt = ref('')
+// 使うモデル。空なら CLI の既定。候補はこのマシンの記録に出てきたモデル（最近使った順）。取れなくても既定のまま始められる
+const model = ref('')
+const models = ref({}) // { claude: { cli_default, models }, codex: … }
+onMounted(async () => {
+  try {
+    models.value = await getModels()
+  } catch {
+    models.value = {}
+  }
+})
+// エージェントを切り替えたら消す（Claude のモデル名を Codex に渡さない）
+watch(agent, () => (model.value = ''))
 const running = ref(false)
 const live = ref([])
 const sessionId = ref(null)
 // 別の作業場所（git worktree）を新しいブランチで切ってそこで始める。切った場所は最初の 1 行で届く
 const worktree = ref(false)
 const branch = ref('')
-// どのブランチから切るか。空は origin の既定のブランチ（分からなければ手元のいまの HEAD）。
+// どのブランチから切るか。空は origin の既定のブランチ。
 // 一覧は手元にある記録から（origin のものと手元のもの）。取れなくても既定のまま始められる
 const base = ref('')
 const branches = ref(null) // { default, branches }
+// 既定のブランチの名前。GitHub の一覧で分かっている名前が正（手元の origin/HEAD は clone したときのままで、
+// GitHub で既定を変えても追従しない）。一覧に無いときだけ手元の記録を使う
+const defaultBranch = computed(() => props.repo.default_branch || branches.value?.default || '')
 watch(worktree, async (on) => {
   if (!on || branches.value) return
   try {
@@ -74,7 +89,9 @@ async function run() {
       images,
       worktree: worktree.value,
       branch: branch.value.trim(),
-      base: base.value,
+      // 既定のブランチも名前で渡す（空のままだと、手元に origin/HEAD の記録が無い clone では HEAD から切られる）
+      base: base.value || defaultBranch.value,
+      model: model.value.trim(),
     }
     await startSession(input, (ev) => {
       if (ev.kind === 'session') {
@@ -119,6 +136,10 @@ function onKey(e) {
           <option value="edit">{{ t('conv.modeEdit') }}</option>
           <option value="auto">{{ t('conv.modeAuto') }}</option>
         </select>
+        <select v-model="model" class="model" :disabled="running || finished" :aria-label="t('repos.model')">
+          <option value="">{{ models[agent]?.cli_default ? t('repos.modelDefault', { name: models[agent].cli_default }) : t('repos.modelDefaultUnknown') }}</option>
+          <option v-for="m in models[agent]?.models ?? []" :key="m" :value="m">{{ m }}</option>
+        </select>
       </div>
       <label class="check">
         <input v-model="worktree" type="checkbox" :disabled="running || finished" />
@@ -127,7 +148,7 @@ function onKey(e) {
       <label v-if="worktree" class="base">
         {{ t('repos.base') }}
         <select v-model="base" :disabled="running || finished">
-          <option value="">{{ branches?.default ? t('repos.baseDefault', { name: branches.default }) : t('repos.baseHead') }}</option>
+          <option value="">{{ defaultBranch ? t('repos.baseDefault', { name: defaultBranch }) : t('repos.baseHead') }}</option>
           <option v-for="b in branches?.branches ?? []" :key="b" :value="b">{{ b }}</option>
         </select>
       </label>
@@ -178,6 +199,7 @@ h2{font-size:22px; font-weight:400; margin:0 0 4px}
 .small{font-size:12px}
 .row{display:flex; gap:8px; margin:12px 0 8px}
 .check{display:flex; align-items:center; gap:8px; font-size:13px; margin:0 0 8px}
+.model{flex:1; min-width:0}
 .base{display:flex; align-items:center; gap:8px; font-size:13px; margin:0 0 8px}
 .base select{flex:1; min-width:0}
 .branch{width:100%; height:36px; border:1px solid var(--outline); border-radius:8px; padding:0 10px; font:inherit; font-family:"Roboto Mono","Noto Sans Mono CJK JP",monospace; font-size:13px; margin-bottom:8px}

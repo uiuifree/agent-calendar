@@ -646,7 +646,7 @@ pub fn launch(
     let continuing = d.last_session_id.as_deref().filter(|_| d.continue_session);
     let (program, args) = match continuing {
         Some(sid) => send::command(&d.agent, sid, mode),
-        None => send::command_new(&d.agent, mode),
+        None => send::command_new(&d.agent, mode, ""),
     };
     let job = send::Job {
         program: program.to_string(),
