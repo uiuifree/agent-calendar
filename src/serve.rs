@@ -240,7 +240,7 @@ async fn update_install_handler(
 }
 
 /// GitHub の一覧を使い回す長さ（画面の「読み直す」で取り直せる）
-const GH_CACHE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+const GH_CACHE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 type Shared = Arc<App>;
 
