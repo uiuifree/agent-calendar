@@ -1790,11 +1790,10 @@ async fn start_handler(
             name => name.to_string(),
         };
         let (dir, br, from) = (b.dir.clone(), branch.clone(), b.base.trim().to_string());
-        let (path, base) = tokio::task::spawn_blocking(move || {
-            schedule::new_worktree(&dir, &br, &from, &schedule::worktrees_dir())
-        })
-        .await?
-        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
+        let (path, base) =
+            tokio::task::spawn_blocking(move || schedule::new_worktree(&dir, &br, &from))
+                .await?
+                .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
         let line = json!({ "kind": "worktree", "path": path, "branch": branch, "base": base });
         (path, Some(format!("{line}\n")))
     } else {

@@ -451,46 +451,71 @@ fn git_toplevel(dir: &str) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// git の管理フォルダ（作業場所どうしで共有する方）。同じリポジトリの作業場所かを見分ける
+fn common_dir(dir: &str) -> Option<String> {
+    let out = Command::new("git")
+        .args([
+            "-C",
+            dir,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// 管理フォルダの設定値。無ければ None
+fn git_config(git_dir: &str, key: &str) -> Option<String> {
+    let out = Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["config", key])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 /// 予定専用の作業コピー。初回に作り、以後は同じものを使う（消すのは人が決める）。戻り値は (場所, ブランチ)。
-/// 置き場所は予定とリポジトリの組ごと。予定のディレクトリを別のリポジトリに変えたら新しく作り、古い方は残す
-pub fn ensure_worktree(dir: &str, id: i64, base: &Path) -> Result<(String, String)> {
+/// 置き場所は予定とリポジトリの組ごと。予定のディレクトリを別のリポジトリに変えたら新しく作り、古い方は残す。
+/// そのブランチの作業コピーがすでにあれば（置き場所を変える前に作ったものも）そこを使う
+pub fn ensure_worktree(dir: &str, id: i64) -> Result<(String, String)> {
     let top = git_toplevel(dir).context("a worktree needs a git repository")?;
-    let path = base.join(format!(
-        "{id}-{}",
-        &crate::share::sha256_hex(top.as_bytes())[..8]
-    ));
     let branch = format!("agent-calendar/schedule-{id}");
-    if !path.is_dir() {
-        std::fs::create_dir_all(base)?;
-        // ブランチが残っていれば（人が worktree だけ消したなど）そのまま使い、動かさない。
-        // -B で作り直すと、そこに commit した成果がブランチから外れる
-        let exists = Command::new("git")
-            .args([
-                "-C",
-                &top,
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}"),
-            ])
-            .output()
-            .is_ok_and(|o| o.status.success());
-        let mut cmd = Command::new("git");
-        cmd.args(["-C", &top, "worktree", "add"]);
-        if exists {
-            cmd.arg(&path).arg(&branch);
-        } else {
-            cmd.args(["-b", &branch]).arg(&path);
-        }
-        let out = cmd.output().context("cannot run git")?;
-        if !out.status.success() {
-            bail!(
-                "git worktree add failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
+    if let Some(w) = worktrees(&top).into_iter().find(|w| w.branch == branch) {
+        return Ok((w.path, branch));
     }
-    Ok((path.to_string_lossy().into_owned(), branch))
+    let path = beside_main(&top, &branch)?;
+    // 中で別のブランチに切り替えていても、置き場所にあればそれを使う。
+    // 置き場所はリポジトリの隣なので、同じ名前の関係ないフォルダなら使わない（そこでエージェントを動かさない）
+    if Path::new(&path).is_dir() {
+        if common_dir(&path).is_some_and(|c| Some(c) == common_dir(&top)) {
+            return Ok((path, branch));
+        }
+        bail!("{path} already exists and is not a worktree of {top}");
+    }
+    // ブランチが残っていれば（人が worktree だけ消したなど）そのまま使い、動かさない。
+    // -B で作り直すと、そこに commit した成果がブランチから外れる
+    let mut cmd = Command::new("git");
+    cmd.args(["-C", &top, "worktree", "add"]);
+    if has_ref(&top, &format!("refs/heads/{branch}")) {
+        cmd.arg(&path).arg(&branch);
+    } else {
+        cmd.args(["-b", &branch]).arg(&path);
+    }
+    let out = cmd.output().context("cannot run git")?;
+    if !out.status.success() {
+        bail!(
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok((path, branch))
 }
 
 pub fn valid_branch(name: &str) -> bool {
@@ -535,7 +560,7 @@ fn start_point(top: &str, from: &str) -> Result<(String, String)> {
 /// 「ここで始める」で切る作業場所。`from`（空なら既定のブランチ）から新しいブランチを作り、別の作業フォルダに置く。
 /// 手元の作業コピーには触らない。ブランチがすでにあれば断る（人の作業を上書きしない）。
 /// 戻り値は (作業フォルダ, 出発点)
-pub fn new_worktree(dir: &str, branch: &str, from: &str, base: &Path) -> Result<(String, String)> {
+pub fn new_worktree(dir: &str, branch: &str, from: &str) -> Result<(String, String)> {
     let top = git_toplevel(dir).context("a worktree needs a git repository")?;
     if !valid_branch(branch) {
         bail!("not a valid branch name: {branch}");
@@ -544,15 +569,10 @@ pub fn new_worktree(dir: &str, branch: &str, from: &str, base: &Path) -> Result<
         bail!("the branch {branch} already exists");
     }
     let (start, shown) = start_point(&top, from)?;
-    let path = base.join(format!(
-        "{}-{}",
-        &crate::share::sha256_hex(top.as_bytes())[..8],
-        branch.replace('/', "-")
-    ));
-    if path.exists() {
-        bail!("{} already exists", path.display());
+    let path = beside_main(&top, branch)?;
+    if Path::new(&path).exists() {
+        bail!("{path} already exists");
     }
-    std::fs::create_dir_all(base)?;
     // origin のブランチから切っても、そこを push 先にはしない（--no-track。既定のブランチへ push させない）
     let out = Command::new("git")
         .args(["-C", &top, "worktree", "add", "--no-track", "-b", branch])
@@ -566,7 +586,54 @@ pub fn new_worktree(dir: &str, branch: &str, from: &str, base: &Path) -> Result<
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok((path.to_string_lossy().into_owned(), shown))
+    Ok((path, shown))
+}
+
+/// 作業場所の置き場: 本体の作業コピーの隣の `<リポジトリ名>-<ブランチ名>`（JetBrains の IDE と同じ並び）。
+/// 本体の中に置くと IDE が別のリポジトリと取り違える。作業場所の中から切っても、本体の隣に置く
+fn beside_main(top: &str, branch: &str) -> Result<String> {
+    // 本体の中から切るなら top が本体（サブモジュールもこちら。git の管理フォルダが .git/modules/ にある）。
+    // 作業場所の中からなら、管理フォルダから本体を求める。サブモジュールの管理フォルダは本体の場所を
+    // core.worktree に持ち、ふつうのリポジトリは管理フォルダ（.git）の親が本体。
+    // worktree list の出力は日本語などのパスを引用符つきで返すので使わない
+    let out = Command::new("git")
+        .args([
+            "-C",
+            top,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+        ])
+        .output()
+        .context("cannot run git")?;
+    let dirs = String::from_utf8_lossy(&out.stdout);
+    let mut dirs = dirs.lines();
+    let (git_dir, common) = (dirs.next(), dirs.next().unwrap_or_default());
+    let main = if git_dir == Some(common) {
+        top.to_string()
+    } else if let Some(wt) = git_config(common, "core.worktree") {
+        let p = Path::new(common).join(wt);
+        std::fs::canonicalize(&p)
+            .with_context(|| format!("cannot find the main working copy {}", p.display()))?
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        crate::repo::git_root(top).context("cannot find the main working copy")?
+    };
+    let main = Path::new(&main);
+    let (parent, name) = main
+        .parent()
+        .zip(main.file_name())
+        .context("the main working copy has no parent folder")?;
+    Ok(parent
+        .join(format!(
+            "{}-{}",
+            name.to_string_lossy(),
+            branch.replace('/', "-")
+        ))
+        .to_string_lossy()
+        .into_owned())
 }
 
 /// すでにある作業場所（git worktree）
@@ -577,6 +644,38 @@ pub struct Worktree {
     pub branch: String,
 }
 
+/// git が引用符で包んだパスを元に戻す。git 2.36 から、worktree list は日本語・引用符・制御文字を含むパスを
+/// `"/a/\346\227\245"` のように C の書き方で返す（core.quotePath）。包まれていなければそのまま
+fn unquote(s: &str) -> String {
+    let Some(inner) = s.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
+        return s.to_string();
+    };
+    let mut out = Vec::new();
+    let mut bytes = inner.bytes();
+    while let Some(b) = bytes.next() {
+        if b != b'\\' {
+            out.push(b);
+            continue;
+        }
+        let Some(e) = bytes.next() else { break };
+        out.push(match e {
+            b'a' => 7,
+            b'b' => 8,
+            b't' => b'\t',
+            b'n' => b'\n',
+            b'v' => 11,
+            b'f' => 12,
+            b'r' => b'\r',
+            // 3 桁の 8 進数（UTF-8 の 1 バイトずつ）
+            b'0'..=b'7' => bytes.by_ref().take(2).fold(e - b'0', |n, d| {
+                n.wrapping_mul(8).wrapping_add(d.wrapping_sub(b'0'))
+            }),
+            other => other, // \" と \\
+        });
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// `git worktree list --porcelain` の出力から、選べる作業場所を取り出す（パスの順）。
 /// 先頭は本体の作業コピーなので除く。フォルダが消えているもの（prunable）と bare も除く
 fn parse_worktrees(porcelain: &str) -> Vec<Worktree> {
@@ -585,7 +684,7 @@ fn parse_worktrees(porcelain: &str) -> Vec<Worktree> {
         .skip(1)
         .filter_map(|block| {
             let mut lines = block.lines();
-            let path = lines.next()?.strip_prefix("worktree ")?.to_string();
+            let path = unquote(lines.next()?.strip_prefix("worktree ")?);
             let rest: Vec<&str> = lines.collect();
             if rest
                 .iter()
@@ -615,14 +714,6 @@ pub fn worktrees(dir: &str) -> Vec<Worktree> {
         .filter(|o| o.status.success())
         .map(|o| parse_worktrees(&String::from_utf8_lossy(&o.stdout)))
         .unwrap_or_default()
-}
-
-pub fn worktrees_dir() -> std::path::PathBuf {
-    db::path()
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_default()
-        .join("worktrees")
 }
 
 /// 作業コピーに残っている変更の数（実行のあと、見に行くべきものがあるか）
@@ -687,7 +778,7 @@ pub fn launch(
         Ok(run_id)
     };
     let (cwd, branch) = if d.worktree {
-        match ensure_worktree(&d.dir, d.id, &worktrees_dir()) {
+        match ensure_worktree(&d.dir, d.id) {
             Ok(v) => v,
             Err(e) => return fail("failed", format!("{e:#}")),
         }
@@ -1244,6 +1335,112 @@ mod tests {
     }
 
     #[test]
+    fn unquotes_paths_from_git() {
+        assert_eq!(unquote("/a/b c"), "/a/b c");
+        assert_eq!(unquote("\"/a/\\346\\227\\245\\346\\234\\254\""), "/a/日本");
+        assert_eq!(
+            unquote("\"\\a\\b\\t\\n\\v\\f\\r\\\"\\\\\""),
+            "\u{7}\u{8}\t\n\u{b}\u{c}\r\"\\"
+        );
+        assert_eq!(unquote("\"x\\\""), "x"); // 末尾が \ だけなら捨てる
+    }
+
+    /// 本体のパスに日本語があっても、本体の隣に作る
+    #[test]
+    fn worktree_beside_japanese_repo() {
+        let dir = db::temp_dir("sched-wt-ja");
+        let repo = dir.join("日本語");
+        std::fs::create_dir_all(&repo).unwrap();
+        let r = repo.to_str().unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &[
+                "-c",
+                "user.email=a@b",
+                "-c",
+                "user.name=a",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "x",
+            ],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(r)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let (ws, _) = new_worktree(r, "feature/ja", "").unwrap();
+        assert_eq!(Path::new(&ws), dir.join("日本語-feature-ja"));
+        let (path, _) = ensure_worktree(r, 3).unwrap();
+        assert_eq!(
+            Path::new(&path),
+            dir.join("日本語-agent-calendar-schedule-3")
+        );
+        // 2 回目は一覧から見つけて同じ場所を使う（日本語のパスでも取り違えない）
+        assert_eq!(ensure_worktree(r, 3).unwrap().0, path);
+        // 中で別のブランチに切り替えても、同じ場所を使い続ける
+        let st = Command::new("git")
+            .args(["-C", &path, "checkout", "-q", "-b", "other"])
+            .status()
+            .unwrap();
+        assert!(st.success());
+        assert_eq!(ensure_worktree(r, 3).unwrap().0, path);
+        // 置き場所に同じ名前の関係ないフォルダがあれば、そこでは動かさない
+        std::fs::create_dir_all(dir.join("日本語-agent-calendar-schedule-4")).unwrap();
+        let e = ensure_worktree(r, 4).unwrap_err();
+        assert!(e.to_string().contains("is not a worktree of"), "{e}");
+    }
+
+    /// サブモジュールから切っても、git の管理フォルダ（.git/modules/）ではなく作業フォルダの隣に作る
+    #[test]
+    fn worktree_beside_submodule() {
+        let dir = db::temp_dir("sched-wt-sub");
+        let git = |at: &Path, args: &[&str]| {
+            std::fs::create_dir_all(at).unwrap();
+            let st = Command::new("git")
+                .arg("-C")
+                .arg(at)
+                .args([
+                    "-c",
+                    "user.email=a@b",
+                    "-c",
+                    "user.name=a",
+                    "-c",
+                    "protocol.file.allow=always",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                st.status.success(),
+                "{}",
+                String::from_utf8_lossy(&st.stderr)
+            );
+        };
+        let (sub, parent) = (dir.join("sub"), dir.join("parent"));
+        git(&sub, &["init", "-q"]);
+        git(&sub, &["commit", "-q", "--allow-empty", "-m", "s"]);
+        git(&parent, &["init", "-q"]);
+        git(
+            &parent,
+            &["submodule", "add", "-q", sub.to_str().unwrap(), "mod"],
+        );
+        let m = parent.join("mod");
+        let (ws, _) = new_worktree(m.to_str().unwrap(), "feature/s", "").unwrap();
+        assert_eq!(Path::new(&ws), parent.join("mod-feature-s"));
+        // サブモジュールの作業場所の中から切っても、サブモジュールの作業フォルダの隣
+        let (nested, _) = new_worktree(&ws, "feature/t", "").unwrap();
+        assert_eq!(Path::new(&nested), parent.join("mod-feature-t"));
+    }
+
+    #[test]
     fn worktree_is_created_once() {
         let dir = db::temp_dir("sched-wt");
         let repo = dir.join("repo");
@@ -1272,17 +1469,21 @@ mod tests {
             "x",
         ]);
         // 「ここで始める」の作業場所: 新しいブランチで切る。同じブランチ・おかしな名前は断る
-        let wbase = dir.join("start-wts");
         let r = repo.to_str().unwrap();
-        // origin/HEAD が分からないうちは、いまの HEAD から切る
-        let (ws, from) = new_worktree(r, "feature/try-1", "", &wbase).unwrap();
-        assert!(ws.ends_with("-feature-try-1"));
+        // origin/HEAD が分からないうちは、いまの HEAD から切る。置き場所は本体の隣
+        let (ws, from) = new_worktree(r, "feature/try-1", "").unwrap();
+        assert_eq!(Path::new(&ws), dir.join("repo-feature-try-1"));
         assert_eq!(from, "HEAD");
         assert!(Path::new(&ws).join(".git").exists());
-        assert!(new_worktree(r, "feature/try-1", "", &wbase).is_err());
-        assert!(new_worktree(r, "bad..name", "", &wbase).is_err());
-        assert!(new_worktree(r, "-x", "", &wbase).is_err());
-        assert!(new_worktree(dir.to_str().unwrap(), "y", "", &wbase).is_err()); // git ではない
+        assert!(new_worktree(r, "feature/try-1", "").is_err());
+        assert!(new_worktree(r, "bad..name", "").is_err());
+        assert!(new_worktree(r, "-x", "").is_err());
+        assert!(new_worktree(dir.to_str().unwrap(), "y", "").is_err()); // git ではない
+        // 作業場所の中から切っても、入れ子にせず本体の隣
+        let (nested, _) = new_worktree(&ws, "feature/nested", "").unwrap();
+        assert_eq!(Path::new(&nested), dir.join("repo-feature-nested"));
+        git(&["worktree", "remove", &nested]);
+        git(&["branch", "-D", "feature/nested"]);
         // 出発点: origin の既定のブランチ（1 つ前のコミット）と、手元だけのブランチ（その先のコミット）を用意する
         let rev = |dir: &str, name: &str| {
             let o = Command::new("git")
@@ -1316,17 +1517,17 @@ mod tests {
         let origin_main = rev(r, "refs/remotes/origin/main");
         assert_ne!(origin_main, rev(r, "HEAD"));
         // 空なら既定のブランチから（いまの HEAD からではない）。そこを push 先にはしない
-        let (ws, from) = new_worktree(r, "feature/try-2", "", &wbase).unwrap();
+        let (ws, from) = new_worktree(r, "feature/try-2", "").unwrap();
         assert_eq!(from, "origin/main");
         assert_eq!(rev(&ws, "HEAD"), origin_main);
         assert!(!has_ref(r, "feature/try-2@{upstream}"));
         // 選んだブランチから。origin と手元の両方にあれば origin、origin に無ければ手元
-        let (ws, from) = new_worktree(r, "feature/try-3", "release", &wbase).unwrap();
+        let (ws, from) = new_worktree(r, "feature/try-3", "release").unwrap();
         assert_eq!(
             (from.as_str(), rev(&ws, "HEAD")),
             ("origin/release", origin_main)
         );
-        let (ws, from) = new_worktree(r, "feature/try-4", "local-only", &wbase).unwrap();
+        let (ws, from) = new_worktree(r, "feature/try-4", "local-only").unwrap();
         assert_eq!(from, "local-only");
         assert_eq!(rev(&ws, "HEAD"), rev(r, "HEAD"));
         // すでにある作業場所の一覧: 切ったものが出て、本体の作業コピーは出ない
@@ -1348,7 +1549,8 @@ mod tests {
                  worktree /w/z\nHEAD b\nbranch refs/heads/feature/z\n\n\
                  worktree /w/d\nHEAD c\ndetached\n\n\
                  worktree /w/gone\nHEAD d\nbranch refs/heads/gone\nprunable gitdir file points to non-existent location\n\n\
-                 worktree /w/bare\nbare\n"
+                 worktree /w/bare\nbare\n\n\
+                 worktree \"/w/\\346\\227\\245\"\nHEAD e\nbranch refs/heads/feature/j\n"
             ),
             [
                 Worktree {
@@ -1359,12 +1561,16 @@ mod tests {
                     path: "/w/z".into(),
                     branch: "feature/z".into()
                 },
+                Worktree {
+                    path: "/w/日".into(),
+                    branch: "feature/j".into()
+                },
             ]
         );
         // 無いブランチ・ブランチ名でないものは断る
-        assert!(new_worktree(r, "feature/try-5", "nope", &wbase).is_err());
-        assert!(new_worktree(r, "feature/try-5", "main~1", &wbase).is_err());
-        assert!(new_worktree(r, "feature/try-5", "-x", &wbase).is_err());
+        assert!(new_worktree(r, "feature/try-5", "nope").is_err());
+        assert!(new_worktree(r, "feature/try-5", "main~1").is_err());
+        assert!(new_worktree(r, "feature/try-5", "-x").is_err());
         assert_eq!(
             (
                 crate::github::default_branch(r).as_deref(),
@@ -1386,14 +1592,11 @@ mod tests {
                 .to_vec()
             )
         );
-        let base = dir.join("wts");
-        let (path, branch) = ensure_worktree(repo.to_str().unwrap(), 7, &base).unwrap();
+        let (path, branch) = ensure_worktree(repo.to_str().unwrap(), 7).unwrap();
         assert_eq!(branch, "agent-calendar/schedule-7");
+        assert_eq!(Path::new(&path), dir.join("repo-agent-calendar-schedule-7"));
         assert!(Path::new(&path).join(".git").exists());
-        assert_eq!(
-            ensure_worktree(repo.to_str().unwrap(), 7, &base).unwrap().0,
-            path
-        );
+        assert_eq!(ensure_worktree(repo.to_str().unwrap(), 7).unwrap().0, path);
         std::fs::write(Path::new(&path).join("new.txt"), "x").unwrap();
         assert_eq!(changes(&path), Some(1));
         // 作業コピーに commit したあと、人が作業コピーだけ消しても、作り直しでブランチの成果を失わない
@@ -1420,7 +1623,7 @@ mod tests {
             "work",
         ]);
         git(&["worktree", "remove", "--force", &path]);
-        let again = ensure_worktree(repo.to_str().unwrap(), 7, &base).unwrap().0;
+        let again = ensure_worktree(repo.to_str().unwrap(), 7).unwrap().0;
         assert!(Path::new(&again).join("new.txt").exists());
         // 別のリポジトリに変えたら別の作業コピー
         let other = dir.join("other");
@@ -1449,12 +1652,23 @@ mod tests {
             "x",
         ]);
         assert_ne!(
-            ensure_worktree(other.to_str().unwrap(), 7, &base)
-                .unwrap()
-                .0,
+            ensure_worktree(other.to_str().unwrap(), 7).unwrap().0,
             again
         );
-        assert!(ensure_worktree(dir.to_str().unwrap(), 8, &base).is_err());
-        assert!(worktrees_dir().ends_with("agent-calendar/worktrees"));
+        assert!(ensure_worktree(dir.to_str().unwrap(), 8).is_err());
+        // 置き場所を変える前に作った作業コピーは、そのまま使い続ける
+        let old = dir.join("old-place");
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "agent-calendar/schedule-9",
+            old.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            Path::new(&ensure_worktree(repo.to_str().unwrap(), 9).unwrap().0),
+            old
+        );
     }
 }

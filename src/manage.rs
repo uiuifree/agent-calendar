@@ -123,10 +123,9 @@ mod tests {
         };
         git(r, &["init", "-q", "-b", "main"]).unwrap();
         commit(r, "x");
-        let wbase = dir.join("wts");
-        let (merged, _) = schedule::new_worktree(r, "feature/merged", "", &wbase).unwrap();
-        let (ahead, _) = schedule::new_worktree(r, "feature/ahead", "", &wbase).unwrap();
-        let (dirty, _) = schedule::new_worktree(r, "feature/dirty", "", &wbase).unwrap();
+        let (merged, _) = schedule::new_worktree(r, "feature/merged", "").unwrap();
+        let (ahead, _) = schedule::new_worktree(r, "feature/ahead", "").unwrap();
+        let (dirty, _) = schedule::new_worktree(r, "feature/dirty", "").unwrap();
         commit(&ahead, "y"); // main に取り込まれていない commit
         std::fs::write(Path::new(&dirty).join("left.txt"), "作業の途中").unwrap();
 

@@ -44,7 +44,7 @@ fn resolve_uncached(cwd: &str) -> String {
     cwd.to_string()
 }
 
-fn git_root(dir: &str) -> Option<String> {
+pub fn git_root(dir: &str) -> Option<String> {
     let out = Command::new("git")
         .args([
             "-C",
