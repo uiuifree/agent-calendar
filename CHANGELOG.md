@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.2
+
+- Repositories view: the GitHub repository list is now reused for 24 hours (was 10 minutes); Reload still fetches it again
+
 ## 0.1.1
 
 - The page now listens on port 23848 by default (was 8082, which collides with common development servers); `--port` still changes it
