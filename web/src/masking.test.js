@@ -74,6 +74,7 @@ it('ツールの名前・GitHub のリンク・ファイルのパス', () => {
   expect(b.branches[0]).toBe('main')
   expect(b.branches[1]).toMatch(/^feature\//)
   expect(maskData({ default: null }).default).toBe(null)
+  expect(maskData({ checked_out: '/home/me/Secret Client' }).checked_out).not.toMatch(/Secret/)
   expect(m.files[0].path).toMatch(/\.rs$/)
   expect(m.files[0].path).not.toContain('billing')
   expect(m.files[0].added).toBe(3)

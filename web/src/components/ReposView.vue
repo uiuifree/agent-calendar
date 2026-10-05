@@ -4,6 +4,7 @@ import { cloneRepo, getRepoSessions, getRepos, getSession, rescan } from '../api
 import { locale, t } from '../i18n.js'
 import { DAY_MS } from '../layout.js'
 import { repoColor } from '../colors.js'
+import RepoMenu from './RepoMenu.vue'
 import StartDialog from './StartDialog.vue'
 
 // リポジトリの画面: 先に組織を選び、その組織の GitHub のリポジトリを表で並べる（手元にあるものを上、無いものはたたむ）。
@@ -22,6 +23,7 @@ const query = ref('')
 const cloneRoot = ref('')
 const cloning = ref(null) // clone 中のリポジトリ（owner/name）
 const starting = ref(null) // 「ここで始める」を開いているリポジトリ
+const managing = ref(null) // メニュー（作業場所とブランチの片付け）を開いているリポジトリ
 // 始まって会話の画面へ移ったあとも、終わるまではダイアログを隠したまま残す（終わりの失敗の理由を受け取るため）
 const startHidden = ref(false)
 function closeStart() {
@@ -189,6 +191,7 @@ async function opened(id) {
                 {{ t('repos.sessions', { n: r.sessions }) }} {{ openRepo === r.local ? '▾' : '▸' }}
               </button>
               <button class="btn small accent" @click="starting = r">{{ t('repos.start') }}</button>
+              <button class="btn small more" :aria-label="t('repos.menu.open')" :title="t('repos.menu.open')" @click="managing = r">⋯</button>
             </span>
           </div>
           <div v-if="openRepo === r.local" class="sessions">
@@ -228,6 +231,7 @@ async function opened(id) {
         </div>
       </template>
     </template>
+    <RepoMenu v-if="managing" :repo="managing" @close="managing = null" @changed="emit('changed')" />
     <StartDialog
       v-if="starting"
       v-show="!startHidden"
@@ -278,6 +282,7 @@ async function opened(id) {
 .date.link{text-decoration:none}
 .date.link:hover{color:var(--accent); text-decoration:underline}
 .btn.small{height:30px; padding:0 12px; font-size:13px}
+.btn.more{padding:0 10px}
 .acts{display:flex; align-items:center; gap:12px}
 /* 右にパネルが出るなどして表が狭いときは、GitHub の更新日を名前の下に回し、ボタンを右にまとめる（名前の列を潰さない） */
 @container (max-width: 680px){

@@ -1,6 +1,6 @@
 use crate::{
-    db, diff, github, opt, pins, pricing, remote, repo, resume, scan, schedule, send, settings,
-    stats, summarize, transcript, update,
+    db, diff, github, manage, opt, pins, pricing, remote, repo, resume, scan, schedule, send,
+    settings, stats, summarize, transcript, update,
 };
 use anyhow::{Context, Result};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -310,6 +310,10 @@ pub async fn run(args: &[String]) -> Result<()> {
         .route("/repos", get(repos_handler))
         .route("/repos/branches", get(branches_handler))
         .route("/models", get(models_handler))
+        .route("/repos/manage", get(manage_handler))
+        .route("/repos/worktree/remove", post(remove_worktree_handler))
+        .route("/repos/branch/delete", post(delete_branch_handler))
+        .route("/repos/fetch", post(fetch_handler))
         .route("/repos/clone", post(clone_handler))
         .route(
             "/repos/start",
@@ -1501,6 +1505,9 @@ struct StartBody {
     /// 使うモデル。空なら CLI の既定
     #[serde(default)]
     model: String,
+    /// すでにある作業場所（git worktree）で始めるときの、そのフォルダ。空なら使わない
+    #[serde(default)]
+    existing: String,
 }
 
 /// 「ここで始める」で選べるモデルの候補。このマシンのこれまでの記録に出てきたモデル（最近使った順）と、
@@ -1548,17 +1555,174 @@ async fn branches_handler(
         settings::load(&conn)?
     };
     let found = tokio::task::spawn_blocking(move || {
-        github::startable(&set, &q.dir)
-            .then(|| (github::default_branch(&q.dir), github::branches(&q.dir)))
+        github::startable(&set, &q.dir).then(|| {
+            (
+                github::default_branch(&q.dir),
+                github::branches(&q.dir),
+                schedule::worktrees(&q.dir),
+            )
+        })
     })
     .await?;
-    let Some((default, branches)) = found else {
+    let Some((default, branches, worktrees)) = found else {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
             anyhow::anyhow!("not a repository of the GitHub owners in settings"),
         ));
     };
-    Ok(Json(json!({ "default": default, "branches": branches })))
+    Ok(Json(
+        json!({ "default": default, "branches": branches, "worktrees": worktrees }),
+    ))
+}
+
+/// リポジトリごとの操作は、作業を始めてよいリポジトリ（設定の組織・探すフォルダ）だけで受ける
+fn require_startable(app: &App, dir: &str) -> ApiResult<()> {
+    let set = {
+        let conn = app.db.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        settings::load(&conn)?
+    };
+    if !github::startable(&set, dir) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            anyhow::anyhow!("{dir} is not a repository of the GitHub owners in settings"),
+        ));
+    }
+    Ok(())
+}
+
+/// 予定がまだ使っている作業場所か。予定専用の作業場所（ブランチ名から予定を引く）か、
+/// 予定の作業ディレクトリにそのフォルダを指定しているもの。消した予定のものは片付けてよい
+fn used_by_schedule(app: &App, path: &str, branch: &str) -> ApiResult<Option<i64>> {
+    let conn = app.db.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+    if let Some(id) = manage::schedule_of(branch)
+        && schedule::get(&conn, id)?.is_some()
+    {
+        return Ok(Some(id));
+    }
+    Ok(schedule::using_dir(&conn, path)?)
+}
+
+/// リポジトリのメニュー: 片付けられる作業場所と手元のブランチ
+async fn manage_handler(
+    State(app): State<Shared>,
+    Query(q): Query<BranchesQuery>,
+) -> ApiResult<Json<Value>> {
+    require_startable(&app, &q.dir)?;
+    let dir = q.dir.clone();
+    let (worktrees, branches) = tokio::task::spawn_blocking(move || {
+        manage::branches(&dir).map(|b| (schedule::worktrees(&dir), b))
+    })
+    .await??;
+    let mut list = Vec::new();
+    for w in worktrees {
+        list.push(json!({
+            "schedule": used_by_schedule(&app, &w.path, &w.branch)?,
+            "running": app.running.busy_in(&w.path),
+            "path": w.path,
+            "branch": w.branch,
+        }));
+    }
+    Ok(Json(json!({ "worktrees": list, "branches": branches })))
+}
+
+/// 手元のリポジトリを書き換える操作を 1 つ動かす。同じリポジトリでは同時に 1 つだけ。
+/// git が断った理由（変更が残っている、など）はそのまま返す
+async fn manage_op<T: Send + 'static>(
+    app: &App,
+    dir: &str,
+    op: impl FnOnce() -> Result<T> + Send + 'static,
+) -> ApiResult<T> {
+    let Some(claim) = app.running.claim(&format!("manage:{dir}")) else {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            anyhow::anyhow!("another operation is running on this repository"),
+        ));
+    };
+    tokio::task::spawn_blocking(move || {
+        let _claim = claim;
+        op()
+    })
+    .await?
+    .map_err(|e| ApiError(StatusCode::CONFLICT, e))
+}
+
+#[derive(Deserialize)]
+struct RemoveWorktreeBody {
+    dir: String,
+    path: String,
+}
+
+/// 使い終わった作業場所を消す（ブランチは残る）。実行中のもの・予定が使っているものは消さない
+async fn remove_worktree_handler(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Json(b): Json<RemoveWorktreeBody>,
+) -> ApiResult<Json<Value>> {
+    same_origin(&headers)?;
+    require_startable(&app, &b.dir)?;
+    let refuse = |msg: String| Err(ApiError(StatusCode::CONFLICT, anyhow::anyhow!(msg)));
+    if app.running.busy_in(&b.path) {
+        return refuse("an agent is running in this worktree".into());
+    }
+    let (dir, path) = (b.dir.clone(), b.path.clone());
+    let branch = tokio::task::spawn_blocking(move || {
+        schedule::worktrees(&dir)
+            .into_iter()
+            .find(|w| w.path == path)
+            .map(|w| w.branch)
+    })
+    .await?;
+    if let Some(id) = used_by_schedule(&app, &b.path, branch.as_deref().unwrap_or(""))? {
+        return refuse(format!(
+            "schedule {id} uses this worktree; delete the schedule first"
+        ));
+    }
+    let (dir, path) = (b.dir.clone(), b.path);
+    manage_op(&app, &b.dir, move || manage::remove_worktree(&dir, &path)).await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct DeleteBranchBody {
+    dir: String,
+    branch: String,
+    /// まだ取り込まれていない commit があっても消す
+    #[serde(default)]
+    force: bool,
+}
+
+/// 手元のブランチを消す（GitHub 側のブランチには触らない）
+async fn delete_branch_handler(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Json(b): Json<DeleteBranchBody>,
+) -> ApiResult<Json<Value>> {
+    same_origin(&headers)?;
+    require_startable(&app, &b.dir)?;
+    let (dir, branch, force) = (b.dir.clone(), b.branch, b.force);
+    manage_op(&app, &b.dir, move || {
+        manage::delete_branch(&dir, &branch, force)
+    })
+    .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct FetchBody {
+    dir: String,
+}
+
+/// GitHub から取り直す（`git fetch --prune origin`）
+async fn fetch_handler(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Json(b): Json<FetchBody>,
+) -> ApiResult<Json<Value>> {
+    same_origin(&headers)?;
+    require_startable(&app, &b.dir)?;
+    let dir = b.dir.clone();
+    let report = manage_op(&app, &b.dir, move || manage::fetch(&dir)).await?;
+    Ok(Json(json!({ "report": report })))
 }
 
 /// 「ここで始める」で切るブランチの既定の名前（この PC の時刻）
@@ -1601,8 +1765,26 @@ async fn start_handler(
     }
     let checked =
         send::check_images(&b.images).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
-    // 作業場所を切るなら、先に作ってそこで始める。どこに切ったかを最初の 1 行で知らせる
-    let (cwd, first) = if b.worktree {
+    // すでにある作業場所で始めるなら、そのリポジトリの作業場所として git が挙げるものだけを受ける
+    // （画面から来たパスをそのまま使うと、どのフォルダでも始められてしまう）。
+    // 作業場所を切るなら、先に作ってそこで始める。どこで始めたかを最初の 1 行で知らせる
+    let (cwd, first) = if !b.existing.is_empty() {
+        let (dir, path) = (b.dir.clone(), b.existing.clone());
+        let found = tokio::task::spawn_blocking(move || {
+            schedule::worktrees(&dir)
+                .into_iter()
+                .find(|w| w.path == path)
+        })
+        .await?;
+        let Some(w) = found else {
+            return Err(bad(format!(
+                "{} is not a worktree of {}",
+                b.existing, b.dir
+            )));
+        };
+        let line = json!({ "kind": "worktree", "path": w.path, "branch": w.branch });
+        (w.path, Some(format!("{line}\n")))
+    } else if b.worktree {
         let branch = match b.branch.trim() {
             "" => default_branch(chrono::Local::now()),
             name => name.to_string(),
@@ -2013,6 +2195,7 @@ mod tests {
             branch: String::new(),
             base: String::new(),
             model: String::new(),
+            existing: String::new(),
         };
         let ours = root.join("agent-calendar").to_string_lossy().into_owned();
         let theirs = root.join("theirs").to_string_lossy().into_owned();
@@ -2021,7 +2204,10 @@ mod tests {
             branches_handler(State(app.clone()), Query(BranchesQuery { dir: dir.into() }))
         };
         let Json(v) = branches(&ours).await.unwrap();
-        assert_eq!(v, json!({ "default": null, "branches": [] })); // 中身の無い作り物のリポジトリ
+        assert_eq!(
+            v,
+            json!({ "default": null, "branches": [], "worktrees": [] })
+        ); // 中身の無い作り物のリポジトリ
         for dir in [theirs.as_str(), "/tmp"] {
             assert_eq!(branches(dir).await.unwrap_err().0, StatusCode::BAD_REQUEST);
         }
@@ -2034,15 +2220,120 @@ mod tests {
                 model: "--dangerously-skip-permissions".into(),
                 ..start(ours.clone(), "claude", "見て")
             },
+            // そのリポジトリの作業場所でないフォルダでは始めない
+            StartBody {
+                existing: "/tmp".into(),
+                ..start(ours.clone(), "claude", "見て")
+            },
         ] {
             let e = start_handler(State(app.clone()), local_headers(), Json(b))
                 .await
                 .unwrap_err();
             assert_eq!(e.0, StatusCode::BAD_REQUEST);
         }
-        // 別のオリジンからは受けない
+        // リポジトリのメニューの操作も、作業を始めてよいリポジトリだけ。別のオリジンからは受けない
+        let theirs = root.join("theirs").to_string_lossy().into_owned();
         let mut evil = local_headers();
         evil.insert("origin", "http://evil.example".parse().unwrap());
+        for (dir, headers, want) in [
+            (theirs.clone(), local_headers(), StatusCode::BAD_REQUEST),
+            ("/tmp".to_string(), local_headers(), StatusCode::BAD_REQUEST),
+            (ours.clone(), evil.clone(), StatusCode::FORBIDDEN),
+        ] {
+            let s = State(app.clone());
+            let e = remove_worktree_handler(
+                s.clone(),
+                headers.clone(),
+                Json(RemoveWorktreeBody {
+                    dir: dir.clone(),
+                    path: "/tmp".into(),
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(e.0, want, "{dir}");
+            let e = delete_branch_handler(
+                s.clone(),
+                headers.clone(),
+                Json(DeleteBranchBody {
+                    dir: dir.clone(),
+                    branch: "main".into(),
+                    force: false,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(e.0, want, "{dir}");
+            let e = fetch_handler(s, headers, Json(FetchBody { dir: dir.clone() }))
+                .await
+                .unwrap_err();
+            assert_eq!(e.0, want, "{dir}");
+        }
+        let e = manage_handler(State(app.clone()), Query(BranchesQuery { dir: theirs }))
+            .await
+            .unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_REQUEST);
+        // そのリポジトリの作業場所でないフォルダは消さない（git が断った理由をそのまま返す）
+        let e = remove_worktree_handler(
+            State(app.clone()),
+            local_headers(),
+            Json(RemoveWorktreeBody {
+                dir: ours.clone(),
+                path: "/tmp".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.0, StatusCode::CONFLICT);
+        assert!(std::path::Path::new("/tmp").is_dir());
+        // エージェントが実行中の作業場所は消さない
+        let running = app.running.enter("/x/wt");
+        let also = app.running.enter("/x/wt"); // 同じフォルダで 2 つ動いていれば、1 つ終わってもまだ実行中
+        drop(also);
+        assert!(app.running.busy_in("/x/wt"));
+        let e = remove_worktree_handler(
+            State(app.clone()),
+            local_headers(),
+            Json(RemoveWorktreeBody {
+                dir: ours.clone(),
+                path: "/x/wt".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.0, StatusCode::CONFLICT);
+        assert!(e.1.to_string().contains("running"), "{}", e.1);
+        drop(running);
+        assert!(!app.running.busy_in("/x/wt"));
+        // 予定の作業場所は、その予定があるあいだだけ「使っている」
+        let id = {
+            let conn = app.db.lock().unwrap();
+            let input = schedule::Input {
+                name: "朝のテスト".into(),
+                dir: root.to_string_lossy().into_owned(),
+                agent: "claude".into(),
+                mode: send::Mode::Read,
+                worktree: false,
+                continue_session: false,
+                prompt: "見て".into(),
+                repeat: schedule::Repeat::Weekly {
+                    days: 0b111_1111,
+                    minute: 8 * 60,
+                },
+                enabled: true,
+            };
+            schedule::save(&conn, None, &input, chrono::Local::now()).unwrap()
+        };
+        let branch = format!("agent-calendar/schedule-{id}");
+        let dir = root.to_string_lossy().into_owned();
+        assert_eq!(used_by_schedule(&app, "/x/wt", &branch).unwrap(), Some(id));
+        assert_eq!(used_by_schedule(&app, "/x/wt", "feature/x").unwrap(), None);
+        // 予定専用のブランチでなくても、予定の作業ディレクトリに指定しているフォルダは使っている
+        assert_eq!(used_by_schedule(&app, &dir, "feature/x").unwrap(), Some(id));
+        schedule::delete(&app.db.lock().unwrap(), id).unwrap();
+        assert_eq!(used_by_schedule(&app, "/x/wt", &branch).unwrap(), None);
+        assert_eq!(used_by_schedule(&app, &dir, "feature/x").unwrap(), None);
+        // 別のオリジンからは受けない
         assert!(
             start_handler(
                 State(app.clone()),

@@ -281,6 +281,17 @@ pub fn save(conn: &Connection, id: Option<i64>, i: &Input, now: DateTime<Local>)
     }
 }
 
+/// そのフォルダを作業ディレクトリにしている予定（あれば 1 つ）。予定が使うフォルダを消させないために見る
+pub fn using_dir(conn: &Connection, dir: &str) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT id FROM schedules WHERE dir = ?1 LIMIT 1",
+            [dir],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
 pub fn delete(conn: &Connection, id: i64) -> Result<bool> {
     conn.execute("DELETE FROM schedule_runs WHERE schedule_id = ?1", [id])?;
     Ok(conn.execute("DELETE FROM schedules WHERE id = ?1", [id])? > 0)
@@ -482,7 +493,7 @@ pub fn ensure_worktree(dir: &str, id: i64, base: &Path) -> Result<(String, Strin
     Ok((path.to_string_lossy().into_owned(), branch))
 }
 
-fn valid_branch(name: &str) -> bool {
+pub fn valid_branch(name: &str) -> bool {
     !name.starts_with('-')
         && Command::new("git")
             .args(["check-ref-format", "--branch", name])
@@ -556,6 +567,54 @@ pub fn new_worktree(dir: &str, branch: &str, from: &str, base: &Path) -> Result<
         );
     }
     Ok((path.to_string_lossy().into_owned(), shown))
+}
+
+/// すでにある作業場所（git worktree）
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Worktree {
+    pub path: String,
+    /// チェックアウトしているブランチ。ブランチの上にいなければ（detached）空
+    pub branch: String,
+}
+
+/// `git worktree list --porcelain` の出力から、選べる作業場所を取り出す（パスの順）。
+/// 先頭は本体の作業コピーなので除く。フォルダが消えているもの（prunable）と bare も除く
+fn parse_worktrees(porcelain: &str) -> Vec<Worktree> {
+    let mut out: Vec<Worktree> = porcelain
+        .split("\n\n")
+        .skip(1)
+        .filter_map(|block| {
+            let mut lines = block.lines();
+            let path = lines.next()?.strip_prefix("worktree ")?.to_string();
+            let rest: Vec<&str> = lines.collect();
+            if rest
+                .iter()
+                .any(|l| *l == "bare" || l.starts_with("prunable"))
+            {
+                return None;
+            }
+            let branch = rest
+                .iter()
+                .find_map(|l| l.strip_prefix("branch refs/heads/"))
+                .unwrap_or("")
+                .to_string();
+            Some(Worktree { path, branch })
+        })
+        .collect();
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
+/// そのリポジトリにすでにある作業場所（本体の作業コピーは含めない）。「ここで始める」で選ぶ。
+/// agent-calendar が切ったものに限らず、git が知っているもの全部
+pub fn worktrees(dir: &str) -> Vec<Worktree> {
+    Command::new("git")
+        .args(["-C", dir, "worktree", "list", "--porcelain"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| parse_worktrees(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default()
 }
 
 pub fn worktrees_dir() -> std::path::PathBuf {
@@ -1270,6 +1329,38 @@ mod tests {
         let (ws, from) = new_worktree(r, "feature/try-4", "local-only", &wbase).unwrap();
         assert_eq!(from, "local-only");
         assert_eq!(rev(&ws, "HEAD"), rev(r, "HEAD"));
+        // すでにある作業場所の一覧: 切ったものが出て、本体の作業コピーは出ない
+        let listed = worktrees(r);
+        assert_eq!(
+            listed.iter().map(|w| w.branch.as_str()).collect::<Vec<_>>(),
+            [
+                "feature/try-1",
+                "feature/try-2",
+                "feature/try-3",
+                "feature/try-4"
+            ]
+        );
+        assert_eq!(listed[3].path, ws);
+        assert!(worktrees("/nonexistent").is_empty());
+        assert_eq!(
+            parse_worktrees(
+                "worktree /r/main\nHEAD a\nbranch refs/heads/main\n\n\
+                 worktree /w/z\nHEAD b\nbranch refs/heads/feature/z\n\n\
+                 worktree /w/d\nHEAD c\ndetached\n\n\
+                 worktree /w/gone\nHEAD d\nbranch refs/heads/gone\nprunable gitdir file points to non-existent location\n\n\
+                 worktree /w/bare\nbare\n"
+            ),
+            [
+                Worktree {
+                    path: "/w/d".into(),
+                    branch: String::new()
+                },
+                Worktree {
+                    path: "/w/z".into(),
+                    branch: "feature/z".into()
+                },
+            ]
+        );
         // 無いブランチ・ブランチ名でないものは断る
         assert!(new_worktree(r, "feature/try-5", "nope", &wbase).is_err());
         assert!(new_worktree(r, "feature/try-5", "main~1", &wbase).is_err());

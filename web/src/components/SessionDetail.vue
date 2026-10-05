@@ -14,8 +14,9 @@ const props = defineProps({
   machineLabels: { type: Object, default: () => ({}) },
   full: { type: Boolean, default: false }, // 画面いっぱいに広げている
   tab: { type: String, default: 'summary' }, // 開いているタブ（URL に持つので App が覚える）
+  compact: { type: Boolean, default: false }, // 上の情報をたたんで題だけにしている（ブラウザに覚えるので App が持つ）
 })
-const emit = defineEmits(['close', 'full', 'pinned', 'update:tab'])
+const emit = defineEmits(['close', 'full', 'pinned', 'update:tab', 'update:compact'])
 
 // 概要・会話・変更のタブ（URL に持つので App が覚える。パネルの幅も App がタブで決める）
 const tab = computed({ get: () => props.tab, set: (v) => emit('update:tab', v) })
@@ -151,8 +152,18 @@ watch(
 </script>
 
 <template>
-  <aside class="detail" :class="{ full, changes: tab === 'changes' }">
+  <aside class="detail" :class="{ full, compact, changes: tab === 'changes' }">
     <div class="tools">
+      <button
+        v-if="s"
+        class="icon-btn"
+        :aria-label="compact ? t('detail.showTop') : t('detail.hideTop')"
+        :title="compact ? t('detail.showTop') : t('detail.hideTop')"
+        :aria-expanded="!compact"
+        @click="emit('update:compact', !compact)"
+      >
+        {{ compact ? '▾' : '▴' }}
+      </button>
       <button
         v-if="s"
         class="icon-btn pin"
@@ -162,18 +173,20 @@ watch(
         :aria-pressed="s.pinned"
         @click="togglePin"
       >
-        📌
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+          <path d="M16 3v2h-1v6l2 3v2h-4v5l-1 1-1-1v-5H7v-2l2-3V5H8V3z" />
+        </svg>
       </button>
+      <!-- 広げるボタンは元の大きさのときだけ。画面いっぱいのときは ✕ が元の大きさへ戻す（閉じない） -->
+      <button v-if="!full" class="icon-btn" :aria-label="t('detail.expand')" :title="t('detail.expand')" @click="emit('full', true)">⤢</button>
       <button
         class="icon-btn"
-        :aria-label="full ? t('detail.shrink') : t('detail.expand')"
-        :title="full ? t('detail.shrink') : t('detail.expand')"
-        :aria-pressed="full"
-        @click="emit('full', !full)"
+        :aria-label="full ? t('detail.shrink') : t('close')"
+        :title="full ? t('detail.shrink') : t('close')"
+        @click="full ? emit('full', false) : emit('close')"
       >
-        {{ full ? '⤡' : '⤢' }}
+        ✕
       </button>
-      <button class="icon-btn" :aria-label="t('close')" @click="emit('close')">✕</button>
     </div>
     <p v-if="error" class="chip warn">{{ error }}</p>
     <p v-if="!s && !error" class="muted">{{ t('detail.loading') }}</p>
@@ -182,8 +195,8 @@ watch(
         <i class="square" :style="{ background: repoColor(repo?.slot) }" />
         <div>
           <h2>{{ s.summary?.title || s.title || t('untitled') }}</h2>
-          <div class="when num">{{ when }}</div>
-          <div class="meta muted">
+          <div v-if="!compact" class="when num">{{ when }}</div>
+          <div v-if="!compact" class="meta muted">
             <span>{{ repoName }}</span>
             <code v-if="s.branch">{{ s.branch }}</code>
             <span class="chip src">{{ t(`source.${s.source}`) }}</span>
@@ -198,12 +211,13 @@ watch(
               <a v-if="s.github.compare" :href="s.github.compare" target="_blank" rel="noopener noreferrer">{{ t('detail.ghCompare') }} ↗</a>
             </span>
           </div>
-          <div class="meta muted">
+          <div v-if="!compact" class="meta muted">
             {{ t('detail.openFor', { d: fmtDuration(s.last_ts - s.first_ts) }) }} · {{ t('detail.prompts', { n: s.prompt_count }) }}
           </div>
         </div>
       </header>
 
+      <template v-if="!compact">
       <div class="actions">
         <button v-if="isClaude" class="btn primary" :disabled="resuming || running === 'interactive'" @click="doResume">
           {{ resuming ? t('detail.resuming') : running === 'background' ? t('detail.resumeOpen') : t('detail.resume') }}
@@ -221,6 +235,7 @@ watch(
           <span v-else class="muted">{{ t('detail.findOnPhone') }}</span>
         </template>
       </div>
+      </template>
 
       <nav class="tabs" role="tablist">
         <button role="tab" :aria-selected="tab === 'summary'" :class="{ on: tab === 'summary' }" @click="tab = 'summary'">
@@ -326,19 +341,28 @@ watch(
 .tabs button.on{color:var(--accent); border-bottom-color:var(--accent)}
 /* 会話のときはパネルの中でスクロールさせ、入力欄を下に留める */
 .conv{flex:1; min-height:360px}
-.tools{display:flex; justify-content:flex-end; gap:4px}
+.tools{display:flex; justify-content:flex-end; align-items:center; gap:4px}
 .section-title .spacer{flex:1}
 .gh{display:inline-flex; gap:10px; margin-left:4px}
 .gh a{color:var(--accent); text-decoration:none; font-size:13px}
 .gh a:hover{text-decoration:underline}
-.icon-btn.pin{filter:grayscale(1); opacity:.55}
-.icon-btn.pin.on{filter:none; opacity:1}
+.icon-btn.pin svg{fill:none; stroke:currentColor; stroke-width:1.6; stroke-linejoin:round}
+.icon-btn.pin.on{color:var(--accent)}
+.icon-btn.pin.on svg{fill:currentColor}
 .btn.small{height:30px; padding:0 12px; font-size:13px}
 /* 画面いっぱいのときは、読みやすい幅で真ん中に置く */
 .detail.full{padding-left:max(24px, calc((100% - 960px) / 2)); padding-right:max(24px, calc((100% - 960px) / 2)); border-left:0}
 /* 変更（左に一覧・右に差分）は全画面なら広く使う */
 .detail.full.changes{padding-left:max(24px, calc((100% - 1600px) / 2)); padding-right:max(24px, calc((100% - 1600px) / 2))}
 .head{display:grid; grid-template-columns:20px 1fr; gap:16px; align-items:start}
+/* たたんだときは、題だけをボタンと同じ行に 1 行で置く */
+.detail.compact .tools{margin-bottom:-36px; position:relative; z-index:1; pointer-events:none}
+.detail.compact .tools .icon-btn{pointer-events:auto}
+.detail.compact .head{padding-right:168px; align-items:center; min-height:36px}
+.detail.compact .head > div{min-width:0}
+.detail.compact .square{margin-top:0}
+.detail.compact h2{font-size:16px; font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+.detail.compact .tabs{margin-top:4px}
 .square{width:16px; height:16px; border-radius:4px; margin-top:8px}
 h2{font-size:22px; font-weight:400; line-height:1.35; margin:0; color:var(--ink)}
 .when{font-size:14px; color:var(--ink-soft); margin-top:2px}

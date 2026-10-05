@@ -376,6 +376,24 @@ pub struct Running {
     pending: Arc<Mutex<HashMap<String, Pending>>>,
     /// 本体を入れ替えている最中。新しい実行を受け付けない（入れ替えのあとの再起動で途中で切れるので）
     updating: Arc<std::sync::atomic::AtomicBool>,
+    /// 実行中のエージェントの作業フォルダ（同じフォルダで複数動くことがあるので、動いている数だけ入る）。
+    /// 動いている最中の作業場所を消させないために見る
+    cwds: Arc<Mutex<Vec<String>>>,
+}
+
+/// 実行が終わったら（途中で落ちても）作業フォルダの印を 1 つ外す
+pub struct InDir {
+    cwds: Arc<Mutex<Vec<String>>>,
+    dir: String,
+}
+
+impl Drop for InDir {
+    fn drop(&mut self) {
+        let mut cwds = self.cwds.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = cwds.iter().position(|d| *d == self.dir) {
+            cwds.swap_remove(i);
+        }
+    }
 }
 
 /// 答えを待っている許可の問い合わせ
@@ -441,6 +459,27 @@ impl Running {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .is_empty()
+    }
+
+    /// そのフォルダでエージェントが動いている印を付ける。戻り値を手放すと外れる
+    pub fn enter(&self, dir: &str) -> InDir {
+        self.cwds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(dir.to_string());
+        InDir {
+            cwds: self.cwds.clone(),
+            dir: dir.to_string(),
+        }
+    }
+
+    /// そのフォルダでエージェントが動いているか（始めたばかりの実行も、続きの指示も、予定の実行も）
+    pub fn busy_in(&self, dir: &str) -> bool {
+        self.cwds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|d| d == dir)
     }
 
     pub fn contains(&self, id: &str) -> bool {
@@ -591,6 +630,7 @@ pub fn start(
         }
     };
     let (tx, rx) = mpsc::channel::<String>(256);
+    let in_dir = running.enter(&job.cwd);
     let running = running.clone();
     let (source, prompt, limit, cleanup) = (job.source, job.prompt, job.timeout, job.cleanup);
     let ask = job.ask && source != "codex";
@@ -706,6 +746,7 @@ pub fn start(
         running.forget(&asked);
         discard(&cleanup);
         drop(session_claim);
+        drop(in_dir);
         drop(tx);
         // 終わった時点で印を外す（読み直しを待たずに次の指示を送れるように）
         drop(claim);

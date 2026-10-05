@@ -33,13 +33,15 @@ watch(agent, () => (model.value = ''))
 const running = ref(false)
 const live = ref([])
 const sessionId = ref(null)
-// 別の作業場所（git worktree）を新しいブランチで切ってそこで始める。切った場所は最初の 1 行で届く
+// 別の作業場所（git worktree）で始める。新しいブランチで切るか、すでにあるものを選ぶ（existing はそのフォルダ。空なら新しく切る）。
+// どこで始めたかは最初の 1 行で届く
 const worktree = ref(false)
+const existing = ref('')
 const branch = ref('')
 // どのブランチから切るか。空は origin の既定のブランチ。
 // 一覧は手元にある記録から（origin のものと手元のもの）。取れなくても既定のまま始められる
 const base = ref('')
-const branches = ref(null) // { default, branches }
+const branches = ref(null) // { default, branches, worktrees }
 // 既定のブランチの名前。GitHub の一覧で分かっている名前が正（手元の origin/HEAD は clone したときのままで、
 // GitHub で既定を変えても追従しない）。一覧に無いときだけ手元の記録を使う
 const defaultBranch = computed(() => props.repo.default_branch || branches.value?.default || '')
@@ -48,7 +50,7 @@ watch(worktree, async (on) => {
   try {
     branches.value = await getBranches(props.repo.local)
   } catch {
-    branches.value = { default: null, branches: [] }
+    branches.value = { default: null, branches: [], worktrees: [] }
   }
 })
 const workspace = ref(null) // { path, branch }
@@ -91,6 +93,7 @@ async function run() {
       branch: branch.value.trim(),
       // 既定のブランチも名前で渡す（空のままだと、手元に origin/HEAD の記録が無い clone では HEAD から切られる）
       base: base.value || defaultBranch.value,
+      existing: worktree.value ? existing.value : '',
       model: model.value.trim(),
     }
     await startSession(input, (ev) => {
@@ -146,6 +149,13 @@ function onKey(e) {
         {{ t('repos.worktree') }}
       </label>
       <label v-if="worktree" class="base">
+        {{ t('repos.worktreePick') }}
+        <select v-model="existing" :disabled="running || finished">
+          <option value="">{{ t('repos.worktreeNew') }}</option>
+          <option v-for="w in branches?.worktrees ?? []" :key="w.path" :value="w.path">{{ w.branch || t('repos.detached') }} — {{ w.path }}</option>
+        </select>
+      </label>
+      <label v-if="worktree && !existing" class="base">
         {{ t('repos.base') }}
         <select v-model="base" :disabled="running || finished">
           <option value="">{{ defaultBranch ? t('repos.baseDefault', { name: defaultBranch }) : t('repos.baseHead') }}</option>
@@ -153,7 +163,7 @@ function onKey(e) {
         </select>
       </label>
       <input
-        v-if="worktree"
+        v-if="worktree && !existing"
         v-model="branch"
         class="branch"
         type="text"
@@ -172,7 +182,7 @@ function onKey(e) {
       <p v-if="attachError" class="chip warn">{{ attachError }}</p>
       <p class="muted small">{{ t('repos.startNote') }} {{ t('conv.attach', { n: MAX_IMAGES }) }}</p>
 
-      <p v-if="workspace" class="ws">{{ t('repos.workspace', { branch: workspace.branch, base: workspace.base }) }}<br /><code>{{ workspace.path }}</code></p>
+      <p v-if="workspace" class="ws">{{ workspace.base ? t('repos.workspace', { branch: workspace.branch, base: workspace.base }) : t('repos.workspaceExisting', { branch: workspace.branch || t('repos.detached') }) }}<br /><code>{{ workspace.path }}</code></p>
       <div v-if="live.length || running" class="live">
         <template v-for="(ev, i) in live" :key="i">
           <div v-if="ev.kind === 'text'" class="md" v-html="renderMarkdown(ev.text)" />

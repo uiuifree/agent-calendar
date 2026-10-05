@@ -7,6 +7,7 @@ mod codex;
 mod db;
 mod diff;
 mod github;
+mod manage;
 mod pins;
 mod pricing;
 mod remote;

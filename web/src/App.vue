@@ -93,11 +93,19 @@ const showSettings = ref(false)
 // 詳細パネル: 会話・変更のタブでは広げる（変更は左に一覧・右に差分なので特に広く）。tab は開いているタブ、full は画面いっぱい（閉じたら戻す）。
 // tab と full は URL にも持つ（リロードしても同じ状態で開く）
 const detailFull = ref(false)
+// 詳細パネルの上の情報（日時・リポジトリ・再開のボタン）をたたんで、会話や差分を広く使う（画面の低いノート PC 用。次に開いたときも同じ）
+const detailCompact = remembered('agent-calendar.detailCompact', false, (v) => typeof v === 'boolean')
 const detailTab = ref('summary')
 const DETAIL_W = { conversation: '640px', changes: 'min(960px, 60vw)' }
 
 // 集計・予定・リポジトリの画面と開いているセッションは URL に持たせる（戻る・進む・ブックマーク・共有ができるように）。
 // カレンダーは URL を変えない（"/"）。"/" に戻ったら、最後に見ていた日・週・月の表示にする
+// サイドバーの小さなカレンダーで日を選ぶ。日付を使わない画面（リポジトリ・予定）にいるときは、
+// 選んでも何も変わらないので、その日のカレンダーへ移る（集計は選んだ週の集計に変わるので、そのまま）
+function pickDay(d) {
+  anchor.value = startOfDay(d)
+  if (view.value === 'repos' || view.value === 'plans') view.value = lastCalendar.value
+}
 const lastCalendar = remembered('agent-calendar.calendarView', 'week', (v) => CALENDAR_VIEWS.includes(v))
 watch(view, (v) => {
   if (CALENDAR_VIEWS.includes(v)) lastCalendar.value = v
@@ -395,7 +403,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
         :host-counts="hostCounts"
         v-model:hosts="hosts"
         v-model:hidden-repos="hiddenRepos"
-        @pick="(d) => (anchor = startOfDay(d))"
+        @pick="pickDay"
         :pins="pins"
         :selected-id="selectedId"
         :page="CALENDAR_VIEWS.includes(view) ? 'calendar' : view"
@@ -484,6 +492,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
         v-model:tab="detailTab"
         :full="detailFull"
         @full="(f) => (detailFull = f)"
+        v-model:compact="detailCompact"
         @pinned="loadPins"
       />
     </main>

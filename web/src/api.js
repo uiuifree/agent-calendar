@@ -103,6 +103,11 @@ export const getRepos = (refresh = false) => j(`/api/repos${refresh ? '?refresh=
 export const getRepoSessions = (repo) => j(`/api/repo-sessions?repo=${encodeURIComponent(unmask(repo))}`)
 export const cloneRepo = (owner, name, root) => post('/api/repos/clone', { owner, name, root })
 // リポジトリで新しいセッションを始める。最初に { kind: 'session', id } が届く
+// リポジトリのメニュー: 片付けられる作業場所（git worktree）と手元のブランチ、その操作
+export const getRepoManage = (dir) => j(`/api/repos/manage?dir=${encodeURIComponent(unmask(dir))}`)
+export const removeWorktree = (dir, path) => post('/api/repos/worktree/remove', { dir, path })
+export const deleteBranch = (dir, branch, force) => post('/api/repos/branch/delete', { dir, branch, force })
+export const fetchRepo = (dir) => post('/api/repos/fetch', { dir })
 // 「ここで始める」で選べるモデルの候補（エージェントごと。cli_default は選ばなかったときに CLI が使うモデル）
 export const getModels = () => j('/api/models')
 // 「ここで始める」で出発点に選べるブランチ（default は origin の既定のブランチ。分からなければ null）

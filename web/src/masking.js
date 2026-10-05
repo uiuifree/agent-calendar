@@ -173,6 +173,8 @@ const RULES = {
   branch: fakeBranch,
   // 「ここで始める」で選ぶ出発点のブランチ（一覧と既定のブランチ）
   branches: fakeBranch, default: fakeBranch, default_branch: fakeBranch,
+  // リポジトリのメニュー: ブランチを使っているフォルダ
+  checked_out: fakePath,
   label: (v) => (v === 'WSL' || v === 'this PC' ? v : 'server'),
   owner: orgName, owners: orgName, github_owners: orgName, roots: () => '/home/me/projects', repo_roots: () => '/home/me/projects', dirs: fakePath,
   project: projectName, known_projects: projectName,
