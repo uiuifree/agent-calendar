@@ -322,14 +322,11 @@ mod tests {
 
     /// claude の代わりに決まった JSON を返すスクリプト
     fn fake_claude(dir: &std::path::Path, stdout: &str, code: i32) -> String {
-        use std::os::unix::fs::PermissionsExt;
         let p = dir.join(format!("claude-{code}-{}", stdout.len()));
-        std::fs::write(
+        crate::db::write_script(
             &p,
-            format!("#!/bin/sh\ncat >/dev/null\ncat <<'EOF'\n{stdout}\nEOF\nexit {code}\n"),
-        )
-        .unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            &format!("#!/bin/sh\ncat >/dev/null\ncat <<'EOF'\n{stdout}\nEOF\nexit {code}\n"),
+        );
         p.to_string_lossy().into_owned()
     }
 

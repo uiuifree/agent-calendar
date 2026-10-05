@@ -227,6 +227,21 @@ pub fn temp_dir(name: &str) -> PathBuf {
     d
 }
 
+/// テストで直接実行するスクリプトを書く。このプロセスが書き込みで開くと、並行するテストがプロセスを分ける瞬間に
+/// その口が子へ写り、直後の実行がまれに「Text file busy」で失敗する。別のプロセス（sh）に書かせれば写らない
+#[cfg(test)]
+pub fn write_script(path: &Path, text: &str) {
+    use std::io::Write;
+    let mut sh = std::process::Command::new("sh")
+        .args(["-c", "cat > \"$0\" && chmod 755 \"$0\""])
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    sh.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
+    assert!(sh.wait().unwrap().success());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
