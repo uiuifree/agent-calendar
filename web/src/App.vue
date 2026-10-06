@@ -580,7 +580,8 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
 .daygrid{flex:1; min-height:0; display:grid; grid-template-columns:minmax(0, 1fr) minmax(320px, 42%)}
 .side{min-height:0}
 /* 右のパネル: 上にタブの帯、下に詳細（残りの高さいっぱい） */
-.panel{display:flex; flex-direction:column; position:relative}
+/* min-width:0 が無いと、会話の中の長い 1 行（コマンドなど）に引っ張られてパネルが画面より広くなる（全画面で中身が右へずれる） */
+.panel{display:flex; flex-direction:column; position:relative; min-width:0}
 /* 境目のつかむ所（パネルの左の縁）。乗せたとき・つかんでいるあいだだけ色を出す */
 .grip{position:absolute; top:0; bottom:0; left:0; width:6px; z-index:5; cursor:col-resize; touch-action:none}
 .grip:hover,.grip.on{background:var(--accent-soft)}
