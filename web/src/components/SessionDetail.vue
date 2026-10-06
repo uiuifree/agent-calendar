@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onUnmounted, ref, watch } from 'vue'
-import { getSession, resumeSession, setPin, summarizeSession } from '../api.js'
+import { getSession, resumeSession, setFinished, setPin, summarizeSession } from '../api.js'
 import { fmtDuration, fmtTokens, fmtUsd } from '../layout.js'
 import { repoColor } from '../colors.js'
 import { locale, t } from '../i18n.js'
@@ -16,8 +16,9 @@ const props = defineProps({
   tab: { type: String, default: 'summary' }, // 開いているタブ（URL に持つので App が覚える）
   compact: { type: Boolean, default: false }, // 上の情報をたたんで題だけにしている（ブラウザに覚えるので App が持つ）
   active: { type: Boolean, default: true }, // 表示中のタブ（ほかのタブを見ているあいだは隠れているだけ）
+  version: { type: Number, default: 0 }, // App が読み直すたびに増える（集計の画面で完了にしたときなど）
 })
-const emit = defineEmits(['close', 'full', 'pinned', 'title', 'update:tab', 'update:compact'])
+const emit = defineEmits(['close', 'full', 'pinned', 'finished', 'title', 'update:tab', 'update:compact'])
 
 // 概要・会話・変更のタブ（URL に持つので App が覚える。パネルの幅も App がタブで決める）
 const tab = computed({ get: () => props.tab, set: (v) => emit('update:tab', v) })
@@ -38,6 +39,21 @@ async function load(id) {
 watch(
   () => props.active,
   (on) => on && load(props.id),
+)
+// App が読み直したら、表示中のものの完了の印と要約だけ取り直す（集計の画面で付け外ししたかもしれない）。
+// 全部を差し替えると、ここから送った指示の実行中に「別の所で実行中」として扱ってしまう
+watch(
+  () => props.version,
+  async () => {
+    const id = props.id
+    if (!props.active || !s.value) return
+    try {
+      const r = await getSession(id)
+      if (id === props.id && s.value) Object.assign(s.value, { finished: r.finished, summary: r.summary })
+    } catch {
+      // 取り直せなくても前の表示のままでよい
+    }
+  },
 )
 
 // 題。読み込めたら App にも知らせる（パネルの上のタブの見出しに出す）
@@ -95,6 +111,20 @@ async function togglePin() {
     emit('pinned')
   } catch (e) {
     if (id === props.id) error.value = String(e.message ?? e)
+  }
+}
+
+// 完了の印。付けたら要約が途中のままでも完了として出す。付け外ししたら App に知らせてカレンダーとピンを読み直す
+const status = computed(() => (s.value?.finished ? 'done' : s.value?.summary?.status))
+async function toggleFinished() {
+  const id = s.value.id
+  const on = !s.value.finished
+  try {
+    await setFinished(id, on)
+    if (id === props.id) s.value.finished = on
+    emit('finished')
+  } catch (e) {
+    if (id === props.id) summaryError.value = String(e.message ?? e)
   }
 }
 
@@ -274,8 +304,11 @@ watch(
       <template v-else>
       <h3 class="section-title">
         {{ t('detail.summary') }}
-        <span v-if="s.summary?.status" class="chip" :class="s.summary.status">{{ t(`status.${s.summary.status}`) }}</span>
+        <span v-if="status" class="chip" :class="status" :title="s.finished ? t('detail.markedDone') : null">{{ t(`status.${status}`) }}</span>
         <span class="spacer" />
+        <button v-if="s.finished || status === 'wip' || s.summary?.next" class="btn small" @click="toggleFinished">
+          {{ s.finished ? t('detail.unmarkDone') : t('detail.markDone') }}
+        </button>
         <button class="btn small" :disabled="summarizingId !== null" @click="doSummarize">
           {{ summarizingId === s.id ? t('detail.summarizing') : s.summary ? t('detail.resummarize') : t('detail.summarizeNow') }}
         </button>
@@ -354,6 +387,7 @@ watch(
 /* 会話のときはパネルの中でスクロールさせ、入力欄を下に留める */
 .conv{flex:1; min-height:360px}
 .tools{display:flex; justify-content:flex-end; align-items:center; gap:4px}
+.section-title{white-space:nowrap}
 .section-title .spacer{flex:1}
 .gh{display:inline-flex; gap:10px; margin-left:4px}
 .gh a{color:var(--accent); text-decoration:none; font-size:13px}
@@ -361,7 +395,7 @@ watch(
 .icon-btn.pin svg{fill:none; stroke:currentColor; stroke-width:1.6; stroke-linejoin:round}
 .icon-btn.pin.on{color:var(--accent)}
 .icon-btn.pin.on svg{fill:currentColor}
-.btn.small{height:30px; padding:0 12px; font-size:13px}
+.btn.small{height:30px; padding:0 12px; font-size:13px; white-space:nowrap}
 /* 画面いっぱいのときは、読みやすい幅で真ん中に置く */
 .detail.full{padding-left:max(24px, calc((100% - 960px) / 2)); padding-right:max(24px, calc((100% - 960px) / 2)); border-left:0}
 /* 変更（左に一覧・右に差分）は全画面なら広く使う */

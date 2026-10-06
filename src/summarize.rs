@@ -151,8 +151,8 @@ pub fn busy() -> bool {
     !BUSY.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
 }
 
-/// 印を付ける。すでに付いていれば None。戻り値を手放すと外れる
-fn claim(id: &str) -> Option<Busy> {
+/// 印を付ける。すでに付いていれば None。戻り値を手放すと外れる（期間の要約も同じ印を使う）
+pub fn claim(id: &str) -> Option<Busy> {
     let mut busy = BUSY.lock().unwrap_or_else(|e| e.into_inner());
     if busy.iter().any(|b| b == id) {
         return None;
@@ -161,7 +161,7 @@ fn claim(id: &str) -> Option<Busy> {
     Some(Busy(id.to_string()))
 }
 
-struct Busy(String);
+pub struct Busy(String);
 
 impl Drop for Busy {
     fn drop(&mut self) {
@@ -261,13 +261,25 @@ fn squeeze(s: &str) -> String {
     )
 }
 
-/// `claude -p` を記録を残さない設定で呼ぶ（残すと要約の呼び出し自体が日誌に載る）
 fn call_claude(
     claude: &str,
     input: &str,
     model: &str,
     lang: Lang,
 ) -> Result<(Summary, Option<f64>)> {
+    let (result, cost) = run_claude(claude, input, model, lang.instruction())?;
+    let mut s = parse_summary(&result)?;
+    s.status = status_code(&s.status).to_string();
+    Ok((s, cost))
+}
+
+/// `claude -p` を記録を残さない設定で呼ぶ（残すと要約の呼び出し自体が日誌に載る）。返事の本文と金額
+pub fn run_claude(
+    claude: &str,
+    input: &str,
+    model: &str,
+    instruction: &str,
+) -> Result<(String, Option<f64>)> {
     let mut child = Command::new(claude)
         .args([
             "-p",
@@ -280,7 +292,7 @@ fn call_claude(
             "",
             "--output-format",
             "json",
-            lang.instruction(),
+            instruction,
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -303,9 +315,7 @@ fn call_claude(
     let result = v["result"]
         .as_str()
         .context("claude output has no result")?;
-    let mut s = parse_summary(result)?;
-    s.status = status_code(&s.status).to_string();
-    Ok((s, v["total_cost_usd"].as_f64()))
+    Ok((result.to_string(), v["total_cost_usd"].as_f64()))
 }
 
 /// 指示しても前置きやコードフェンスが付くことがあるので、最初の { から最後の } までを読む

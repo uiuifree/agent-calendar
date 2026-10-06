@@ -23,6 +23,8 @@
 - `agent-calendar serve [--port 23848] [--no-summarize] [--summary-model sonnet] [--summary-lang en|ja]`
 - `agent-calendar scan` – re-read changed transcripts into the SQLite index
 - `agent-calendar summarize [--limit N] [--model M] [--lang en|ja]` – summarize idle sessions via `claude -p`
+- `agent-calendar todo [--from YYYY-MM-DD] [--to YYYY-MM-DD]` – sessions active in those days (default today) whose summary is in progress, or is not done and lists something left to do; tab-separated: id, last activity, status, repository, title, what is left
+- `agent-calendar done <session id> [--undo]` – mark a session as done (lasts until the session continues)
 - `agent-calendar service install` – Linux systemd user service
 
 ## Behavior

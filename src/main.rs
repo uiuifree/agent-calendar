@@ -6,8 +6,10 @@
 mod codex;
 mod db;
 mod diff;
+mod finished;
 mod github;
 mod manage;
+mod period;
 mod pins;
 mod pricing;
 mod remote;
@@ -41,6 +43,12 @@ USAGE:
         Summarize idle sessions now. Summaries use `claude -p` (your Claude Code login).
     agent-calendar service install [--port 23848] [--no-summarize] [--summary-lang en|ja]
         Linux only: register and start a systemd user service that runs `serve`.
+    agent-calendar todo [--from 2026-10-06] [--to 2026-10-07]
+        List sessions active in those days (default: today) that are in progress, or not done
+        with something left to do in their summary: id, last activity, status, repository, title, what is left.
+    agent-calendar done <session id> [--undo]
+        Mark a session as done (it leaves the todo list and shows as done in the page). The mark lasts until
+        the session continues; --undo removes it.
 
   Collect sessions from another machine (over HTTPS with a pinned certificate and a token):
     agent-calendar share [--bind 0.0.0.0:23847]           on the other machine: serve its transcripts
@@ -84,6 +92,8 @@ async fn main() -> Result<()> {
             let n = summarize::run(&conn, limit, &model, lang)?;
             println!("[summarize] summarized {n} sessions");
         }
+        "todo" => todo_cmd(&args)?,
+        "done" => done_cmd(&args)?,
         "serve" => serve::run(&args).await?,
         "share" if args.get(1).map(String::as_str) == Some("pair") => share::pair(&args)?,
         "share" => share::run(&args).await?,
@@ -120,6 +130,70 @@ fn remote_cmd(args: &[String]) -> Result<()> {
             "usage: agent-calendar remote add '<connection string>' [--name N] | remote list | remote remove <name>"
         ),
     }
+    Ok(())
+}
+
+/// `agent-calendar todo [--from 日付] [--to 日付]`: その日々に動いたセッションの残タスク。to はその日を含む
+fn todo_cmd(args: &[String]) -> Result<()> {
+    let day = |flag: &str| -> Result<Option<chrono::NaiveDate>> {
+        opt(args, flag)
+            .map(|v| {
+                chrono::NaiveDate::parse_from_str(&v, "%Y-%m-%d")
+                    .map_err(|_| anyhow::anyhow!("{flag} takes a date like 2026-10-06, got {v}"))
+            })
+            .transpose()
+    };
+    let from = day("--from")?.unwrap_or_else(|| chrono::Local::now().date_naive());
+    let to = day("--to")?.unwrap_or(from);
+    if to < from {
+        bail!("--to is before --from");
+    }
+    let secs = |d: chrono::NaiveDate| -> Result<i64> {
+        d.and_hms_opt(0, 0, 0)
+            .and_then(|t| t.and_local_timezone(chrono::Local).earliest())
+            .map(|t| t.timestamp())
+            .ok_or_else(|| anyhow::anyhow!("no local midnight on {d}"))
+    };
+    let conn = db::open()?;
+    let (list, unsummarized) =
+        finished::todo(&conn, secs(from)?, secs(to + chrono::Days::new(1))?, None)?;
+    for x in &list {
+        let when = chrono::DateTime::from_timestamp_millis(x.last_ts)
+            .map(|t| {
+                t.with_timezone(&chrono::Local)
+                    .format("%m-%d %H:%M")
+                    .to_string()
+            })
+            .unwrap_or_default();
+        let repo = x.repo.rsplit('/').next().unwrap_or(&x.repo);
+        println!(
+            "{}\t{when}\t{}\t{repo}\t{}\t{}",
+            x.id, x.status, x.title, x.next
+        );
+    }
+    println!("[todo] {} sessions with something left", list.len());
+    if unsummarized > 0 {
+        println!(
+            "[todo] {unsummarized} sessions are not summarized yet (agent-calendar summarize)"
+        );
+    }
+    Ok(())
+}
+
+/// `agent-calendar done <id> [--undo]`
+fn done_cmd(args: &[String]) -> Result<()> {
+    let Some(id) = args.get(1).filter(|a| !a.starts_with("--")) else {
+        bail!("usage: agent-calendar done <session id> [--undo]");
+    };
+    let undo = args.iter().any(|a| a == "--undo");
+    let conn = db::open()?;
+    if !finished::set(&conn, id, !undo, chrono::Utc::now().timestamp_millis())? {
+        bail!("no session {id}");
+    }
+    println!(
+        "{id}: {}",
+        if undo { "mark removed" } else { "marked done" }
+    );
     Ok(())
 }
 

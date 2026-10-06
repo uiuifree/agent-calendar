@@ -1,6 +1,6 @@
 use crate::{
-    db, diff, github, manage, opt, pins, pricing, remote, repo, resume, scan, schedule, send,
-    settings, stats, summarize, transcript, update,
+    db, diff, finished, github, manage, opt, period, pins, pricing, remote, repo, resume, scan,
+    schedule, send, settings, stats, summarize, transcript, update,
 };
 use anyhow::{Context, Result};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -281,11 +281,13 @@ pub async fn run(args: &[String]) -> Result<()> {
     let api = Router::new()
         .route("/week", get(week))
         .route("/stats", get(stats_handler))
+        .route("/period-summary", post(period_summary_handler))
         .route("/session/{id}", get(session))
         .route("/session/{id}/resume", post(resume_handler))
         .route("/session/{id}/transcript", get(transcript_handler))
         .route("/session/{id}/summarize", post(summarize_handler))
         .route("/session/{id}/pin", post(pin_handler))
+        .route("/session/{id}/finished", post(finished_handler))
         .route("/permission", post(permission_handler))
         .route("/session/{id}/asks", get(asks_handler))
         .route("/session/{id}/stop", post(stop_handler))
@@ -537,14 +539,16 @@ async fn week(State(app): State<Shared>, Query(r): Query<Range>) -> ApiResult<Js
 fn week_data(conn: &Connection, from: i64, to: i64) -> Result<Value> {
     let mut sessions: Vec<WeekSession> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT a.session_id, a.bucket, a.n, s.repo, s.title, m.body,
-                (SELECT text FROM prompts p WHERE p.session_id = s.id ORDER BY seq LIMIT 1), s.source, s.machine
+                (SELECT text FROM prompts p WHERE p.session_id = s.id ORDER BY seq LIMIT 1), s.source, s.machine,
+                {}
          FROM activity a JOIN sessions s ON s.id = a.session_id
          LEFT JOIN summaries m ON m.session_id = s.id
          WHERE a.bucket >= ?1 AND a.bucket < ?2
          ORDER BY s.first_ts, a.bucket",
-    )?;
+        finished::SQL
+    ))?;
     let mut rows = stmt.query([from, to])?;
     while let Some(row) = rows.next()? {
         let id: String = row.get(0)?;
@@ -561,7 +565,7 @@ fn week_data(conn: &Connection, from: i64, to: i64) -> Result<Value> {
                     source: row.get(7)?,
                     machine: row.get(8)?,
                     title,
-                    status: summary.map(|s| s.status).unwrap_or_default(),
+                    status: finished::status(summary.as_ref(), row.get(9)?),
                     buckets: Vec::new(),
                     usd: Vec::new(),
                     unpriced: false,
@@ -767,6 +771,7 @@ fn session_data(conn: &Connection, id: &str) -> Result<Option<Value>> {
     detail["cost"] = stats::session_cost(conn, id)?;
     detail["resume_command"] = resume::resume_command(&source, &cwd, id).into();
     detail["pinned"] = pins::is_pinned(conn, id)?.into();
+    detail["finished"] = finished::is_finished(conn, id)?.into();
     Ok(Some(detail))
 }
 
@@ -958,15 +963,60 @@ async fn stats_handler(
     Query(r): Query<Range>,
 ) -> ApiResult<Json<Value>> {
     let conn = app.db.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(Json(with_slots(
+    let machines = parse_machines(r.machines.as_deref())?;
+    let mut v = with_slots(
         &conn,
-        stats::stats(
+        stats::stats(&conn, r.from / 1000, r.to / 1000, machines.as_deref())?,
+    )?;
+    // 同じ期間の残タスク（要約が途中か、残っていることが書かれていて、完了の印の無いもの）
+    let (todo, unsummarized) =
+        finished::todo(&conn, r.from / 1000, r.to / 1000, machines.as_deref())?;
+    v["todo"] = serde_json::to_value(todo)?;
+    v["unsummarized"] = unsummarized.into();
+    v["period_summary"] = serde_json::to_value(period::load(
+        &conn,
+        r.from / 1000,
+        r.to / 1000,
+        machines.as_deref(),
+    )?)?;
+    Ok(Json(v))
+}
+
+#[derive(Deserialize)]
+struct PeriodBody {
+    from: i64, // unix ms
+    to: i64,
+    /// 集計と同じホストの絞り込み。無ければ全部
+    #[serde(default)]
+    machines: Option<Vec<String>>,
+}
+
+/// 期間の要約を作って保存する（1 分ほどかかる）。要約を止めて起動していれば断る
+async fn period_summary_handler(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Json(b): Json<PeriodBody>,
+) -> ApiResult<Json<Value>> {
+    same_origin(&headers)?;
+    let Some(o) = app.summary.clone() else {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            anyhow::anyhow!("summaries are off (started with --no-summarize)"),
+        ));
+    };
+    let s = tokio::task::spawn_blocking(move || {
+        let conn = db::open()?;
+        period::make(
             &conn,
-            r.from / 1000,
-            r.to / 1000,
-            parse_machines(r.machines.as_deref())?.as_deref(),
-        )?,
-    )?))
+            "claude",
+            (b.from / 1000, b.to / 1000),
+            b.machines.as_deref(),
+            &o.model,
+            o.lang,
+        )
+    })
+    .await??;
+    Ok(Json(json!({ "period_summary": s })))
 }
 
 fn parse_machines(s: Option<&str>) -> ApiResult<Option<Vec<String>>> {
@@ -1219,6 +1269,31 @@ async fn pin_handler(
     let conn = app.db.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
     pins::set(&conn, &id, b.pinned, chrono::Utc::now().timestamp_millis())?;
     Ok(Json(json!({ "pinned": b.pinned })))
+}
+
+#[derive(Deserialize)]
+struct FinishedBody {
+    finished: bool,
+}
+
+/// 完了の印を付ける・外す（要約が「途中」でも、残りを片付けたものに付ける）
+async fn finished_handler(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(b): Json<FinishedBody>,
+) -> ApiResult<Response> {
+    same_origin(&headers)?;
+    let conn = app.db.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+    if !finished::set(
+        &conn,
+        &id,
+        b.finished,
+        chrono::Utc::now().timestamp_millis(),
+    )? {
+        return Ok((StatusCode::NOT_FOUND, "no such session").into_response());
+    }
+    Ok(Json(json!({ "finished": b.finished })).into_response())
 }
 
 #[derive(Deserialize)]
@@ -2396,6 +2471,110 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(v["sessions"][0]["id"], "s1");
+    }
+
+    #[tokio::test]
+    async fn mark_finished() {
+        let (app, _) = test_app("finished-api");
+        {
+            let conn = app.db.lock().unwrap();
+            seed(&conn, "s1", "/r/a", 6000, "題");
+            conn.execute(
+                "INSERT INTO summaries (session_id, last_uuid, model, body, created_at) VALUES ('s1', 'u', 'm', ?1, 0)",
+                [r#"{"title":"t","bullets":[],"status":"途中"}"#],
+            )
+            .unwrap();
+        }
+        let mark = |id: &str, on: bool, headers: HeaderMap| {
+            finished_handler(
+                State(app.clone()),
+                headers,
+                Path(id.into()),
+                Json(FinishedBody { finished: on }),
+            )
+        };
+        let status = || {
+            let conn = app.db.lock().unwrap();
+            let d = session_data(&conn, "s1").unwrap().unwrap();
+            let w = week_data(&conn, 0, 10_000).unwrap();
+            (d["finished"].clone(), w["sessions"][0]["status"].clone())
+        };
+        assert_eq!(status(), (json!(false), json!("wip")));
+        let todo = || async {
+            let q = |machines: Option<&str>| Range {
+                from: 0,
+                to: 10_000_000,
+                machines: machines.map(String::from),
+            };
+            let Json(v) = stats_handler(State(app.clone()), Query(q(None)))
+                .await
+                .unwrap();
+            let Json(w) = stats_handler(State(app.clone()), Query(q(Some(r#"["ai-node"]"#))))
+                .await
+                .unwrap();
+            assert_eq!(w["todo"].as_array().unwrap().len(), 0);
+            (
+                v["todo"].as_array().unwrap().len(),
+                v["unsummarized"].clone(),
+            )
+        };
+        assert_eq!(todo().await, (1, json!(0)));
+        let r = mark("s1", true, local_headers()).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(status(), (json!(true), json!("done")));
+        assert_eq!(todo().await, (0, json!(0)));
+        mark("s1", false, local_headers()).await.unwrap();
+        assert_eq!(status(), (json!(false), json!("wip")));
+        let r = mark("nope", true, local_headers()).await.unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        let mut evil = local_headers();
+        evil.insert("origin", "http://evil.example".parse().unwrap());
+        assert!(mark("s1", true, evil).await.is_err());
+        assert_eq!(status().0, json!(false));
+    }
+
+    #[tokio::test]
+    async fn period_summary_needs_summaries_on() {
+        let (app, _) = test_app("period-api");
+        {
+            let conn = app.db.lock().unwrap();
+            seed(&conn, "s1", "/r/a", 600, "題");
+            conn.execute(
+                "INSERT INTO period_summaries VALUES (0, 3000, '', '## 概要', 'sonnet', 5, 0.1)",
+                [],
+            )
+            .unwrap();
+        }
+        let body = || PeriodBody {
+            from: 0,
+            to: 3_000_000,
+            machines: None,
+        };
+        let e = period_summary_handler(State(app.clone()), local_headers(), Json(body()))
+            .await
+            .unwrap_err();
+        assert_eq!(e.0, StatusCode::CONFLICT);
+        let mut evil = local_headers();
+        evil.insert("origin", "http://evil.example".parse().unwrap());
+        assert!(
+            period_summary_handler(State(app.clone()), evil, Json(body()))
+                .await
+                .is_err()
+        );
+        // 保存した要約は、同じ期間の集計と一緒に返す
+        let q = |machines: Option<&str>| Range {
+            from: 0,
+            to: 3_000_000,
+            machines: machines.map(String::from),
+        };
+        let Json(v) = stats_handler(State(app.clone()), Query(q(None)))
+            .await
+            .unwrap();
+        assert_eq!(v["period_summary"]["text"], "## 概要");
+        let Json(v) = stats_handler(State(app.clone()), Query(q(Some(r#"[""]"#))))
+            .await
+            .unwrap();
+        assert_eq!(v["period_summary"], Value::Null);
     }
 
     #[test]

@@ -36,6 +36,8 @@ export const getWeek = (from, to) => j(`/api/week?from=${from}&to=${to}`)
 // machines（ホストの id の配列。手元は空文字）を渡すとそのホストだけ。null なら全部
 export const getStats = (from, to, machines = null) =>
   j(`/api/stats?from=${from}&to=${to}${machines == null ? '' : `&machines=${encodeURIComponent(JSON.stringify(machines))}`}`)
+// 期間（日・週・月）の要約を作って保存する。machines は集計と同じホストの絞り込み（null なら全部）
+export const summarizePeriod = (from, to, machines = null) => post('/api/period-summary', { from, to, machines })
 export const getSession = (id) => j(`/api/session/${encodeURIComponent(id)}`)
 export const rescan = () => post('/api/rescan')
 export const setProject = (repo, project) => post('/api/repo-project', { repo, project })
@@ -57,6 +59,8 @@ export const stopInstruction = (id) => post(`/api/session/${encodeURIComponent(i
 // ピン留め
 export const getPins = () => j('/api/pins')
 export const setPin = (id, pinned) => post(`/api/session/${encodeURIComponent(id)}/pin`, { pinned })
+// 完了の印（要約が途中でも、残りを片付けたものに付ける。セッションがそのあと動いたら効かなくなる）
+export const setFinished = (id, finished) => post(`/api/session/${encodeURIComponent(id)}/finished`, { finished })
 // いま要約する（止まっていなくても、要約済みでも作り直す）
 export const summarizeSession = (id) => post(`/api/session/${encodeURIComponent(id)}/summarize`)
 export const getSettings = () => j('/api/settings')
