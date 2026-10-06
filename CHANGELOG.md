@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.3 (unreleased)
+
+- Start here: the list of branches to cut the new worktree from now shows branches on GitHub as `origin/name`; only branches that exist just on this machine keep their bare name. The default branch reads `origin/main`, so it is clear where the new branch starts from
+- Permission choice when sending the next instruction now starts at auto (was edit); the last choice is remembered in the browser and shared with Start here
+
 ## 0.1.2
 
 - Repositories view: the GitHub repository list is now reused for 24 hours (was 10 minutes); Reload still fetches it again

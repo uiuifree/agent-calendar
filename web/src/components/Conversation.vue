@@ -4,6 +4,7 @@ import { getAsks, getTranscript, sendInstruction } from '../api.js'
 import { locale, t } from '../i18n.js'
 import { renderMarkdown } from '../markdown.js'
 import { MAX_IMAGES, pickImages, toPayload } from '../images.js'
+import { rememberedMode } from '../remembered.js'
 import PermissionAsk from './PermissionAsk.vue'
 
 // セッションの会話。履歴をチャットの形で並べ、下の入力欄から続きの指示を送る
@@ -86,7 +87,7 @@ watch(
 
 // 送る
 const prompt = ref('')
-const mode = ref('edit') // 許可の初期値は「ファイルの編集まで」（ユーザーの指定）
+const mode = rememberedMode() // 許可の範囲。既定は自動判定で、前回選んだものを覚えている
 const running = ref(false)
 const live = ref([]) // 実行中に届いた途中経過
 const canSend = computed(() => !props.blocked && !running.value && prompt.value.trim().length > 0)

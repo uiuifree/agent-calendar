@@ -186,6 +186,8 @@ const RULES = {
 
 function fakeBranch(v) {
   if (v.startsWith('https://')) return fakeGithub(v)
+  // 出発点の一覧の origin/… は、origin/ を残して名前だけ作り物にする
+  if (v.startsWith('origin/')) return `origin/${fakeBranch(v.slice('origin/'.length))}`
   return v === 'main' || v === 'master' ? v : `feature/${pick(['login-fix', 'search-speedup', 'settings', 'csv-import'], v)}`
 }
 

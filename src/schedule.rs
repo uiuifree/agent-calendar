@@ -509,8 +509,9 @@ fn has_ref(top: &str, name: &str) -> bool {
 }
 
 /// 新しいブランチの出発点。戻り値は (git に渡す名前, 画面に出す名前)。
-/// 空なら origin の既定のブランチ（分からなければいまの HEAD）。名前を選んだときは origin のものを先に見て、
-/// origin に無ければ手元のブランチ（GitHub にある状態から始めるのが基本なので）
+/// 空なら origin の既定のブランチ（分からなければいまの HEAD）。`origin/名前` なら origin のそのブランチ
+/// （手元にしか無ければ断る）。素の名前なら origin のものを先に見て、origin に無ければ手元のブランチ
+/// （GitHub にある状態から始めるのが基本なので）
 fn start_point(top: &str, from: &str) -> Result<(String, String)> {
     if from.is_empty() {
         return Ok(match crate::github::default_branch(top) {
@@ -518,16 +519,20 @@ fn start_point(top: &str, from: &str) -> Result<(String, String)> {
             None => ("HEAD".into(), "HEAD".into()),
         });
     }
-    if !valid_branch(from) {
+    let (name, origin_only) = match from.strip_prefix("origin/") {
+        Some(name) => (name, true),
+        None => (from, false),
+    };
+    if !valid_branch(name) {
         bail!("not a valid branch name: {from}");
     }
-    let remote = format!("refs/remotes/origin/{from}");
+    let remote = format!("refs/remotes/origin/{name}");
     if has_ref(top, &remote) {
-        return Ok((remote, format!("origin/{from}")));
+        return Ok((remote, format!("origin/{name}")));
     }
-    let local = format!("refs/heads/{from}");
-    if has_ref(top, &local) {
-        return Ok((local, from.to_string()));
+    let local = format!("refs/heads/{name}");
+    if !origin_only && has_ref(top, &local) {
+        return Ok((local, name.to_string()));
     }
     bail!("no such branch: {from}");
 }
@@ -1313,6 +1318,7 @@ mod tests {
         ]);
         git(&["branch", "local-only"]);
         git(&["branch", "release"]); // 手元の release は origin より先に進んでいる
+        git(&["branch", "origin/topic"]); // 手元だけにある origin/… という名前（一覧には出さない）
         let origin_main = rev(r, "refs/remotes/origin/main");
         assert_ne!(origin_main, rev(r, "HEAD"));
         // 空なら既定のブランチから（いまの HEAD からではない）。そこを push 先にはしない
@@ -1324,11 +1330,20 @@ mod tests {
         let (ws, from) = new_worktree(r, "feature/try-3", "release", &wbase).unwrap();
         assert_eq!(
             (from.as_str(), rev(&ws, "HEAD")),
-            ("origin/release", origin_main)
+            ("origin/release", origin_main.clone())
         );
         let (ws, from) = new_worktree(r, "feature/try-4", "local-only", &wbase).unwrap();
         assert_eq!(from, "local-only");
         assert_eq!(rev(&ws, "HEAD"), rev(r, "HEAD"));
+        // 一覧の表記（origin/名前）のまま渡せる。origin に無いものは手元にあっても断る
+        let (ws, from) = new_worktree(r, "feature/try-5", "origin/release", &wbase).unwrap();
+        assert_eq!(
+            (from.as_str(), rev(&ws, "HEAD")),
+            ("origin/release", origin_main)
+        );
+        assert!(new_worktree(r, "feature/try-6", "origin/local-only", &wbase).is_err());
+        assert!(new_worktree(r, "feature/try-6", "origin/", &wbase).is_err());
+        assert!(new_worktree(r, "feature/try-6", "origin/-x", &wbase).is_err());
         // すでにある作業場所の一覧: 切ったものが出て、本体の作業コピーは出ない
         let listed = worktrees(r);
         assert_eq!(
@@ -1337,10 +1352,11 @@ mod tests {
                 "feature/try-1",
                 "feature/try-2",
                 "feature/try-3",
-                "feature/try-4"
+                "feature/try-4",
+                "feature/try-5"
             ]
         );
-        assert_eq!(listed[3].path, ws);
+        assert_eq!(listed[4].path, ws);
         assert!(worktrees("/nonexistent").is_empty());
         assert_eq!(
             parse_worktrees(
@@ -1362,9 +1378,10 @@ mod tests {
             ]
         );
         // 無いブランチ・ブランチ名でないものは断る
-        assert!(new_worktree(r, "feature/try-5", "nope", &wbase).is_err());
-        assert!(new_worktree(r, "feature/try-5", "main~1", &wbase).is_err());
-        assert!(new_worktree(r, "feature/try-5", "-x", &wbase).is_err());
+        assert!(new_worktree(r, "feature/try-6", "nope", &wbase).is_err());
+        assert!(new_worktree(r, "feature/try-6", "origin/nope", &wbase).is_err());
+        assert!(new_worktree(r, "feature/try-6", "main~1", &wbase).is_err());
+        assert!(new_worktree(r, "feature/try-6", "-x", &wbase).is_err());
         assert_eq!(
             (
                 crate::github::default_branch(r).as_deref(),
@@ -1372,15 +1389,18 @@ mod tests {
             ),
             (
                 Some("main"),
+                // origin にあるものは origin/ 付き。release は手元にもあるが origin のものだけ出す。
+                // 手元の origin/topic は出ない
                 [
                     "feature/try-1",
                     "feature/try-2",
                     "feature/try-3",
                     "feature/try-4",
+                    "feature/try-5",
                     "local-only",
-                    "main",
                     "master",
-                    "release"
+                    "origin/main",
+                    "origin/release"
                 ]
                 .map(String::from)
                 .to_vec()
