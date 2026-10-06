@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.4 (unreleased)
+## 0.1.4
 
 - Session details open in tabs at the top of the right panel: picking another session replaces the tab unless you keep it with ＋, kept tabs stay side by side, and a half-written instruction survives switching tabs
 - Drag the edge between the calendar and the right panel to change its width (per Overview / Conversation / Changes; double-click to reset)
