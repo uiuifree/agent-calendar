@@ -52,6 +52,8 @@ export const getChanges = (id, commit = null) => j(`/api/session/${encodeURIComp
 export const getDiff = (id, path, commit = null) => j(`/api/session/${encodeURIComponent(id)}/diff?${q(commit, unmask(path))}`)
 // そのセッションで、画面の答えを待っている許可の問い合わせ（会話を開き直したときに出し直す）
 export const getAsks = (id) => j(`/api/session/${encodeURIComponent(id)}/asks`)
+// 実行中の指示を止める（画面の「中断」）。実行中でなければ失敗が返る
+export const stopInstruction = (id) => post(`/api/session/${encodeURIComponent(id)}/stop`)
 // ピン留め
 export const getPins = () => j('/api/pins')
 export const setPin = (id, pinned) => post(`/api/session/${encodeURIComponent(id)}/pin`, { pinned })

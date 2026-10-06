@@ -42,6 +42,7 @@ const MESSAGES = {
     unpricedHint: 'Includes models without a known price (shown lower than actual)',
     apiPrice: 'At API prices',
     close: 'Close',
+    resizePanel: 'Drag to change the width (double-click to reset)',
     sidebar: { create: 'Create', pages: 'Pages', menu: 'Main menu', insights: 'Time insights', moreInsights: 'More insights', hosts: 'Hosts', repos: 'Repositories', pinned: 'Pinned' },
     settings: {
       title: 'Settings',
@@ -66,6 +67,12 @@ const MESSAGES = {
       noRelease: 'no release published yet',
       roots: 'Folders to look for local clones',
       rootsHint: 'One absolute path per line. Git repositories directly inside are matched by their origin; clones go here.',
+    },
+    tabs: {
+      label: 'Open sessions',
+      keep: 'Keep this tab (it stays when you open another session)',
+      unkeep: 'Stop keeping this tab',
+      close: 'Close tab',
     },
     detail: {
       pin: 'Pin to the sidebar',
@@ -260,6 +267,9 @@ const MESSAGES = {
       noRemote: 'This session ran on {machine}. Continue it there.',
       noRunning: 'This session is open in a terminal or in the background. Continue it there.',
       busy: 'An instruction is already running for this session.',
+      stop: 'Stop',
+      stopConfirm: 'Stop the running instruction? Changes made so far are not undone.',
+      stopped: 'Stopped.',
       result: 'Result',
       failed: 'Failed: {e}',
       done: 'Finished',
@@ -324,6 +334,7 @@ const MESSAGES = {
     unpricedHint: '単価の分からないモデルを含む（少なめに出ている）',
     apiPrice: 'API 単価換算',
     close: '閉じる',
+    resizePanel: 'ドラッグで幅を変える（ダブルクリックで元の幅に戻す）',
     sidebar: { create: '作成', pages: '画面', menu: 'メインメニュー', insights: '時間の分析情報', moreInsights: 'その他の分析情報', hosts: 'ホスト', repos: 'リポジトリ', pinned: 'ピン留め' },
     settings: {
       title: '設定',
@@ -348,6 +359,12 @@ const MESSAGES = {
       noRelease: 'まだリリースがありません',
       roots: '手元の clone を探すフォルダ',
       rootsHint: '1 行に 1 つ、絶対パスで。直下の git リポジトリを origin で突き合わせます。clone もここに置きます。',
+    },
+    tabs: {
+      label: '開いているセッション',
+      keep: 'タブを固定（ほかのセッションを開いても残す）',
+      unkeep: '固定を外す',
+      close: 'タブを閉じる',
     },
     detail: {
       pin: 'サイドバーにピン留め',
@@ -542,6 +559,9 @@ const MESSAGES = {
       noRemote: 'このセッションは {machine} で動いたものです。そちらで続けてください。',
       noRunning: 'このセッションは端末か裏で開いています。そちらで続けてください。',
       busy: 'このセッションには、いま別の指示を実行中です。',
+      stop: '中断',
+      stopConfirm: '実行中の指示を中断しますか？ ここまでに行われた変更は元に戻りません。',
+      stopped: '中断しました。',
       result: '結果',
       failed: '失敗しました: {e}',
       done: '終わりました',

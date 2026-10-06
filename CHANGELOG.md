@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.4 (unreleased)
+
+- Session details open in tabs at the top of the right panel: picking another session replaces the tab unless you keep it with ＋, kept tabs stay side by side, and a half-written instruction survives switching tabs
+- Drag the edge between the calendar and the right panel to change its width (per Overview / Conversation / Changes; double-click to reset)
+- Conversation: a Stop button stops the instruction that is running for the session (one you sent, or one started from Start here or another tab). Changes it already made are kept
+- An instruction sent from the page, Start here, and a schedule may now run for up to 60 minutes (was 15) before it is stopped
+- Settings: when Check now finds a newer version, the Update button in the header appears right away (it used to appear only after reloading the page)
+
 ## 0.1.3
 
 - Start here: the list of branches to cut the new worktree from now shows branches on GitHub as `origin/name`; only branches that exist just on this machine keep their bare name. The default branch reads `origin/main`, so it is clear where the new branch starts from

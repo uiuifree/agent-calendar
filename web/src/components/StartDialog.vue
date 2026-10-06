@@ -117,7 +117,7 @@ async function run() {
     finished.value = true
     // 会話の画面へ移ったあと（ダイアログは隠れている）に失敗したら、理由を親に渡して見えるところに出す
     const end = live.value.at(-1)
-    if (sessionId.value && end?.kind === 'done' && !end.ok) emit('failed', end.text ?? '')
+    if (sessionId.value && end?.kind === 'done' && !end.ok && !end.stopped) emit('failed', end.text ?? '')
     emit('ran')
   }
 }
@@ -194,6 +194,7 @@ function onKey(e) {
           <div v-if="ev.kind === 'text'" class="md" v-html="renderMarkdown(ev.text)" />
           <div v-else-if="ev.kind === 'tool'" class="tool"><span class="name">{{ ev.name }}</span> {{ ev.text }}</div>
           <PermissionAsk v-else-if="ev.kind === 'permission'" :ask="ev" />
+          <p v-else-if="ev.kind === 'done' && ev.stopped" class="chip">{{ t('conv.stopped') }}</p>
           <p v-else-if="ev.kind === 'done' && !ev.ok" class="chip warn">{{ t('conv.failed', { e: ev.text ?? '' }) }}</p>
         </template>
         <p v-if="running" class="muted small">{{ t('repos.running') }}</p>

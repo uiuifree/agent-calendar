@@ -5,11 +5,14 @@ import { addDays, startOfDay, weekStart } from './layout.js'
 import { lang, locale, setLang, t } from './i18n.js'
 import { CALENDAR_VIEWS, formatRoute, parseRoute } from './route.js'
 import { remembered } from './remembered.js'
+import { closeTab, isTabs, keptTabs, openTab, patchTab } from './tabs.js'
+import { MIN_CALENDAR, isWidths, panelWidth, withoutWidth } from './resize.js'
 import TimeGrid from './components/TimeGrid.vue'
 import DayList from './components/DayList.vue'
 import MonthView from './components/MonthView.vue'
 import StatsView from './components/StatsView.vue'
 import SessionDetail from './components/SessionDetail.vue'
+import DetailTabs from './components/DetailTabs.vue'
 import SettingsDialog from './components/SettingsDialog.vue'
 import Sidebar from './components/Sidebar.vue'
 import PlansView from './components/PlansView.vue'
@@ -62,15 +65,61 @@ function openDay(d) {
 const data = ref({ sessions: [], repos: {}, machines: [] })
 const error = ref('')
 const loading = ref(false)
-const selectedId = ref(null)
+// 右の詳細パネルはタブ式。開いているセッションの並びはブラウザに覚え、表示中のもの（activeId）は URL に持つ。
+// セッションを選ぶと、固定していないタブ（仮のタブ）の中身が入れ替わる。固定したタブは残り、その右に新しいタブが足される
+const tabs = remembered('agent-calendar.tabs', [], isTabs)
+const activeId = ref(null)
+// 表示中のセッション。選ぶ所（カレンダー・サイドバー・URL）はここへ入れるだけでよい。
+// 無しにした（パネルを閉じた）ときは仮のタブを捨てる
+const selectedId = computed({
+  get: () => activeId.value,
+  set: (id) => {
+    tabs.value = id ? openTab(tabs.value, activeId.value, id) : keptTabs(tabs.value)
+    activeId.value = id
+  },
+})
+// タブの見出しに出す題（詳細を読み込めたものから入る。スクショ用の表示でも作り物のまま出るよう、ブラウザには覚えない）
+const tabTitles = ref({})
+function closeDetailTab(id) {
+  const r = closeTab(tabs.value, activeId.value, id)
+  tabs.value = r.tabs
+  selectedId.value = r.active
+}
+function keepDetailTab(id) {
+  tabs.value = patchTab(tabs.value, id, { kept: !tabs.value.find((x) => x.id === id).kept })
+}
 const showSettings = ref(false)
 // 詳細パネル: 会話・変更のタブでは広げる（変更は左に一覧・右に差分なので特に広く）。tab は開いているタブ、full は画面いっぱい（閉じたら戻す）。
 // tab と full は URL にも持つ（リロードしても同じ状態で開く）
 const detailFull = ref(false)
 // 詳細パネルの上の情報（日時・リポジトリ・再開のボタン）をたたんで、会話や差分を広く使う（画面の低いノート PC 用。次に開いたときも同じ）
 const detailCompact = remembered('agent-calendar.detailCompact', false, (v) => typeof v === 'boolean')
-const detailTab = ref('summary')
+// 表示中のセッションで開いている中のタブ（概要・会話・変更）。セッションごとに覚える
+const detailTab = computed({
+  get: () => tabs.value.find((x) => x.id === activeId.value)?.tab ?? 'summary',
+  set: (v) => (tabs.value = patchTab(tabs.value, activeId.value, { tab: v })),
+})
 const DETAIL_W = { conversation: '640px', changes: 'min(960px, 60vw)' }
+// カレンダーとの境目をドラッグして変えた幅（中のタブごと。ブラウザに覚える）。変えていないタブは上の既定の幅。
+// あとで画面を狭くしても、カレンダー側に最低限の幅は残す
+const SIDEBAR_W = 256
+const detailWidths = remembered('agent-calendar.detailWidths', {}, isWidths)
+const sidebarW = computed(() => (sidebarOpen.value ? SIDEBAR_W : 0))
+const detailWidth = computed(() => {
+  const w = detailWidths.value[detailTab.value]
+  return w ? `min(${w}px, calc(100vw - ${sidebarW.value + MIN_CALENDAR}px))` : (DETAIL_W[detailTab.value] ?? '440px')
+})
+const resizing = ref(false)
+// 境目をつかんだら、離すまでポインタをこの要素で受ける（カレンダーや会話の上を通っても途切れない）
+function startResize(e) {
+  e.preventDefault() // 文字の選択を始めない
+  e.currentTarget.setPointerCapture(e.pointerId)
+  resizing.value = true
+}
+function resize(e) {
+  if (!resizing.value) return
+  detailWidths.value = { ...detailWidths.value, [detailTab.value]: panelWidth(e.clientX, window.innerWidth, sidebarW.value) }
+}
 
 // 集計・予定・リポジトリの画面と開いているセッションは URL に持たせる（戻る・進む・ブックマーク・共有ができるように）。
 // カレンダーは URL を変えない（"/"）。"/" に戻ったら、最後に見ていた日・週・月の表示にする
@@ -133,9 +182,7 @@ async function openPlan(id) {
 // 予定はこのマシンで動くので、ホストの絞り込みで手元を外したときは出さない
 const plans = computed(() => (hosts.value == null || hosts.value.includes('') ? (data.value.plans ?? []) : []))
 watch(selectedId, (id) => {
-  if (id) return
-  detailFull.value = false
-  detailTab.value = 'summary'
+  if (!id) detailFull.value = false
 })
 const now = ref(Date.now())
 // 読み直した回数。集計とサイドバーはこれを見て取り直す（週の範囲が変わらなくても数字は変わる）
@@ -309,7 +356,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
 </script>
 
 <template>
-  <div class="app" :class="{ withDetail: selectedId, withSidebar: sidebarOpen, detailFull: selectedId && detailFull }" :style="{ '--detail-w': DETAIL_W[detailTab] ?? '440px' }" :lang="lang">
+  <div class="app" :class="{ withDetail: selectedId, withSidebar: sidebarOpen, detailFull: selectedId && detailFull }" :style="{ '--detail-w': detailWidth }" :lang="lang">
     <header class="top">
       <button class="icon-btn" :aria-label="t('sidebar.menu')" :aria-expanded="sidebarOpen" @click="sidebarOpen = !sidebarOpen">☰</button>
       <button class="brand" :title="t('backToCalendar')" @click="backToCalendar">
@@ -456,21 +503,43 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
         />
         <StatsView v-else :from="weekStart(anchor)" :version="version" :hosts="hosts" />
       </div>
-      <SessionDetail
-        v-if="selectedId"
-        :id="selectedId"
-        :repos="data.repos"
-        :machine-labels="machineLabels"
-        class="side"
-        @close="selectedId = null"
-        v-model:tab="detailTab"
-        :full="detailFull"
-        @full="(f) => (detailFull = f)"
-        v-model:compact="detailCompact"
-        @pinned="loadPins"
-      />
+      <!-- 開いているタブの数だけ詳細を置き、表示中のもの以外は隠すだけにする（書きかけの指示と、実行中の途中経過を残す） -->
+      <section v-if="selectedId" class="side panel">
+        <!-- カレンダーとの境目。ドラッグで幅を変え、ダブルクリックで既定の幅に戻す -->
+        <div
+          class="grip"
+          :class="{ on: resizing }"
+          role="separator"
+          aria-orientation="vertical"
+          :title="t('resizePanel')"
+          :aria-label="t('resizePanel')"
+          @pointerdown="startResize"
+          @pointermove="resize"
+          @lostpointercapture="resizing = false"
+          @dblclick="detailWidths = withoutWidth(detailWidths, detailTab)"
+        />
+        <DetailTabs :tabs="tabs" :active="selectedId" :titles="tabTitles" @select="(id) => (selectedId = id)" @keep="keepDetailTab" @close="closeDetailTab" />
+        <SessionDetail
+          v-for="x in tabs"
+          v-show="x.id === selectedId"
+          :id="x.id"
+          :key="x.id"
+          :active="x.id === selectedId"
+          :repos="data.repos"
+          :machine-labels="machineLabels"
+          class="pane"
+          :tab="x.tab"
+          :full="detailFull"
+          v-model:compact="detailCompact"
+          @update:tab="(v) => (tabs = patchTab(tabs, x.id, { tab: v }))"
+          @close="closeDetailTab(x.id)"
+          @full="(f) => (detailFull = f)"
+          @pinned="loadPins"
+          @title="(title) => (tabTitles[x.id] = title)"
+        />
+      </section>
     </main>
-    <SettingsDialog v-if="showSettings" @close="showSettings = false" @saved="load" />
+    <SettingsDialog v-if="showSettings" @close="showSettings = false" @saved="load" @update="(v) => (updateInfo = v)" />
     <PlanForm v-if="creating !== undefined" :at="creating" @close="creating = undefined" @saved="planSaved" />
     <PlanForm v-if="editingPlan" :plan="editingPlan" @close="editingPlan = null" @saved="planSaved" />
   </div>
@@ -510,11 +579,19 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
 .content.fixed .fill{flex:1; min-height:0}
 .daygrid{flex:1; min-height:0; display:grid; grid-template-columns:minmax(0, 1fr) minmax(320px, 42%)}
 .side{min-height:0}
+/* 右のパネル: 上にタブの帯、下に詳細（残りの高さいっぱい） */
+.panel{display:flex; flex-direction:column; position:relative}
+/* 境目のつかむ所（パネルの左の縁）。乗せたとき・つかんでいるあいだだけ色を出す */
+.grip{position:absolute; top:0; bottom:0; left:0; width:6px; z-index:5; cursor:col-resize; touch-action:none}
+.grip:hover,.grip.on{background:var(--accent-soft)}
+.app.detailFull .grip{display:none}
+.panel .pane{flex:1; min-height:0; height:auto}
 .hint{display:flex; align-items:center; gap:12px; margin:4px 0 8px; padding:8px 14px; border-radius:8px; background:var(--accent-faint); font-size:13px}
 .link{border:0; background:none; padding:0; color:var(--accent); font-weight:500; text-decoration:underline; text-underline-offset:.2em}
 
 /* 狭い画面では、サイドバーを消さずに本文の上へ重ねる（☰ で開け閉めできるように） */
 @media (max-width: 1100px){
+  .grip{display:none}
   .app.withSidebar.withDetail .main{grid-template-columns:1fr 400px}
   .app.withSidebar.withDetail .main :deep(.sidebar){position:fixed; top:64px; left:0; bottom:0; z-index:15; background:var(--ground);
     box-shadow:0 4px 8px 3px rgba(60,64,67,.15), 0 1px 3px rgba(60,64,67,.3)}

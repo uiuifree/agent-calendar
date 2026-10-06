@@ -5,7 +5,7 @@ import { useEscape } from '../dialog.js'
 import { locale, t } from '../i18n.js'
 
 // 自動で動かす時間帯と間隔。保存すると裏の処理は次の 1 分から新しい設定で動く
-const emit = defineEmits(['close', 'saved'])
+const emit = defineEmits(['close', 'saved', 'update'])
 useEscape(() => emit('close'))
 
 const form = ref(null)
@@ -24,13 +24,17 @@ const SUMMARY = [15, 30, 60, 120, 180, 360]
 const hourLabel = (h) => `${h}:00`
 const span = (m) => (m < 60 ? t('settings.minutes', { n: m }) : t('settings.hourUnit', { n: m / 60 }))
 
-// 版: いまの版と、確かめた最新の版
+// 版: いまの版と、確かめた最新の版。分かったら App にも渡す（ヘッダーの「更新できます」を読み込み直さずに出す）
 const version = ref(null)
+function gotVersion(v) {
+  version.value = v
+  emit('update', v)
+}
 const checking = ref(false)
 async function checkNow() {
   checking.value = true
   try {
-    version.value = await checkUpdate()
+    gotVersion(await checkUpdate())
   } catch (e) {
     error.value = String(e.message ?? e)
   } finally {
@@ -40,7 +44,7 @@ async function checkNow() {
 
 onMounted(async () => {
   getUpdate()
-    .then((v) => (version.value = v))
+    .then(gotVersion)
     .catch(() => {})
   try {
     const r = await getSettings()
