@@ -288,6 +288,7 @@ pub async fn run(args: &[String]) -> Result<()> {
         .route("/session/{id}/pin", post(pin_handler))
         .route("/permission", post(permission_handler))
         .route("/session/{id}/asks", get(asks_handler))
+        .route("/session/{id}/stop", post(stop_handler))
         .route("/session/{id}/changes", get(changes_handler))
         .route("/session/{id}/diff", get(diff_handler))
         .route("/pins", get(pins_handler))
@@ -1177,6 +1178,23 @@ async fn permission_handler(
     app.running
         .answer(&b.request_id, b.allow, b.remember)
         .map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// 画面の「中断」。そのセッションで実行中の指示を止める（時間切れと同じ止め方）。実行中でなければ 409。
+/// 止まるのはエージェントの実行だけで、すでに済んだ変更は戻らない
+async fn stop_handler(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    same_origin(&headers)?;
+    if !app.running.stop(&id) {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            anyhow::anyhow!("no instruction is running for this session"),
+        ));
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -2396,6 +2414,25 @@ mod tests {
         let res = ndjson_after(Some("a\n".into()), rx).unwrap();
         let body = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
         assert_eq!(&body[..], b"a\nb\n");
+    }
+
+    #[tokio::test]
+    async fn stop_needs_a_running_instruction_and_the_same_origin() {
+        let (app, _) = test_app("stop-api");
+        let stop =
+            |headers: HeaderMap| stop_handler(State(app.clone()), headers, Path("s1".into()));
+        // 実行中でなければ断る
+        assert_eq!(
+            stop(local_headers()).await.unwrap_err().0,
+            StatusCode::CONFLICT
+        );
+        // 実行中なら受ける。ほかのサイトからの呼び出しは受けない
+        let _held = app.running.claim("s1").unwrap();
+        let Json(v) = stop(local_headers()).await.unwrap();
+        assert_eq!(v, json!({ "ok": true }));
+        let mut foreign = local_headers();
+        foreign.insert("origin", "https://evil.example".parse().unwrap());
+        assert!(stop(foreign).await.is_err());
     }
 
     #[tokio::test]

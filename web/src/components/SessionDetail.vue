@@ -15,8 +15,9 @@ const props = defineProps({
   full: { type: Boolean, default: false }, // 画面いっぱいに広げている
   tab: { type: String, default: 'summary' }, // 開いているタブ（URL に持つので App が覚える）
   compact: { type: Boolean, default: false }, // 上の情報をたたんで題だけにしている（ブラウザに覚えるので App が持つ）
+  active: { type: Boolean, default: true }, // 表示中のタブ（ほかのタブを見ているあいだは隠れているだけ）
 })
-const emit = defineEmits(['close', 'full', 'pinned', 'update:tab', 'update:compact'])
+const emit = defineEmits(['close', 'full', 'pinned', 'title', 'update:tab', 'update:compact'])
 
 // 概要・会話・変更のタブ（URL に持つので App が覚える。パネルの幅も App がタブで決める）
 const tab = computed({ get: () => props.tab, set: (v) => emit('update:tab', v) })
@@ -32,6 +33,16 @@ async function load(id) {
     if (id === props.id) error.value = String(e)
   }
 }
+
+// 隠れていたタブに戻ったら読み直す（見ていないあいだに、別のタブや予定からこのセッションの実行が始まった・終わったかもしれない）
+watch(
+  () => props.active,
+  (on) => on && load(props.id),
+)
+
+// 題。読み込めたら App にも知らせる（パネルの上のタブの見出しに出す）
+const title = computed(() => s.value?.summary?.title || s.value?.title || '')
+watch(s, (v) => v && emit('title', title.value))
 
 const repo = computed(() => (s.value && props.repos[s.value.repo]) ?? null)
 const repoName = computed(() => repo.value?.name ?? s.value?.repo.split('/').pop())
@@ -194,7 +205,7 @@ watch(
       <header class="head">
         <i class="square" :style="{ background: repoColor(repo?.slot) }" />
         <div>
-          <h2>{{ s.summary?.title || s.title || t('untitled') }}</h2>
+          <h2>{{ title || t('untitled') }}</h2>
           <div v-if="!compact" class="when num">{{ when }}</div>
           <div v-if="!compact" class="meta muted">
             <span>{{ repoName }}</span>
@@ -256,6 +267,7 @@ watch(
         :key="convKey"
         :blocked="blocked"
         :following="!!s.sending"
+        :stamp="s.last_ts"
         class="conv"
         @sent="load(s.id)"
       />

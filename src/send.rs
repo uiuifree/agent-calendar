@@ -3,14 +3,14 @@
 use anyhow::{Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 /// 1 回の実行の上限。超えたら止める
-pub const TIMEOUT: Duration = Duration::from_secs(15 * 60);
+pub const TIMEOUT: Duration = Duration::from_secs(60 * 60);
 /// エラー出力は最後のここまでだけ残す（失敗の理由を見せるため）
 const STDERR_TAIL: usize = 4096;
 pub const MAX_PROMPT_CHARS: usize = 20_000;
@@ -369,10 +369,11 @@ pub fn rule_label((tool, content): &(String, Option<String>)) -> String {
 }
 
 /// 実行中のセッション。同じセッションに同時に 2 つ送らない（記録に 2 か所から書くことになる）。
+/// 印ごとに、その実行を止める合図（画面の「中断」）を持つ。
 /// あわせて、画面の答えを待っている許可の問い合わせ（問い合わせの ID → その実行の標準入力と、問われた操作）を持つ
 #[derive(Default, Clone)]
 pub struct Running {
-    set: Arc<Mutex<HashSet<String>>>,
+    set: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     pending: Arc<Mutex<HashMap<String, Pending>>>,
     /// 本体を入れ替えている最中。新しい実行を受け付けない（入れ替えのあとの再起動で途中で切れるので）
     updating: Arc<std::sync::atomic::AtomicBool>,
@@ -410,15 +411,29 @@ struct Pending {
 impl Running {
     /// 印を付ける。すでに付いていれば None。戻り値を手放すと印が外れる
     pub fn claim(&self, id: &str) -> Option<Claim> {
+        self.claim_with(id, Arc::new(Notify::new()))
+    }
+
+    /// 止める合図を指定して印を付ける。新しく始めたセッションの ID が分かったとき、
+    /// 同じ実行にその ID でも印を付けるのに使う（どちらの名前で「中断」しても同じ実行が止まる）
+    fn claim_with(&self, id: &str, stop: Arc<Notify>) -> Option<Claim> {
         let mut set = self.set.lock().unwrap_or_else(|e| e.into_inner());
         // 入れ替えの判定と同じ鍵の中で見る（判定と新しい実行が入れ違わないように）
-        if self.updating() {
+        if self.updating() || set.contains_key(id) {
             return None;
         }
-        set.insert(id.to_string()).then(|| Claim {
+        set.insert(id.to_string(), stop.clone());
+        Some(Claim {
             set: self.set.clone(),
             id: id.to_string(),
+            stop,
         })
+    }
+
+    /// 画面の「中断」。そのセッションで実行中の指示に、止める合図を送る。実行中でなければ false
+    pub fn stop(&self, id: &str) -> bool {
+        let set = self.set.lock().unwrap_or_else(|e| e.into_inner());
+        set.get(id).map(|stop| stop.notify_one()).is_some()
     }
 
     pub fn updating(&self) -> bool {
@@ -486,7 +501,7 @@ impl Running {
         self.set
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(id)
+            .contains_key(id)
     }
 
     /// 画面で押した許可・拒否を Claude に返す。remember なら、そのルールをリポジトリの
@@ -564,8 +579,10 @@ impl Running {
 
 /// 終わったら（途中で落ちても）印を外す
 pub struct Claim {
-    set: Arc<Mutex<HashSet<String>>>,
+    set: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     id: String,
+    /// この実行を止める合図
+    stop: Arc<Notify>,
 }
 
 impl Drop for Claim {
@@ -635,6 +652,7 @@ pub fn start(
     let (source, prompt, limit, cleanup) = (job.source, job.prompt, job.timeout, job.cleanup);
     let ask = job.ask && source != "codex";
     let job_id = job.id.clone();
+    let stop = claim.stop.clone();
     tokio::spawn(async move {
         // 問い合わせを画面で受けるときは標準入力を閉じずに、答えをここから書き足す（結果が出たら閉じる）
         let mut answers: Option<mpsc::Sender<String>> = None;
@@ -708,16 +726,19 @@ pub fn start(
                         && session_claim.is_none()
                         && let Some(id) = ev["id"].as_str()
                     {
-                        session_claim = running.claim(id);
+                        session_claim = running.claim_with(id, stop.clone());
                         current = id.to_string();
                     }
                     let _ = tx.send(format!("{ev}\n")).await;
                 }
             }
         };
-        // 時間切れなら止めてから回収する（止めないと編集が上限を超えて続く）
-        let timed_out = tokio::time::timeout(limit, read).await.is_err();
-        if timed_out {
+        // 時間切れか、画面の「中断」なら止めてから回収する（止めないと編集が上限を超えて続く）
+        let (timed_out, stopped) = tokio::select! {
+            r = tokio::time::timeout(limit, read) => (r.is_err(), false),
+            () = stop.notified() => (false, true),
+        };
+        if timed_out || stopped {
             let _ = child.start_kill();
         }
         let status = child.wait().await;
@@ -733,13 +754,15 @@ pub fn start(
         if timed_out || !done {
             let why = match status {
                 _ if timed_out => format!("stopped after {} minutes", limit.as_secs() / 60),
+                _ if stopped => "stopped from the page".to_string(),
                 Ok(s) => format!("exited with {s}: {}", err.trim()),
                 Err(e) => e.to_string(),
             };
+            // stopped は、画面が「失敗」でなく「中断した」と出すための印
             let _ = tx
                 .send(format!(
                     "{}\n",
-                    json!({ "kind": "done", "ok": false, "text": why })
+                    json!({ "kind": "done", "ok": false, "text": why, "stopped": stopped })
                 ))
                 .await;
         }
@@ -1139,6 +1162,37 @@ mod tests {
         let ev =
             collect(start(&running, job(&noisy, "t2", &dir, String::new()), || {}).unwrap()).await;
         assert_eq!(ev, [json!({"kind":"done","ok":true,"text":null})]);
+    }
+
+    #[tokio::test]
+    async fn stops_when_asked_from_the_page() {
+        let dir = crate::db::temp_dir("send-stop");
+        let running = Running::default();
+        // 実行中でなければ何もしない
+        assert!(!running.stop("p1"));
+        let slow = fake(&dir, "sleep 30");
+        let started = std::time::Instant::now();
+        let rx = start(&running, job(&slow, "p1", &dir, String::new()), || {}).unwrap();
+        assert!(running.stop("p1"));
+        let ev = collect(rx).await;
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(
+            ev,
+            [json!({"kind":"done","ok":false,"text":"stopped from the page","stopped":true})]
+        );
+        assert!(!running.contains("p1") && !running.stop("p1"));
+        // 新しく始めたセッションは、分かった ID でも止められる
+        let script = fake(
+            &dir,
+            r#"echo '{"type":"system","subtype":"init","session_id":"real-2"}'; sleep 30"#,
+        );
+        let mut rx = start(&running, job(&script, "new:/s", &dir, String::new()), || {}).unwrap();
+        let first: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+        assert_eq!(first["kind"], "session");
+        assert!(running.stop("real-2"));
+        let ev = collect(rx).await;
+        assert_eq!(ev.last().unwrap()["stopped"], true);
+        assert!(!running.contains("real-2") && !running.contains("new:/s"));
     }
 
     #[tokio::test]

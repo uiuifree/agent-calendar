@@ -1,6 +1,6 @@
 <script setup>
 import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
-import { getAsks, getTranscript, sendInstruction } from '../api.js'
+import { getAsks, getTranscript, sendInstruction, stopInstruction } from '../api.js'
 import { locale, t } from '../i18n.js'
 import { renderMarkdown } from '../markdown.js'
 import { MAX_IMAGES, pickImages, toPayload } from '../images.js'
@@ -14,6 +14,8 @@ const props = defineProps({
   blocked: { type: String, default: null },
   // ほかの画面（「ここで始める」や別のタブ）から実行中。数秒おきに履歴を読み直して進み具合を見せる
   following: { type: Boolean, default: false },
+  // セッションの最後の記録の時刻。変わったら履歴を読み直す（隠れていたタブに戻ったとき、見ていないあいだに進んだ分を出す）
+  stamp: { type: Number, default: 0 },
 })
 const emit = defineEmits(['sent'])
 
@@ -87,6 +89,11 @@ watch(
 
 // 送る
 const prompt = ref('')
+// ここから送っている最中は読み直さない（終わったときに読み直す）。書きかけの指示はそのまま残る
+watch(
+  () => props.stamp,
+  () => running.value || refresh(),
+)
 const mode = rememberedMode() // 許可の範囲。既定は自動判定で、前回選んだものを覚えている
 const running = ref(false)
 const live = ref([]) // 実行中に届いた途中経過
@@ -171,6 +178,21 @@ async function send() {
   }
 }
 
+// 中断: このセッションで実行中の指示を止める（ここから送ったものも、別のタブや「ここで始める」で動いているものも）。
+// 止まるのは実行だけで、ここまでの変更は元に戻らない
+const stopping = ref(false)
+async function stop() {
+  if (!window.confirm(t('conv.stopConfirm'))) return
+  stopping.value = true
+  try {
+    await stopInstruction(props.id)
+  } catch (e) {
+    error.value = String(e.message ?? e)
+  } finally {
+    stopping.value = false
+  }
+}
+
 async function scrollDown() {
   await nextTick()
   list.value?.scrollTo({ top: list.value.scrollHeight })
@@ -219,6 +241,7 @@ function onKey(e) {
         <div v-else-if="ev.kind === 'text'" class="msg agent"><div class="md" v-html="renderMarkdown(ev.text)" /></div>
         <div v-else-if="ev.kind === 'tool'" class="tool flat"><span class="name">{{ ev.name }}</span> <span class="arg">{{ ev.text }}</span></div>
         <PermissionAsk v-else-if="ev.kind === 'permission'" :ask="ev" />
+        <p v-else-if="ev.kind === 'done' && ev.stopped" class="chip">{{ t('conv.stopped') }}</p>
         <p v-else-if="ev.kind === 'done' && !ev.ok" class="chip warn">{{ t('conv.failed', { e: ev.text ?? '' }) }}</p>
       </template>
       <PermissionAsk v-for="a in waiting" :key="a.request_id" :ask="a" />
@@ -226,7 +249,12 @@ function onKey(e) {
     </div>
 
     <div class="composer" @dragover.prevent @drop.prevent="onDrop">
-      <p v-if="blocked" class="muted small">{{ blocked }}</p>
+      <div v-if="blocked" class="row">
+        <p class="muted small">{{ blocked }}</p>
+        <span class="spacer" />
+        <!-- 別のタブや「ここで始める」で動いている指示も、ここから止められる -->
+        <button v-if="following" class="btn" :disabled="stopping" @click="stop">{{ t('conv.stop') }}</button>
+      </div>
       <template v-else>
         <textarea v-model="prompt" rows="3" :placeholder="t('conv.placeholder')" :disabled="running" @keydown="onKey" @paste="onPaste" />
         <div v-if="attachments.length && !running" class="thumbs">
@@ -243,6 +271,7 @@ function onKey(e) {
             <option value="auto">{{ t('conv.modeAuto') }}</option>
           </select>
           <span class="spacer" />
+          <button v-if="running" class="btn" :disabled="stopping" @click="stop">{{ t('conv.stop') }}</button>
           <button class="btn primary" :disabled="!canSend" @click="send">{{ running ? t('conv.sending') : t('conv.send') }}</button>
         </div>
         <p class="muted small">{{ t('conv.note') }} {{ t('conv.attach', { n: MAX_IMAGES }) }}</p>
