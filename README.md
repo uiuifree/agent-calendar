@@ -21,7 +21,9 @@ Everything runs on your machine. The page is served on `127.0.0.1` only.
   agent / subagents / advisor, your git commits made during the session, and the conversation history.
   Summarize a session on demand with *Summarize now*.
 - **Stats** – active time, session count and cost per project for a day, week or month. You assign repositories
-  to projects in the page.
+  to projects in the page. Below it, a summary of the period that you write with a button and that is kept, and
+  what is left to do in that period: sessions in progress, or not done with something left in their summary, which you
+  can open or mark done.
 - **Continue** – send the next instruction to a Claude Code or Codex session from the page (read-only, allowed
   to edit, or Claude's auto mode). When Claude needs approval for a command, the page asks you to allow or deny it.
   You can also resume a Claude Code session in the background with Remote Control, or copy the
@@ -92,8 +94,15 @@ cargo install --path .
 agent-calendar serve [--port 23848] [--no-summarize] [--summary-model sonnet] [--summary-lang en|ja]
 agent-calendar scan
 agent-calendar summarize [--limit 20] [--model sonnet] [--lang en|ja]
+agent-calendar todo [--from 2026-10-06] [--to 2026-10-07]
+agent-calendar done <session id> [--undo]
 agent-calendar service install [--port 23848] [--no-summarize] [--summary-lang en|ja]
 ```
+
+`todo` lists the sessions of those days (default: today) that are in progress, or not done with something left to do in
+their summary, one per line: id, last activity, status, repository, title, what is left. `done` marks a session as done; it
+then leaves the list and shows as done in the page until the session continues. You can also do this from the page
+(Mark done in a session's Overview).
 
 `serve` rescans every 5 minutes and summarizes idle sessions every hour (10 per round) between 7:00 and 22:00;
 change the hours and intervals from the settings in the page. The summary language defaults to Japanese when `$LANG` starts with `ja`, English otherwise.

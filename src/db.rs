@@ -217,6 +217,22 @@ CREATE TABLE IF NOT EXISTS pins (
     session_id TEXT PRIMARY KEY,
     pinned_at  INTEGER NOT NULL
 );
+-- 手で付けた完了の印。finished_at（unix ms）より後の記録がセッションに入ったら印は効かない
+CREATE TABLE IF NOT EXISTS finished (
+    session_id  TEXT PRIMARY KEY,
+    finished_at INTEGER NOT NULL
+);
+-- 期間（日・週・月）の要約。集計の画面で作る。from_ts・to_ts は unix 秒、machines はホストの絞り込み（すべてなら空文字）
+CREATE TABLE IF NOT EXISTS period_summaries (
+    from_ts    INTEGER NOT NULL,
+    to_ts      INTEGER NOT NULL,
+    machines   TEXT NOT NULL,
+    body       TEXT NOT NULL,  -- マークダウン
+    model      TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    cost_usd   REAL,
+    PRIMARY KEY (from_ts, to_ts, machines)
+);
 ";
 
 #[cfg(test)]

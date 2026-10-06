@@ -1,6 +1,6 @@
 //! ピン留め: 進行中の会話をすぐ開けるように、選んだセッションをサイドバーの上に並べる。
 //! あわせて、リポジトリの画面に出す「そのリポジトリのセッション」の一覧も作る（題の付け方が同じなので）
-use crate::summarize;
+use crate::{finished, summarize};
 use anyhow::Result;
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
@@ -40,14 +40,15 @@ pub fn is_pinned(conn: &Connection, id: &str) -> Result<bool> {
 
 /// ピン留めしたセッション。最近動いたものから
 pub fn list(conn: &Connection) -> Result<Vec<Value>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT s.id, s.repo, s.title, m.body,
                 (SELECT text FROM prompts p WHERE p.session_id = s.id ORDER BY seq LIMIT 1),
-                s.last_ts, s.source, s.machine
+                s.last_ts, s.source, s.machine, {}
          FROM pins x JOIN sessions s ON s.id = x.session_id
          LEFT JOIN summaries m ON m.session_id = s.id
          ORDER BY s.last_ts DESC",
-    )?;
+        finished::SQL
+    ))?;
     let rows = stmt
         .query_map([], |r| {
             let summary = r
@@ -57,7 +58,7 @@ pub fn list(conn: &Connection) -> Result<Vec<Value>> {
                 "id": r.get::<_, String>(0)?,
                 "repo": r.get::<_, String>(1)?,
                 "title": title(summary.as_ref(), r.get(2)?, r.get(4)?),
-                "status": summary.map(|s| s.status).unwrap_or_default(),
+                "status": finished::status(summary.as_ref(), r.get(8)?),
                 "last_ts": r.get::<_, i64>(5)?,
                 "source": r.get::<_, String>(6)?,
                 "machine": r.get::<_, String>(7)?,
@@ -69,14 +70,15 @@ pub fn list(conn: &Connection) -> Result<Vec<Value>> {
 
 /// このマシンでそのリポジトリに開いたセッション。新しいものから limit 件
 pub fn in_repo(conn: &Connection, repo: &str, limit: i64) -> Result<Vec<Value>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT s.id, s.title, m.body,
                 (SELECT text FROM prompts p WHERE p.session_id = s.id ORDER BY seq LIMIT 1),
-                s.first_ts, s.last_ts, s.source
+                s.first_ts, s.last_ts, s.source, {}
          FROM sessions s LEFT JOIN summaries m ON m.session_id = s.id
          WHERE s.repo = ?1 AND s.machine = ''
          ORDER BY s.last_ts DESC LIMIT ?2",
-    )?;
+        finished::SQL
+    ))?;
     let rows = stmt
         .query_map(params![repo, limit], |r| {
             let summary = r
@@ -85,7 +87,7 @@ pub fn in_repo(conn: &Connection, repo: &str, limit: i64) -> Result<Vec<Value>> 
             Ok(json!({
                 "id": r.get::<_, String>(0)?,
                 "title": title(summary.as_ref(), r.get(1)?, r.get(3)?),
-                "status": summary.map(|s| s.status).unwrap_or_default(),
+                "status": finished::status(summary.as_ref(), r.get(7)?),
                 "first_ts": r.get::<_, i64>(4)?,
                 "last_ts": r.get::<_, i64>(5)?,
                 "source": r.get::<_, String>(6)?,

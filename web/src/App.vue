@@ -23,6 +23,8 @@ const VIEWS = ['day', 'week', 'month', 'stats', 'plans', 'repos']
 // 日付で動く表示（前へ・次へと今日のボタンを出す）
 const CALENDAR = ['day', 'week', 'month', 'stats']
 const view = remembered('agent-calendar.view3', 'week', (v) => VIEWS.includes(v))
+// 集計の単位（日・週・月）。‹ › の送り幅もこれに合わせる
+const statsMode = remembered('agent-calendar.statsMode', 'week', (v) => CALENDAR_VIEWS.includes(v))
 const sidebarOpen = remembered('agent-calendar.sidebar', true, (v) => typeof v === 'boolean')
 // 選んだホスト（null = すべて、'' = このマシン）と、隠したリポジトリ
 const hosts = remembered('agent-calendar.hosts', null, (v) => v === null || Array.isArray(v))
@@ -54,8 +56,9 @@ const to = computed(() => span.value[1])
 // ‹ › は表示に合わせて 1 日・1 週・1 か月ずつ
 function step(n) {
   const d = new Date(anchor.value)
-  if (view.value === 'day') anchor.value = addDays(anchor.value, n)
-  else if (view.value === 'month') anchor.value = new Date(d.getFullYear(), d.getMonth() + n, 1).getTime()
+  const unit = view.value === 'stats' ? statsMode.value : view.value
+  if (unit === 'day') anchor.value = addDays(anchor.value, n)
+  else if (unit === 'month') anchor.value = new Date(d.getFullYear(), d.getMonth() + n, 1).getTime()
   else anchor.value = addDays(anchor.value, 7 * n)
 }
 function openDay(d) {
@@ -281,13 +284,16 @@ onMounted(() => {
 onUnmounted(() => clearInterval(timer))
 
 // 見出し: 日は「2026年10月4日(日)」、月は「2026年10月」、週は「2026年 9月 28日 – 10月 4日」
+// 集計の画面では、集計の単位（日・週・月）に合わせる
 const range = computed(() => {
-  if (view.value === 'day') {
+  const unit = view.value === 'stats' ? statsMode.value : view.value
+  if (unit === 'day') {
     return new Date(anchor.value).toLocaleDateString(locale(), { year: 'numeric', month: 'long', day: 'numeric', weekday: 'short' })
   }
-  if (view.value === 'month') return new Date(monthStart.value).toLocaleDateString(locale(), { year: 'numeric', month: 'long' })
+  if (unit === 'month') return new Date(monthStart.value).toLocaleDateString(locale(), { year: 'numeric', month: 'long' })
+  const w = weekStart(anchor.value)
   const fmt = new Intl.DateTimeFormat(locale(), { year: 'numeric', month: 'short', day: 'numeric' })
-  return fmt.formatRange(new Date(from.value), new Date(addDays(from.value, 6)))
+  return fmt.formatRange(new Date(w), new Date(addDays(w, 6)))
 })
 
 const machines = computed(() => data.value.machines ?? [])
@@ -501,7 +507,15 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
           @open-settings="showSettings = true"
           @changed="load"
         />
-        <StatsView v-else :from="weekStart(anchor)" :version="version" :hosts="hosts" />
+        <StatsView
+          v-else
+          v-model:mode="statsMode"
+          :day="anchor"
+          :version="version"
+          :hosts="hosts"
+          @open-session="(id) => (selectedId = id)"
+          @changed="load"
+        />
       </div>
       <!-- 開いているタブの数だけ詳細を置き、表示中のもの以外は隠すだけにする（書きかけの指示と、実行中の途中経過を残す） -->
       <section v-if="selectedId" class="side panel">
@@ -525,6 +539,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
           :id="x.id"
           :key="x.id"
           :active="x.id === selectedId"
+          :version="version"
           :repos="data.repos"
           :machine-labels="machineLabels"
           class="pane"
@@ -535,6 +550,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
           @close="closeDetailTab(x.id)"
           @full="(f) => (detailFull = f)"
           @pinned="loadPins"
+          @finished="load"
           @title="(title) => (tabTitles[x.id] = title)"
         />
       </section>

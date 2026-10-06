@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.6 (unreleased)
+
+- Mark a session as done from its Overview (Mark done / Undo done), even when the summary says it is in progress. It then shows as done on the calendar, in pins and in the repository list. The mark lasts until the session continues
+- Stats: choose Day as well as Week and Month (‹ › move by the chosen unit), and see what is left to do in that period under the table: sessions in progress, or not done with something left in their summary, with what is left, a link to open the session, and Mark done. Sessions whose summary says done are not listed
+- Stats: Summarize now writes a summary of the day, week or month (overview, by repository, left to do) from the summaries of its sessions, and keeps it; it shows again when you come back to that period. Only the short overview is shown at first; the details by repository open on a click
+- `agent-calendar todo [--from DATE] [--to DATE]` lists the sessions of those days that are in progress, or not done with something left to do, and `agent-calendar done <id> [--undo]` marks one as done, so you can go through them from a chat with an agent
+
 ## 0.1.5
 
 - Fix: in full screen, session details were pushed to the right and cut off when the conversation had a long line (since 0.1.4)
