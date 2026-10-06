@@ -4,6 +4,7 @@ import { getBranches, getModels, startSession } from '../api.js'
 import { useEscape } from '../dialog.js'
 import { locale, t } from '../i18n.js'
 import { MAX_IMAGES, pickImages, toPayload } from '../images.js'
+import { rememberedMode } from '../remembered.js'
 import { renderMarkdown } from '../markdown.js'
 import PermissionAsk from './PermissionAsk.vue'
 
@@ -16,7 +17,7 @@ const emit = defineEmits(['close', 'opened', 'ran', 'failed'])
 useEscape(() => emit('close'))
 
 const agent = ref('claude')
-const mode = ref('auto') // 許可の初期値は「自動判定」（ユーザーの指定）
+const mode = rememberedMode() // 許可の範囲。既定は自動判定で、前回選んだものを覚えている
 const prompt = ref('')
 // 使うモデル。空なら CLI の既定。候補はこのマシンの記録に出てきたモデル（最近使った順）。取れなくても既定のまま始められる
 const model = ref('')
@@ -45,6 +46,11 @@ const branches = ref(null) // { default, branches, worktrees }
 // 既定のブランチの名前。GitHub の一覧で分かっている名前が正（手元の origin/HEAD は clone したときのままで、
 // GitHub で既定を変えても追従しない）。一覧に無いときだけ手元の記録を使う
 const defaultBranch = computed(() => props.repo.default_branch || branches.value?.default || '')
+// 既定のブランチを一覧と同じ表記で（origin にあれば origin/名前）。画面に出す名前と実際に切る元を揃える
+const defaultEntry = computed(() => {
+  const name = defaultBranch.value
+  return name && branches.value?.branches.includes(`origin/${name}`) ? `origin/${name}` : name
+})
 watch(worktree, async (on) => {
   if (!on || branches.value) return
   try {
@@ -92,7 +98,7 @@ async function run() {
       worktree: worktree.value,
       branch: branch.value.trim(),
       // 既定のブランチも名前で渡す（空のままだと、手元に origin/HEAD の記録が無い clone では HEAD から切られる）
-      base: base.value || defaultBranch.value,
+      base: base.value || defaultEntry.value,
       existing: worktree.value ? existing.value : '',
       model: model.value.trim(),
     }
@@ -158,7 +164,7 @@ function onKey(e) {
       <label v-if="worktree && !existing" class="base">
         {{ t('repos.base') }}
         <select v-model="base" :disabled="running || finished">
-          <option value="">{{ defaultBranch ? t('repos.baseDefault', { name: defaultBranch }) : t('repos.baseHead') }}</option>
+          <option value="">{{ defaultEntry ? t('repos.baseDefault', { name: defaultEntry }) : t('repos.baseHead') }}</option>
           <option v-for="b in branches?.branches ?? []" :key="b" :value="b">{{ b }}</option>
         </select>
       </label>

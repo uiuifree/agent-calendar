@@ -68,11 +68,14 @@ it('ツールの名前・GitHub のリンク・ファイルのパス', () => {
   expect(m.github.repo).toBe(`https://github.com/${m.owners[0]}/${m.github.repo.split('/').pop()}`)
   expect(m.github.branch).toMatch(/\/tree\/feature\/example$/)
   expect(m.github.compare).toBe(null)
-  // 「ここで始める」で選ぶブランチ: main はそのまま、ほかは作り物
-  const b = maskData({ default: 'main', branches: ['main', 'client-acme/billing'] })
+  // 「ここで始める」で選ぶブランチ: main はそのまま、ほかは作り物。origin/ は残す
+  const b = maskData({ default: 'main', branches: ['main', 'client-acme/billing', 'origin/main', 'origin/client-acme/billing'] })
   expect(b.default).toBe('main')
   expect(b.branches[0]).toBe('main')
   expect(b.branches[1]).toMatch(/^feature\//)
+  expect(b.branches[2]).toBe('origin/main')
+  expect(b.branches[3]).toMatch(/^origin\/feature\//)
+  expect(b.branches[3]).not.toContain('acme')
   expect(maskData({ default: null }).default).toBe(null)
   expect(maskData({ checked_out: '/home/me/Secret Client' }).checked_out).not.toMatch(/Secret/)
   expect(m.files[0].path).toMatch(/\.rs$/)

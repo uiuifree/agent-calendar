@@ -4,6 +4,7 @@ import { getPins, getSchedules, getUpdate, getWeek, installUpdate, masked, resca
 import { addDays, startOfDay, weekStart } from './layout.js'
 import { lang, locale, setLang, t } from './i18n.js'
 import { CALENDAR_VIEWS, formatRoute, parseRoute } from './route.js'
+import { remembered } from './remembered.js'
 import TimeGrid from './components/TimeGrid.vue'
 import DayList from './components/DayList.vue'
 import MonthView from './components/MonthView.vue'
@@ -14,33 +15,6 @@ import Sidebar from './components/Sidebar.vue'
 import PlansView from './components/PlansView.vue'
 import PlanForm from './components/PlanForm.vue'
 import ReposView from './components/ReposView.vue'
-
-// 画面の状態のうち、次に開いたときも残したいものはブラウザに覚える（保存できなければ既定に戻る）
-function remembered(key, fallback, valid = () => true) {
-  let v = fallback
-  try {
-    const raw = localStorage.getItem(key)
-    if (raw != null) {
-      const parsed = JSON.parse(raw)
-      if (valid(parsed)) v = parsed
-    }
-  } catch {
-    // 読めなければ既定
-  }
-  const r = ref(v)
-  watch(
-    r,
-    (x) => {
-      try {
-        localStorage.setItem(key, JSON.stringify(x))
-      } catch {
-        // 保存できなくても画面は切り替わる
-      }
-    },
-    { deep: true },
-  )
-  return r
-}
 
 const VIEWS = ['day', 'week', 'month', 'stats', 'plans', 'repos']
 // 日付で動く表示（前へ・次へと今日のボタンを出す）

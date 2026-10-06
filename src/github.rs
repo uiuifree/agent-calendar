@@ -227,8 +227,10 @@ pub fn default_branch(dir: &str) -> Option<String> {
     .and_then(|h| h.strip_prefix("origin/").map(str::to_string))
 }
 
-/// 「ここで始める」で出発点に選べるブランチ: origin にあるものと手元にあるもの（名前順、重複なし）。
-/// 手元にある記録だけを見る（GitHub へは取りに行かない）
+/// 「ここで始める」で出発点に選べるブランチ（名前順、重複なし）。origin にあるものは `origin/名前`、
+/// 手元にしか無いものは素の名前で出す（両方にあれば origin のものだけ。切るときも origin を先に見るので、
+/// 画面の表記と実際の出発点が揃う）。手元のブランチで名前が `origin/` で始まるものは出さない
+/// （origin のものと見分けがつかず、git 自身も曖昧だと警告する名前）。手元にある記録だけを見る（GitHub へは取りに行かない）
 pub fn branches(dir: &str) -> Vec<String> {
     let refs = git_out(
         dir,
@@ -240,14 +242,20 @@ pub fn branches(dir: &str) -> Vec<String> {
         ],
     )
     .unwrap_or_default();
-    let names: std::collections::BTreeSet<String> = refs
+    let remote: std::collections::BTreeSet<&str> = refs
         .lines()
-        .filter_map(|r| {
-            r.strip_prefix("refs/heads/")
-                .or_else(|| r.strip_prefix("refs/remotes/origin/"))
-        })
+        .filter_map(|r| r.strip_prefix("refs/remotes/origin/"))
         .filter(|n| *n != "HEAD")
-        .map(str::to_string)
+        .collect();
+    let local = refs
+        .lines()
+        .filter_map(|r| r.strip_prefix("refs/heads/"))
+        .filter(|n| !remote.contains(n) && !n.starts_with("origin/"))
+        .map(str::to_string);
+    let names: std::collections::BTreeSet<String> = remote
+        .iter()
+        .map(|n| format!("origin/{n}"))
+        .chain(local)
         .collect();
     names.into_iter().collect()
 }
