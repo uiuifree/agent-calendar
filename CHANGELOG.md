@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.5 (unreleased)
+
+- Fix: in full screen, session details were pushed to the right and cut off when the conversation had a long line (since 0.1.4)
+
 ## 0.1.4
 
 - Session details open in tabs at the top of the right panel: picking another session replaces the tab unless you keep it with ＋, kept tabs stay side by side, and a half-written instruction survives switching tabs
