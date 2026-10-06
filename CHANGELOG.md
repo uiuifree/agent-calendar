@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.6 (unreleased)
+## 0.1.6
 
 - Mark a session as done from its Overview (Mark done / Undo done), even when the summary says it is in progress. It then shows as done on the calendar, in pins and in the repository list. The mark lasts until the session continues
 - Stats: choose Day as well as Week and Month (‹ › move by the chosen unit), and see what is left to do in that period under the table: sessions in progress, or not done with something left in their summary, with what is left, a link to open the session, and Mark done. Sessions whose summary says done are not listed
