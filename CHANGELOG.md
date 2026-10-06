@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.5 (unreleased)
+## 0.1.5
 
 - Fix: in full screen, session details were pushed to the right and cut off when the conversation had a long line (since 0.1.4)
 
