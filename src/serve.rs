@@ -293,6 +293,7 @@ pub async fn run(args: &[String]) -> Result<()> {
         .route("/session/{id}/stop", post(stop_handler))
         .route("/session/{id}/changes", get(changes_handler))
         .route("/session/{id}/diff", get(diff_handler))
+        .route("/session/{id}/image", get(image_handler))
         .route("/pins", get(pins_handler))
         .route("/update", get(update_handler))
         .route("/update/check", post(update_check_handler))
@@ -1207,6 +1208,43 @@ async fn diff_handler(
             .await?
             .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
     Ok(Json(json!({ "patch": patch, "truncated": truncated })))
+}
+
+#[derive(Deserialize)]
+struct ImageQuery {
+    /// あればそのコミット。無ければまだ commit していない変更
+    commit: Option<String>,
+    path: String,
+    side: diff::Side,
+}
+
+/// 変わった画像の、変わる前か後の中身（「変更」タブで並べて見せる）。その側に無ければ 404
+async fn image_handler(
+    State(app): State<Shared>,
+    Path(id): Path<String>,
+    Query(q): Query<ImageQuery>,
+) -> ApiResult<Response> {
+    let dir = session_dir(&app, &id)?;
+    let found = tokio::task::spawn_blocking(move || {
+        diff::image(&dir, q.commit.as_deref(), &q.path, q.side)
+    })
+    .await?
+    .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
+    let Some((bytes, mime)) = found else {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            anyhow::anyhow!("no image on this side"),
+        ));
+    };
+    Ok((
+        [
+            (header::CONTENT_TYPE, mime),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 #[derive(Deserialize)]
@@ -2672,6 +2710,61 @@ mod tests {
         .await
         .unwrap();
         assert!(v["patch"].as_str().unwrap().contains("+hi"));
+        // 画像は前と後の中身を返す。その側に無ければ 404、画像でなければ 400
+        std::fs::write(repo.join("p.png"), b"png").unwrap();
+        let img = |path: &str, side| {
+            Query(ImageQuery {
+                commit: None,
+                path: path.to_string(),
+                side,
+            })
+        };
+        let res = image_handler(
+            State(app.clone()),
+            Path("s1".into()),
+            img("p.png", diff::Side::After),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.headers()[header::CONTENT_TYPE], "image/png");
+        assert_eq!(res.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        let body = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"png");
+        let img_status = |r: ApiResult<Response>| r.unwrap_err().0;
+        assert_eq!(
+            img_status(
+                image_handler(
+                    State(app.clone()),
+                    Path("s1".into()),
+                    img("p.png", diff::Side::Before)
+                )
+                .await
+            ),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            img_status(
+                image_handler(
+                    State(app.clone()),
+                    Path("s1".into()),
+                    img("n.txt", diff::Side::After)
+                )
+                .await
+            ),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            img_status(
+                image_handler(
+                    State(app.clone()),
+                    Path("none".into()),
+                    img("p.png", diff::Side::After)
+                )
+                .await
+            ),
+            StatusCode::NOT_FOUND
+        );
+        std::fs::remove_file(repo.join("p.png")).unwrap();
         // パスが無い・コミットの指定がおかしい・別のマシン・無いセッション
         let status = |r: ApiResult<Json<Value>>| r.unwrap_err().0;
         assert_eq!(

@@ -18,21 +18,25 @@ Everything runs on your machine. The page is served on `127.0.0.1` only.
 
 - **Calendar** – day, week and month views in a Google Calendar–style layout. Filter by host and repository.
 - **Session details** – summary (what was done, done / in progress / discussion, what is left), cost split into
-  agent / subagents / advisor, your git commits made during the session, and the conversation history.
-  Summarize a session on demand with *Summarize now*.
+  agent / subagents / advisor, your git commits made during the session, the conversation history, and the changes
+  as a GitHub-style diff (images before and after, side by side). Summarize a session on demand with *Summarize now*, or mark it done with *Mark done*.
+  Details open in tabs at the top of the right panel: keep a tab with ＋ to have several sessions side by side, and drag
+  the panel's edge to make it wider.
 - **Stats** – active time, session count and cost per project for a day, week or month. You assign repositories
   to projects in the page. Below it, a summary of the period that you write with a button and that is kept, and
   what is left to do in that period: sessions in progress, or not done with something left in their summary, which you
   can open or mark done.
 - **Continue** – send the next instruction to a Claude Code or Codex session from the page (read-only, allowed
   to edit, or Claude's auto mode). When Claude needs approval for a command, the page asks you to allow or deny it.
-  You can also resume a Claude Code session in the background with Remote Control, or copy the
+  *Stop* stops an instruction that is running; an instruction runs for up to 60 minutes. You can also resume a Claude Code session in the background with Remote Control, or copy the
   `claude --resume` / `codex resume` command.
 - **Schedules** – run a prompt with Claude Code or Codex in a chosen directory once, on chosen weekdays, or every
   N minutes within a time window, optionally in a separate git worktree. Results show up on the calendar.
 - **Repositories** – pick a GitHub organization (only the ones you list in Settings) and see its repositories next to
   your local clones (matched by `origin` in the folders you list), when you last worked in each, and when it was last
-  updated on GitHub. Start a new Claude Code or Codex session in a clone, or clone a missing one. Uses your `gh` login.
+  updated on GitHub. Start a new Claude Code or Codex session in a clone (choose the model, and work in a new worktree
+  cut from `origin/main` or another branch, or in a worktree that already exists), or clone a missing one. The ⋯ menu
+  of each repository fetches from GitHub and removes finished worktrees and local branches. Uses your `gh` login.
 - **Pins** – pin the conversations you are working on; they stay at the top of the sidebar.
 - **Screenshots** – paste or drop images (PNG, JPEG, GIF, WebP; up to 5, 5 MB each) into an instruction.
 - **Other machines** – collect sessions from another machine over HTTPS (pinned certificate and token) with
@@ -45,9 +49,13 @@ Everything runs on your machine. The page is served on `127.0.0.1` only.
 
 | Session details | Changes |
 |---|---|
-| ![Summary, cost, commits and the conversation of a session](docs/images/session-en.png) | ![A GitHub-style diff of the session's changes](docs/images/changes-en.png) |
+| ![Summary of a session, with two sessions open in tabs](docs/images/session-en.png) | ![A GitHub-style diff of a commit made in the session](docs/images/changes-en.png) |
 | **Repositories** | **Stats** |
 | ![Repositories of your GitHub organizations next to local clones](docs/images/repos-en.png) | ![Active time and API-price cost per project](docs/images/stats-en.png) |
+| **Conversation** | **Schedules** |
+| ![Send the next instruction to a session from the page](docs/images/conversation-en.png) | ![A schedule that runs on weekday mornings in a separate worktree](docs/images/schedules-en.png) |
+| **Left to do** | |
+| ![The summary of the week and the sessions left to do](docs/images/todo-en.png) | |
 
 The screenshots are taken in screenshot mode, so names and text are sample content.
 
@@ -139,7 +147,7 @@ change the hours and intervals from the settings in the page. The summary langua
 
 agent-calendar depends on transcript formats and CLI commands that are not documented as stable APIs
 (`~/.claude/projects`, `claude agents --json`, `claude respawn`, `~/.codex/sessions`). Tested with
-**Claude Code 2.1.288** and **Codex CLI 0.154.0** on Linux (WSL2). The macOS build is not tested yet.
+**Claude Code 2.1.292** and **Codex CLI 0.154.0** on Linux (WSL2). The macOS build is not tested yet.
 If a newer version breaks something, please open an issue with the version numbers.
 
 ## FAQ

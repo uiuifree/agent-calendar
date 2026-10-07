@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.7 (unreleased)
+
+- Changes: images (PNG, JPEG, GIF, WebP) are shown before and after side by side instead of just "binary"; click one to open it at full size. They are hidden in screenshot mode
+
 ## 0.1.6
 
 - Mark a session as done from its Overview (Mark done / Undo done), even when the summary says it is in progress. It then shows as done on the calendar, in pins and in the repository list. The mark lasts until the session continues

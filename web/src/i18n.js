@@ -188,6 +188,11 @@ const MESSAGES = {
       new: 'new',
       binary: 'binary',
       truncated: 'The diff is too large; only the beginning is shown.',
+      before: 'Before',
+      after: 'After',
+      noImage: 'None',
+      imageFailed: 'Could not show the image.',
+      imageMasked: 'Images are not shown in screenshot mode.',
     },
     repos: {
       loading: 'Loading repositories from GitHub…',
@@ -490,6 +495,11 @@ const MESSAGES = {
       new: '新規',
       binary: 'バイナリ',
       truncated: '差分が大きいので、先頭だけを出しています。',
+      before: '変更前',
+      after: '変更後',
+      noImage: 'なし',
+      imageFailed: '画像を出せませんでした。',
+      imageMasked: 'スクショ用の表示では画像を出しません。',
     },
     repos: {
       loading: 'GitHub からリポジトリを読んでいます…',

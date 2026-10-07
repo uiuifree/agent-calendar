@@ -52,6 +52,9 @@ const q = (commit, path) =>
 export const getChanges = (id, commit = null) => j(`/api/session/${encodeURIComponent(id)}/changes?${q(commit)}`)
 // スクショ用の表示では、作り物のパスを本物に戻して問い合わせる
 export const getDiff = (id, path, commit = null) => j(`/api/session/${encodeURIComponent(id)}/diff?${q(commit, unmask(path))}`)
+// 変わった画像の、変わる前（before）か後（after）の中身の URL
+export const imageUrl = (id, path, commit, side) =>
+  `/api/session/${encodeURIComponent(id)}/image?${q(commit, unmask(path))}&side=${side}`
 // そのセッションで、画面の答えを待っている許可の問い合わせ（会話を開き直したときに出し直す）
 export const getAsks = (id) => j(`/api/session/${encodeURIComponent(id)}/asks`)
 // 実行中の指示を止める（画面の「中断」）。実行中でなければ失敗が返る

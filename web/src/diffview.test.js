@@ -1,5 +1,5 @@
 import { expect, it } from 'vitest'
-import { lineKind, patchRows, splitPath } from './diffview.js'
+import { isImage, lineKind, patchRows, splitPath } from './diffview.js'
 
 it('差分の行を分ける（見出しより前はファイルの情報）', () => {
   expect(lineKind('diff --git a/a b/a', true)).toBe('meta')
@@ -44,4 +44,9 @@ it('旧・新の行番号を付ける', () => {
 it('パスを分ける', () => {
   expect(splitPath('src/a/b.rs')).toEqual({ dir: 'src/a/', name: 'b.rs' })
   expect(splitPath('README.md')).toEqual({ dir: '', name: 'README.md' })
+})
+
+it('前と後を並べる画像か', () => {
+  expect(['a.png', 'docs/b.JPG', 'c.jpeg', 'd.gif', 'e.webp'].every(isImage)).toBe(true)
+  expect(['f.svg', 'g.png.txt', 'png'].some(isImage)).toBe(false)
 })
