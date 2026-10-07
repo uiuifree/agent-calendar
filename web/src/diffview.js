@@ -38,6 +38,9 @@ export function patchRows(patch) {
 }
 
 // パスをファイル名と置き場所に分ける（一覧ではファイル名を目立たせる）
+// 「変更」タブで前と後を並べて見せる画像（サーバーと同じ拡張子。SVG は入れない）
+export const isImage = (path) => /\.(png|jpe?g|gif|webp)$/i.test(path)
+
 export function splitPath(path) {
   const i = path.lastIndexOf('/')
   return i < 0 ? { dir: '', name: path } : { dir: path.slice(0, i + 1), name: path.slice(i + 1) }

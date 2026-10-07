@@ -1,8 +1,8 @@
 <script setup>
 import { computed, nextTick, ref, watch } from 'vue'
-import { getChanges, getDiff } from '../api.js'
+import { getChanges, getDiff, imageUrl, masked } from '../api.js'
 import { t } from '../i18n.js'
-import { patchRows, splitPath } from '../diffview.js'
+import { isImage, patchRows, splitPath } from '../diffview.js'
 
 // セッションの「変更」タブ。GitHub の Files changed と同じく、左にファイルの一覧、右にファイルごとの差分を並べる（見るだけ）。
 // 見る対象は、まだ commit していない変更か、セッション中のコミットのどれか
@@ -17,12 +17,14 @@ const dir = ref('')
 const files = ref(null)
 const diffs = ref({}) // path → { rows, truncated } | { error }
 const collapsed = ref({}) // path → true
+const failed = ref({}) // `${path}:${side}` → 出せなかったわけ（その側に無い・大きすぎるなど）
 const error = ref('')
 const loading = ref(false)
 
-// 差分は並べて取る（ファイルが多くても git を一度に起動しすぎないよう、同時に 6 つまで）
+// 差分は並べて取る（ファイルが多くても git を一度に起動しすぎないよう、同時に 6 つまで）。
+// 画像は差分の代わりに前と後を並べるので取らない
 async function loadDiffs(list, commit, token) {
-  const queue = [...list]
+  const queue = list.filter((f) => !isImage(f.path))
   const worker = async () => {
     while (queue.length) {
       const f = queue.shift()
@@ -49,6 +51,7 @@ async function load() {
   files.value = null
   diffs.value = {}
   collapsed.value = {}
+  failed.value = {}
   try {
     const r = await getChanges(props.id, commit)
     if (token !== loadToken) return
@@ -79,6 +82,13 @@ async function jump(path) {
   collapsed.value = { ...collapsed.value, [path]: false }
   await nextTick()
   pane.value?.querySelector(`[data-path="${CSS.escape(path)}"]`)?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+}
+// 画像を出せなかったら問い合わせ直して、その側に無い（404）のか、ほかの理由（大きすぎるなど）なのかを出す
+async function imageFailed(path, side) {
+  const token = loadToken
+  const r = await fetch(imageUrl(props.id, path, source.value || null, side)).catch((e) => e)
+  const why = r instanceof Response ? (r.status === 404 ? t('changes.noImage') : await r.text()) : String(r.message ?? r)
+  if (token === loadToken) failed.value = { ...failed.value, [`${path}:${side}`]: why || t('changes.imageFailed') }
 }
 const toggle = (path) => (collapsed.value = { ...collapsed.value, [path]: !collapsed.value[path] })
 </script>
@@ -125,7 +135,24 @@ const toggle = (path) => (collapsed.value = { ...collapsed.value, [path]: !colla
             <span v-else class="num tiny"><span class="add">+{{ f.added }}</span> <span class="del">−{{ f.removed }}</span></span>
           </header>
           <template v-if="!collapsed[f.path]">
-            <p v-if="!diffs[f.path]" class="muted small pad">{{ t('changes.loading') }}</p>
+            <!-- 画像は GitHub と同じく前と後を並べる。スクショ用の表示では本物が出てしまうので出さない -->
+            <p v-if="isImage(f.path) && masked" class="muted small pad">{{ t('changes.imageMasked') }}</p>
+            <div v-else-if="isImage(f.path)" class="images">
+              <figure v-for="side in ['before', 'after']" :key="side" :class="side">
+                <figcaption class="muted tiny">{{ t(`changes.${side}`) }}</figcaption>
+                <p v-if="failed[`${f.path}:${side}`]" class="muted small">{{ failed[`${f.path}:${side}`] }}</p>
+                <!-- 押すと原寸を別のタブで開く -->
+                <a v-else :href="imageUrl(id, f.path, source || null, side)" target="_blank" rel="noopener noreferrer">
+                  <img
+                    :src="imageUrl(id, f.path, source || null, side)"
+                    :alt="`${t(`changes.${side}`)}: ${f.path}`"
+                    loading="lazy"
+                    @error="imageFailed(f.path, side)"
+                  />
+                </a>
+              </figure>
+            </div>
+            <p v-else-if="!diffs[f.path]" class="muted small pad">{{ t('changes.loading') }}</p>
             <p v-else-if="diffs[f.path].error" class="chip warn">{{ diffs[f.path].error }}</p>
             <p v-else-if="!diffs[f.path].rows.length" class="muted small pad">{{ t('changes.noText') }}</p>
             <div v-else class="code">
@@ -191,4 +218,12 @@ tr.add .ln{background:#ccffd8}
 tr.del td{background:#ffebe9}
 tr.del .ln{background:#ffd7d5}
 tr.hunk td{background:#ddf4ff; color:#57606a}
+/* 画像: 前は赤、後は緑の枠。透明な部分が分かるよう市松模様の上に置く */
+.images{display:grid; grid-template-columns:1fr 1fr; gap:12px; padding:12px}
+.images figure{margin:0; min-width:0; text-align:center}
+.images figcaption{margin-bottom:6px}
+.images img{max-width:100%; max-height:480px; border:1px solid; border-radius:4px;
+  background:repeating-conic-gradient(#eee 0 25%, #fff 0 50%) 0 0 / 16px 16px}
+.images .before img{border-color:#ff8182}
+.images .after img{border-color:#4ac26b}
 </style>
