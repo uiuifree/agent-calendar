@@ -34,7 +34,7 @@
 - Active time: 10-minute buckets merged across sessions, gaps of 30 minutes or less count as continuous
 - Summaries send only prompts and agent text (no tool I/O) through the user's own `claude -p --no-session-persistence`
 - Server accepts only Host 127.0.0.1/localhost/[::1] on its port; POSTs need a JSON body and are refused from other origins
-- Depends on undocumented transcript formats; tested with Claude Code 2.1.288 and Codex CLI 0.154.0
+- Depends on undocumented transcript formats; tested with Claude Code 2.1.292 and Codex CLI 0.154.0
 
 ## Links
 
