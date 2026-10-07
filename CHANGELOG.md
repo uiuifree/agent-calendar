@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.7 (unreleased)
+## 0.1.7
 
 - Changes: images (PNG, JPEG, GIF, WebP) are shown before and after side by side instead of just "binary"; click one to open it at full size. They are hidden in screenshot mode
 
