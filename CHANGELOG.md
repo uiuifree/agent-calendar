@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.8 (unreleased)
+
+- Session details: when the top is folded, the repository and branch still show next to the title if the panel is wide enough
+
 ## 0.1.7
 
 - Changes: images (PNG, JPEG, GIF, WebP) are shown before and after side by side instead of just "binary"; click one to open it at full size. They are hidden in screenshot mode

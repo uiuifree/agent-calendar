@@ -235,7 +235,14 @@ watch(
       <header class="head">
         <i class="square" :style="{ background: repoColor(repo?.slot) }" />
         <div>
-          <h2>{{ title || t('untitled') }}</h2>
+          <div class="title-row">
+            <h2>{{ title || t('untitled') }}</h2>
+            <!-- たたんでいても、横幅に余裕があればリポジトリとブランチは題の右に出す -->
+            <span v-if="compact" class="mini muted" :title="s.branch ? `${repoName} · ${s.branch}` : repoName">
+              <span>{{ repoName }}</span>
+              <code v-if="s.branch">{{ s.branch }}</code>
+            </span>
+          </div>
           <div v-if="!compact" class="when num">{{ when }}</div>
           <div v-if="!compact" class="meta muted">
             <span>{{ repoName }}</span>
@@ -380,7 +387,7 @@ watch(
 
 <style scoped>
 .detail{overflow-y:auto; height:100%; padding:8px 24px 32px; border-left:1px solid var(--rule); background:var(--ground);
-  display:flex; flex-direction:column}
+  display:flex; flex-direction:column; container:detail / inline-size}
 .tabs{display:flex; gap:4px; margin:16px 0 4px; border-bottom:1px solid var(--rule)}
 .tabs button{border:0; background:none; padding:8px 16px; color:var(--muted); font-weight:500; border-bottom:3px solid transparent; margin-bottom:-1px}
 .tabs button.on{color:var(--accent); border-bottom-color:var(--accent)}
@@ -408,6 +415,14 @@ watch(
 .detail.compact .head > div{min-width:0}
 .detail.compact .square{margin-top:0}
 .detail.compact h2{font-size:16px; font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+.detail.compact .title-row{display:flex; align-items:baseline; gap:12px; min-width:0}
+.detail.compact .title-row h2{flex:1 1 auto; min-width:0}
+.mini{display:none; flex:0 1 auto; min-width:0; max-width:50%; gap:6px; align-items:baseline; font-size:13px; white-space:nowrap; overflow:hidden}
+.mini > *{overflow:hidden; text-overflow:ellipsis}
+.mini > span{flex:0 0 auto}
+.mini > code{flex:0 1 auto; min-width:0}
+/* 狭いときは題を優先して隠す */
+@container detail (min-width: 640px){ .mini{display:flex} }
 .detail.compact .tabs{margin-top:4px}
 .square{width:16px; height:16px; border-radius:4px; margin-top:8px}
 h2{font-size:22px; font-weight:400; line-height:1.35; margin:0; color:var(--ink)}
