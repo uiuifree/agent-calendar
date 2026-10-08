@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.8 (unreleased)
+## 0.1.8
 
 - Session details: when the top is folded, the repository and branch still show next to the title if the panel is wide enough
 
