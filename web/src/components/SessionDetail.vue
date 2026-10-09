@@ -145,16 +145,14 @@ async function doSummarize() {
   }
 }
 
-// 別のタブから指示を実行中のあいだは状態を見に行き、終わったら入力欄を戻して会話を読み直す
-const convKey = ref(0)
+// 別のタブから指示を実行中のあいだは状態を見に行く（終わったときの会話の読み直しは Conversation がする）
 let poll = null
 watch(
   () => s.value?.sending,
-  (now, before) => {
+  (now) => {
     clearInterval(poll)
     poll = null
     if (now) poll = setInterval(() => load(props.id), 4000)
-    else if (before) convKey.value++
   },
 )
 onUnmounted(() => clearInterval(poll))
@@ -301,8 +299,8 @@ watch(
       <Conversation
         v-else-if="tab === 'conversation'"
         :id="s.id"
-        :key="convKey"
         :blocked="blocked"
+        :remote="!!s.machine"
         :following="!!s.sending"
         :stamp="s.last_ts"
         class="conv"

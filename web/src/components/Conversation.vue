@@ -14,6 +14,8 @@ const props = defineProps({
   blocked: { type: String, default: null },
   // ほかの画面（「ここで始める」や別のタブ）から実行中。数秒おきに履歴を読み直して進み具合を見せる
   following: { type: Boolean, default: false },
+  // 別のマシンで動いたセッション。ここからは送れないので入力欄を出さない
+  remote: { type: Boolean, default: false },
   // セッションの最後の記録の時刻。変わったら履歴を読み直す（隠れていたタブに戻ったとき、見ていないあいだに進んだ分を出す）
   stamp: { type: Number, default: 0 },
 })
@@ -80,9 +82,11 @@ async function refresh() {
 }
 watch(
   () => props.following,
-  (on) => {
+  (on, was) => {
     clearInterval(follow)
     follow = on ? setInterval(refresh, 3000) : null
+    // 終わったら最後まで読み直す（入力欄はそのままにして、書きかけを残す）。ここから送ったものは send が読み直す
+    if (!on && was && !running.value) load()
   },
   { immediate: true },
 )
@@ -148,17 +152,21 @@ onUnmounted(() => {
 async function send() {
   if (!canSend.value) return
   const text = prompt.value.trim()
+  const chosen = mode.value // 実行中に選び直しても、送った指示の許可の範囲は変えない
   running.value = true
-  const shown = attachments.value.map((a) => a.url) // 送り終わるまで見せておく
-  live.value = [{ kind: 'user', text, images: shown }]
+  // 送る画像は入力欄から外し、送り終わるまで会話の側に見せておく。実行中も次の指示を書いて画像を足せる
+  const sending = attachments.value
+  attachments.value = []
+  attachError.value = ''
+  live.value = [{ kind: 'user', text, images: sending.map((a) => a.url) }]
   prompt.value = ''
   await scrollDown()
   try {
-    const images = await Promise.all(attachments.value.map((a) => toPayload(a.file)))
+    const images = await Promise.all(sending.map((a) => toPayload(a.file)))
     await sendInstruction(
       props.id,
       text,
-      mode.value,
+      chosen,
       async (ev) => {
         live.value.push(ev)
         await scrollDown()
@@ -173,7 +181,7 @@ async function send() {
     const ended = live.value.at(-1)
     await load()
     live.value = ended?.kind === 'done' && !ended.ok ? [ended] : []
-    clearImages()
+    for (const a of sending) URL.revokeObjectURL(a.url)
     emit('sent')
   }
 }
@@ -249,15 +257,11 @@ function onKey(e) {
     </div>
 
     <div class="composer" @dragover.prevent @drop.prevent="onDrop">
-      <div v-if="blocked" class="row">
-        <p class="muted small">{{ blocked }}</p>
-        <span class="spacer" />
-        <!-- 別のタブや「ここで始める」で動いている指示も、ここから止められる -->
-        <button v-if="following" class="btn" :disabled="stopping" @click="stop">{{ t('conv.stop') }}</button>
-      </div>
-      <template v-else>
-        <textarea v-model="prompt" rows="3" :placeholder="t('conv.placeholder')" :disabled="running" @keydown="onKey" @paste="onPaste" />
-        <div v-if="attachments.length && !running" class="thumbs">
+      <p v-if="blocked" class="muted small">{{ blocked }}</p>
+      <!-- 送れないあいだも書ける（実行中に次の指示やメモを書きためておく）。送るのは終わってから -->
+      <template v-if="!remote">
+        <textarea v-model="prompt" rows="3" :placeholder="t('conv.placeholder')" @keydown="onKey" @paste="onPaste" />
+        <div v-if="attachments.length" class="thumbs">
           <span v-for="(a, i) in attachments" :key="a.url" class="thumb">
             <img :src="a.url" alt="" />
             <button class="x" :aria-label="t('conv.removeImage')" @click="removeImage(i)">✕</button>
@@ -265,13 +269,14 @@ function onKey(e) {
         </div>
         <p v-if="attachError" class="chip warn">{{ attachError }}</p>
         <div class="row">
-          <select v-model="mode" :disabled="running" :aria-label="t('conv.modeRead')">
+          <select v-model="mode" :aria-label="t('conv.modeRead')">
             <option value="read">{{ t('conv.modeRead') }}</option>
             <option value="edit">{{ t('conv.modeEdit') }}</option>
             <option value="auto">{{ t('conv.modeAuto') }}</option>
           </select>
           <span class="spacer" />
-          <button v-if="running" class="btn" :disabled="stopping" @click="stop">{{ t('conv.stop') }}</button>
+          <!-- 別のタブや「ここで始める」で動いている指示も、ここから止められる -->
+          <button v-if="running || following" class="btn" :disabled="stopping" @click="stop">{{ t('conv.stop') }}</button>
           <button class="btn primary" :disabled="!canSend" @click="send">{{ running ? t('conv.sending') : t('conv.send') }}</button>
         </div>
         <p class="muted small">{{ t('conv.note') }} {{ t('conv.attach', { n: MAX_IMAGES }) }}</p>
@@ -325,6 +330,7 @@ function onKey(e) {
 .thumb .x{position:absolute; top:-6px; right:-6px; width:20px; height:20px; padding:0; border:1px solid var(--rule); border-radius:50%;
   background:var(--ground); font-size:11px; line-height:1; color:var(--ink-soft)}
 .composer{border-top:1px solid var(--rule); padding:10px 0 0}
+.composer > .small:first-child{margin:0 0 8px}
 textarea{width:100%; resize:vertical; border:1px solid var(--outline); border-radius:8px; padding:8px 10px; font:inherit; background:var(--ground)}
 textarea:focus{outline:2px solid var(--accent); border-color:transparent}
 .row{display:flex; align-items:center; gap:8px; margin-top:8px}
