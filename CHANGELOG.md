@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.9 (unreleased)
+
+- Conversation: the text box stays usable while an instruction is running (here, in another tab, or in a terminal), so you can write notes or the next instruction ahead. Only Send waits until it has finished. What you wrote is kept when the run ends
+
 ## 0.1.8
 
 - Session details: when the top is folded, the repository and branch still show next to the title if the panel is wide enough
