@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.9 (unreleased)
+## 0.1.9
 
 - Conversation: the text box stays usable while an instruction is running (here, in another tab, or in a terminal), so you can write notes or the next instruction ahead. Only Send waits until it has finished. What you wrote is kept when the run ends
 
