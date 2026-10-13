@@ -44,6 +44,7 @@ const MESSAGES = {
     close: 'Close',
     resizePanel: 'Drag to change the width (double-click to reset)',
     sidebar: { create: 'Create', pages: 'Pages', menu: 'Main menu', insights: 'Time insights', moreInsights: 'More insights', hosts: 'Hosts', repos: 'Repositories', pinned: 'Pinned' },
+    search: { placeholder: 'Search sessions (repo, branch, words)', none: 'No sessions match', cwdGone: 'Folder removed', cwdGoneTitle: 'The worktree is gone; continuing runs in the main repository' },
     settings: {
       title: 'Settings',
       window: 'Update automatically between',
@@ -93,6 +94,7 @@ const MESSAGES = {
       resuming: 'Starting…',
       copy: 'Copy resume command',
       copied: 'Copied',
+      newSession: 'New session here',
       copyFailed: 'Could not copy: {e}',
       alreadyRunning: 'Already running in the background',
       started: 'Resumed in the background',
@@ -195,6 +197,10 @@ const MESSAGES = {
       imageMasked: 'Images are not shown in screenshot mode.',
     },
     repos: {
+      samePlace: 'Starts in the same folder:',
+      samePlaceBranch: 'branch',
+      placeGone: 'The folder of that session is gone, so it cannot start in the same place',
+      branchMoved: 'The session recorded branch {was}; {now} is checked out now. It starts on {now}',
       loading: 'Loading repositories from GitHub…',
       setup: 'Choose GitHub owners and folders in Settings (⚙) to list repositories here.',
       openSettings: 'Open settings',
@@ -351,6 +357,7 @@ const MESSAGES = {
     close: '閉じる',
     resizePanel: 'ドラッグで幅を変える（ダブルクリックで元の幅に戻す）',
     sidebar: { create: '作成', pages: '画面', menu: 'メインメニュー', insights: '時間の分析情報', moreInsights: 'その他の分析情報', hosts: 'ホスト', repos: 'リポジトリ', pinned: 'ピン留め' },
+    search: { placeholder: 'セッションを検索（リポジトリ・ブランチ・言葉）', none: '当てはまるセッションはありません', cwdGone: '作業場所なし', cwdGoneTitle: '作業場所（worktree）が消えています。続きはリポジトリの本体で動きます' },
     settings: {
       title: '設定',
       window: '自動で更新する時間帯',
@@ -400,6 +407,7 @@ const MESSAGES = {
       resuming: '起動しています…',
       copy: '再開のコマンドをコピー',
       copied: 'コピーしました',
+      newSession: '新しいセッションで始める',
       copyFailed: 'コピーできなかった: {e}',
       alreadyRunning: 'すでに裏で動いています',
       started: '裏で再開しました',
@@ -502,6 +510,10 @@ const MESSAGES = {
       imageMasked: 'スクショ用の表示では画像を出しません。',
     },
     repos: {
+      samePlace: '同じ作業場所で始めます:',
+      samePlaceBranch: 'ブランチ',
+      placeGone: '元のセッションの作業場所が見つからないので、同じ状態では始められません',
+      branchMoved: '記録ではブランチ {was} でしたが、いまは {now} が出ています。{now} のまま始めます',
       loading: 'GitHub からリポジトリを読んでいます…',
       setup: '設定（⚙）で GitHub の組織と探すフォルダを選ぶと、ここにリポジトリが並びます。',
       openSettings: '設定を開く',

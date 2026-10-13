@@ -38,6 +38,13 @@ Everything runs on your machine. The page is served on `127.0.0.1` only.
   cut from `origin/main` or another branch, or in a worktree that already exists), or clone a missing one. The ⋯ menu
   of each repository fetches from GitHub and removes finished worktrees and local branches. Uses your `gh` login.
 - **Pins** – pin the conversations you are working on; they stay at the top of the sidebar.
+- **Search** (the box in the header, or `/`) – find past sessions on this machine by repository, branch, worktree folder, or words from
+  the title, summary or your instructions (all words must match). Pick one to open its conversation; an instruction sent from there runs
+  where the session ran. Sessions whose worktree has been removed are marked, since continuing them runs in the main repository.
+- **New session here** (session details) – start a fresh session, without the earlier conversation, in the same folder (main repository
+  or worktree) on the branch checked out there, and open its conversation. The dialog shows the folder and branch and tells you if the
+  branch differs from the one the session recorded. It does not start if the folder is gone. It works for any folder a session ran in on
+  this machine, not only repositories of the GitHub owners in settings.
 - **Screenshots** – paste or drop images (PNG, JPEG, GIF, WebP; up to 5, 5 MB each) into an instruction.
 - **Other machines** – collect sessions from another machine over HTTPS (pinned certificate and token) with
   `share` / `remote add`.

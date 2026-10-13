@@ -1,6 +1,6 @@
 use crate::{
-    db, diff, finished, github, manage, opt, period, pins, pricing, remote, repo, resume, scan,
-    schedule, send, settings, stats, summarize, transcript, update,
+    db, diff, finished, github, manage, opt, period, pins, place, pricing, remote, repo, resume,
+    scan, schedule, search, send, settings, stats, summarize, transcript, update,
 };
 use anyhow::{Context, Result};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -290,6 +290,7 @@ pub async fn run(args: &[String]) -> Result<()> {
         .route("/session/{id}/finished", post(finished_handler))
         .route("/permission", post(permission_handler))
         .route("/session/{id}/asks", get(asks_handler))
+        .route("/session/{id}/place", get(place_handler))
         .route("/session/{id}/stop", post(stop_handler))
         .route("/session/{id}/changes", get(changes_handler))
         .route("/session/{id}/diff", get(diff_handler))
@@ -299,6 +300,7 @@ pub async fn run(args: &[String]) -> Result<()> {
         .route("/update/check", post(update_check_handler))
         .route("/update/install", post(update_install_handler))
         .route("/repo-sessions", get(repo_sessions_handler))
+        .route("/search", get(search_handler))
         .route(
             "/session/{id}/send",
             post(send_handler).layer(DefaultBodyLimit::max(SEND_BODY_LIMIT)),
@@ -1350,6 +1352,39 @@ async fn repo_sessions_handler(
     ))
 }
 
+#[derive(Deserialize)]
+struct SearchQuery {
+    q: String,
+}
+
+/// ヘッダーの検索。続きをしたい会話を、リポジトリ・ブランチ・文章から探す（新しい順に 50 件まで）
+async fn search_handler(
+    State(app): State<Shared>,
+    Query(q): Query<SearchQuery>,
+) -> ApiResult<Json<Value>> {
+    let conn = app.db.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(Json(
+        json!({ "sessions": search::sessions(&conn, &q.q, 50)? }),
+    ))
+}
+
+/// このマシンのセッションの作業場所。git は DB の口を放してから動かす。セッションが無ければ 404
+async fn session_place(app: &Shared, id: String) -> ApiResult<Option<place::Place>> {
+    let (cwd, repo) = {
+        let conn = app.db.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        place::dirs(&conn, &id).map_err(|e| ApiError(StatusCode::NOT_FOUND, e))?
+    };
+    Ok(tokio::task::spawn_blocking(move || place::find(&cwd, &repo)).await?)
+}
+
+/// 会話から「新しいセッションで始める」ときの作業場所といまのブランチ。消えていれば null
+async fn place_handler(
+    State(app): State<Shared>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    Ok(Json(json!({ "place": session_place(&app, id).await? })))
+}
+
 async fn pins_handler(State(app): State<Shared>) -> ApiResult<Json<Value>> {
     let conn = app.db.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(Json(json!({ "pins": pins::list(&conn)? })))
@@ -1639,6 +1674,10 @@ struct StartBody {
     /// すでにある作業場所（git worktree）で始めるときの、そのフォルダ。空なら使わない
     #[serde(default)]
     existing: String,
+    /// 会話から「新しいセッションで始める」ときの、元のセッション。そのセッションの作業場所で始める
+    /// （dir・worktree・existing は使わない）
+    #[serde(default)]
+    session: String,
 }
 
 /// 「ここで始める」で選べるモデルの候補。このマシンのこれまでの記録に出てきたモデル（最近使った順）と、
@@ -1883,23 +1922,35 @@ async fn start_handler(
     if !model.is_empty() && !send::valid_model(&model) {
         return Err(bad(format!("not a model name: {model}")));
     }
-    let set = {
-        let conn = app.db.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-        settings::load(&conn)?
-    };
-    let dir = b.dir.clone();
-    if !tokio::task::spawn_blocking(move || github::startable(&set, &dir)).await? {
-        return Err(bad(format!(
-            "{} is not a repository of the GitHub owners in settings",
-            b.dir
-        )));
-    }
     let checked =
         send::check_images(&b.images).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
+    // 元のセッションの作業場所で始めるなら、フォルダはこのマシンの記録から決める（記録にあるフォルダなので、設定の組織に限らない）
+    let place = if b.session.is_empty() {
+        let set = {
+            let conn = app.db.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+            settings::load(&conn)?
+        };
+        let dir = b.dir.clone();
+        if !tokio::task::spawn_blocking(move || github::startable(&set, &dir)).await? {
+            return Err(bad(format!(
+                "{} is not a repository of the GitHub owners in settings",
+                b.dir
+            )));
+        }
+        None
+    } else {
+        let Some(p) = session_place(&app, b.session.clone()).await? else {
+            return Err(bad("the folder of that session is gone".into()));
+        };
+        Some(p)
+    };
     // すでにある作業場所で始めるなら、そのリポジトリの作業場所として git が挙げるものだけを受ける
     // （画面から来たパスをそのまま使うと、どのフォルダでも始められてしまう）。
     // 作業場所を切るなら、先に作ってそこで始める。どこで始めたかを最初の 1 行で知らせる
-    let (cwd, first) = if !b.existing.is_empty() {
+    let (cwd, first) = if let Some(p) = place {
+        let line = json!({ "kind": "worktree", "path": p.path, "branch": p.branch });
+        (p.path, Some(format!("{line}\n")))
+    } else if !b.existing.is_empty() {
         let (dir, path) = (b.dir.clone(), b.existing.clone());
         let found = tokio::task::spawn_blocking(move || {
             schedule::worktrees(&dir)
@@ -2327,6 +2378,7 @@ mod tests {
             base: String::new(),
             model: String::new(),
             existing: String::new(),
+            session: String::new(),
         };
         let ours = root.join("agent-calendar").to_string_lossy().into_owned();
         let theirs = root.join("theirs").to_string_lossy().into_owned();
@@ -2477,6 +2529,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn place_of_a_session() {
+        let (app, root) = test_app("place-api");
+        let here = root.to_string_lossy().into_owned();
+        {
+            let conn = app.db.lock().unwrap();
+            seed(&conn, "gone", "/r/a", 6000, "題");
+            seed(&conn, "here", &here, 6000, "題");
+        }
+        let place = |id: &str| place_handler(State(app.clone()), Path(id.into()));
+        let Json(v) = place("here").await.unwrap();
+        assert_eq!(v["place"]["path"], here.as_str());
+        let Json(v) = place("gone").await.unwrap();
+        assert_eq!(v["place"], Value::Null);
+        assert_eq!(place("nope").await.unwrap_err().0, StatusCode::NOT_FOUND);
+        // 作業場所が消えたセッション・知らないセッションからは始めない
+        for (id, want) in [
+            ("gone", StatusCode::BAD_REQUEST),
+            ("nope", StatusCode::NOT_FOUND),
+        ] {
+            let b = StartBody {
+                dir: String::new(),
+                agent: "claude".into(),
+                mode: send::Mode::Read,
+                prompt: "見て".into(),
+                images: Vec::new(),
+                worktree: false,
+                branch: String::new(),
+                base: String::new(),
+                model: String::new(),
+                existing: String::new(),
+                session: id.into(),
+            };
+            let e = start_handler(State(app.clone()), local_headers(), Json(b))
+                .await
+                .unwrap_err();
+            assert_eq!(e.0, want, "{id}");
+        }
+    }
+
+    #[tokio::test]
     async fn pin_and_list() {
         let (app, _) = test_app("pin-api");
         seed(&app.db.lock().unwrap(), "s1", "/r/a", 6000, "題");
@@ -2509,6 +2601,18 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(v["sessions"][0]["id"], "s1");
+    }
+
+    #[tokio::test]
+    async fn search_sessions() {
+        let (app, _) = test_app("search-api");
+        seed(&app.db.lock().unwrap(), "s1", "/r/a", 6000, "題");
+        let search =
+            |q: &str| search_handler(State(app.clone()), Query(SearchQuery { q: q.into() }));
+        let Json(v) = search("/r/a").await.unwrap();
+        assert_eq!(v["sessions"][0]["id"], "s1");
+        let Json(v) = search("nothing").await.unwrap();
+        assert_eq!(v["sessions"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]

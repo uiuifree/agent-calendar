@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.10 (unreleased)
+
+- Search sessions from the box in the header (or press `/`): type a repository, a branch, a worktree folder or words from the title, summary or your instructions (all words must match). Pick one to open its conversation and continue it where it ran. Sessions whose worktree has been removed are marked, because continuing them runs in the main repository
+- Session details: New session here starts a fresh session (without the earlier conversation) in the same folder (main repository or worktree) on the branch checked out there, and opens its conversation. The dialog shows the folder and branch, and says so if the branch differs from the one the session recorded. It does not start if the folder is gone. It works for any folder a session ran in on this machine, not only repositories of the GitHub owners in settings
+
 ## 0.1.9
 
 - Conversation: the text box stays usable while an instruction is running (here, in another tab, or in a terminal), so you can write notes or the next instruction ahead. Only Send waits until it has finished. What you wrote is kept when the run ends

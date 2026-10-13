@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { getPins, getSchedules, getUpdate, getWeek, installUpdate, masked, rescan, setMasked } from './api.js'
+import { getPins, getSchedules, getUpdate, getWeek, installUpdate, masked, rescan, setMasked, waitForSession } from './api.js'
 import { addDays, startOfDay, weekStart } from './layout.js'
 import { lang, locale, setLang, t } from './i18n.js'
 import { CALENDAR_VIEWS, formatRoute, parseRoute } from './route.js'
@@ -18,6 +18,8 @@ import Sidebar from './components/Sidebar.vue'
 import PlansView from './components/PlansView.vue'
 import PlanForm from './components/PlanForm.vue'
 import ReposView from './components/ReposView.vue'
+import SearchBox from './components/SearchBox.vue'
+import StartDialog from './components/StartDialog.vue'
 
 const VIEWS = ['day', 'week', 'month', 'stats', 'plans', 'repos']
 // 日付で動く表示（前へ・次へと今日のボタンを出す）
@@ -238,6 +240,24 @@ function openSession(id, tab) {
   if (tab) detailTab.value = tab
 }
 
+// 会話から「新しいセッションで始める」。始まったら新しいセッションの会話を開き、
+// 終わるまではダイアログを隠したまま残す（終わりの失敗の理由を受け取るため）。
+// 隠れて動いているあいだに別のセッションから押しても開けるように、ダイアログは 1 つずつ持つ（見えているのは 1 つだけ）
+const starts = ref([]) // [{ key, id, repo, branch, hidden }]
+let startKey = 0
+function newStart(v) {
+  starts.value = [...starts.value.filter((x) => x.hidden), { ...v, key: ++startKey, hidden: false }]
+}
+function closeStart(key) {
+  starts.value = starts.value.filter((x) => x.key !== key)
+}
+async function startOpened(x, id) {
+  x.hidden = true
+  await waitForSession(id)
+  load()
+  openSession(id, 'conversation')
+}
+
 // ピン留めした会話（サイドバーの上）
 const pins = ref([])
 async function loadPins() {
@@ -346,11 +366,13 @@ function backToCalendar() {
 // キーボードのショートカット（Google カレンダーと同じ）。入力中・修飾キー付きでは反応しない
 const KEYS = { d: 'day', w: 'week', m: 'month', s: 'stats', a: 'plans', r: 'repos' }
 const SHORTCUT = Object.fromEntries(Object.entries(KEYS).map(([k, v]) => [v, k]))
+const search = ref(null)
 function onKey(e) {
   if (e.ctrlKey || e.metaKey || e.altKey || e.isComposing) return
   if (e.target.closest?.('input, select, textarea, [contenteditable]')) return
   const k = e.key.toLowerCase()
   if (KEYS[k]) view.value = KEYS[k]
+  else if (k === '/') search.value.focus()
   else if (k === 't') anchor.value = startOfDay(Date.now())
   else if (k === 'j' || k === 'n') step(1)
   else if (k === 'k' || k === 'p') step(-1)
@@ -378,6 +400,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
       <h1 class="range num">{{ range }}</h1>
       </template>
       <span class="spacer" />
+      <SearchBox ref="search" @open="(id) => openSession(id, 'conversation')" />
       <span v-if="error" class="chip warn">{{ error }}</span>
       <!-- 表示の単位（日・週・月）はカレンダーのときだけ。集計・予定・リポジトリへはサイドバーから -->
       <div v-if="CALENDAR_VIEWS.includes(view)" class="segmented" role="tablist">
@@ -552,11 +575,24 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
           @pinned="loadPins"
           @finished="load"
           @title="(title) => (tabTitles[x.id] = title)"
+          @new-session="newStart"
         />
       </section>
     </main>
     <SettingsDialog v-if="showSettings" @close="showSettings = false" @saved="load" @update="(v) => (updateInfo = v)" />
     <PlanForm v-if="creating !== undefined" :at="creating" @close="creating = undefined" @saved="planSaved" />
+    <StartDialog
+      v-for="x in starts"
+      v-show="!x.hidden"
+      :key="x.key"
+      :repo="x.repo"
+      :from-session="x.id"
+      :recorded-branch="x.branch"
+      @close="x.hidden || closeStart(x.key)"
+      @opened="(id) => startOpened(x, id)"
+      @failed="(text) => (error = t('repos.startFailed', { e: text }))"
+      @ran="x.hidden ? closeStart(x.key) : load()"
+    />
     <PlanForm v-if="editingPlan" :plan="editingPlan" @close="editingPlan = null" @saved="planSaved" />
   </div>
 </template>
