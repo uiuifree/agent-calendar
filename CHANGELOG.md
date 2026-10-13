@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.10 (unreleased)
+## 0.1.10
 
 - Search sessions from the box in the header (or press `/`): type a repository, a branch, a worktree folder or words from the title, summary or your instructions (all words must match). Pick one to open its conversation and continue it where it ran. Sessions whose worktree has been removed are marked, because continuing them runs in the main repository
 - Session details: New session here starts a fresh session (without the earlier conversation) in the same folder (main repository or worktree) on the branch checked out there, and opens its conversation. The dialog shows the folder and branch, and says so if the branch differs from the one the session recorded. It does not start if the folder is gone. It works for any folder a session ran in on this machine, not only repositories of the GitHub owners in settings
