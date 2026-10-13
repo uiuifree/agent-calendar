@@ -1,6 +1,6 @@
 <script setup>
 import { computed, ref, watch } from 'vue'
-import { cloneRepo, getRepoSessions, getRepos, getSession, rescan } from '../api.js'
+import { cloneRepo, getRepoSessions, getRepos, waitForSession } from '../api.js'
 import { locale, t } from '../i18n.js'
 import { DAY_MS } from '../layout.js'
 import { repoColor } from '../colors.js'
@@ -112,19 +112,10 @@ async function clone(r) {
   }
 }
 
-// できたセッションを開く。始まった直後や終わった直後は、まだ記録を読み直していないことがあるので、
-// 読み直してセッションが見えるまで少し待つ（記録が書き出されるまで最大 10 秒）
+// できたセッションを、記録が見えてから開く
 async function opened(id) {
   startHidden.value = true
-  for (let i = 0; i < 10; i++) {
-    try {
-      await rescan()
-      await getSession(id)
-      break
-    } catch {
-      await new Promise((ok) => setTimeout(ok, 1000))
-    }
-  }
+  await waitForSession(id)
   emit('changed')
   emit('open-session', id, 'conversation')
 }

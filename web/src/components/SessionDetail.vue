@@ -18,7 +18,7 @@ const props = defineProps({
   active: { type: Boolean, default: true }, // 表示中のタブ（ほかのタブを見ているあいだは隠れているだけ）
   version: { type: Number, default: 0 }, // App が読み直すたびに増える（集計の画面で完了にしたときなど）
 })
-const emit = defineEmits(['close', 'full', 'pinned', 'finished', 'title', 'update:tab', 'update:compact'])
+const emit = defineEmits(['close', 'full', 'pinned', 'finished', 'title', 'update:tab', 'update:compact', 'new-session'])
 
 // 概要・会話・変更のタブ（URL に持つので App が覚える。パネルの幅も App がタブで決める）
 const tab = computed({ get: () => props.tab, set: (v) => emit('update:tab', v) })
@@ -265,10 +265,14 @@ watch(
 
       <template v-if="!compact">
       <div class="actions">
-        <button v-if="isClaude" class="btn primary" :disabled="resuming || running === 'interactive'" @click="doResume">
+        <button v-if="isClaude" class="btn small primary" :disabled="resuming || running === 'interactive'" @click="doResume">
           {{ resuming ? t('detail.resuming') : running === 'background' ? t('detail.resumeOpen') : t('detail.resume') }}
         </button>
-        <button class="btn" @click="copy">{{ copied ? t('detail.copied') : t('detail.copy') }}</button>
+        <button class="btn small" @click="copy">{{ copied ? t('detail.copied') : t('detail.copy') }}</button>
+        <!-- 同じリポジトリ・同じ作業場所で、前の会話を持ち越さない新しいセッションを始める -->
+        <button v-if="!s.machine" class="btn small" @click="emit('new-session', { id: s.id, repo: { name: repoName, local: s.repo }, branch: s.branch })">
+          {{ t('detail.newSession') }}
+        </button>
       </div>
       <!-- 端末で開いているセッションは裏で重ねて開かない（同じ記録に 2 か所から書く）。端末の /remote-control なら続けられる -->
       <p v-if="isClaude && running === 'interactive' && !resume" class="muted small">{{ t('detail.openInTerminal') }}</p>
@@ -426,7 +430,7 @@ watch(
 h2{font-size:22px; font-weight:400; line-height:1.35; margin:0; color:var(--ink)}
 .when{font-size:14px; color:var(--ink-soft); margin-top:2px}
 .meta{display:flex; flex-wrap:wrap; align-items:center; gap:6px; font-size:13px; margin-top:6px}
-.actions{display:flex; gap:8px; margin:16px 0 0 36px; flex-wrap:wrap}
+.actions{display:flex; gap:6px; margin:12px 0 0 36px; flex-wrap:wrap}
 .resume{display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:8px 0 0 36px; font-size:13px}
 .resume a{color:var(--accent)}
 .small{font-size:12px}

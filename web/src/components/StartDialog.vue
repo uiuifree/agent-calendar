@@ -1,6 +1,6 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { getBranches, getModels, startSession } from '../api.js'
+import { getBranches, getModels, getPlace, startSession } from '../api.js'
 import { useEscape } from '../dialog.js'
 import { locale, t } from '../i18n.js'
 import { MAX_IMAGES, pickImages, toPayload } from '../images.js'
@@ -12,6 +12,10 @@ import PermissionAsk from './PermissionAsk.vue'
 // カレンダーでセッションを押したときと同じく右のパネルに会話を開く。実行は裏で続き、会話の画面で進み具合と許可の確認を見る
 const props = defineProps({
   repo: { type: Object, required: true }, // { name, local, … }
+  // 会話から「新しいセッションで始める」ときの元のセッション。作業場所とブランチは選ばせず、そのセッションと同じところで始める
+  // （どこで始めるかはサーバーが記録から決める）
+  fromSession: { type: String, default: '' },
+  recordedBranch: { type: String, default: '' }, // そのセッションの記録にあるブランチ（いまのブランチと違えば知らせる）
 })
 const emit = defineEmits(['close', 'opened', 'ran', 'failed'])
 useEscape(() => emit('close'))
@@ -59,9 +63,23 @@ watch(worktree, async (on) => {
     branches.value = { default: null, branches: [], worktrees: [] }
   }
 })
+// 同じ作業場所で始めるときの、その場所といまのブランチ。undefined は読み込み中、null は消えている
+const place = ref(undefined)
+onMounted(async () => {
+  if (!props.fromSession) return
+  try {
+    place.value = (await getPlace(props.fromSession)).place
+  } catch (e) {
+    place.value = null
+    placeError.value = String(e.message ?? e)
+  }
+})
+const placeError = ref('')
 const workspace = ref(null) // { path, branch }
 const finished = ref(false)
-const canRun = computed(() => !running.value && !finished.value && prompt.value.trim().length > 0)
+const canRun = computed(
+  () => !running.value && !finished.value && prompt.value.trim().length > 0 && (!props.fromSession || !!place.value),
+)
 
 // 画像（会話の入力欄と同じく、貼り付けとドロップで足す）
 const attachments = ref([])
@@ -95,11 +113,12 @@ async function run() {
       mode: mode.value,
       prompt: prompt.value.trim(),
       images,
-      worktree: worktree.value,
+      worktree: !props.fromSession && worktree.value,
       branch: branch.value.trim(),
       // 既定のブランチも名前で渡す（空のままだと、手元に origin/HEAD の記録が無い clone では HEAD から切られる）
       base: base.value || defaultEntry.value,
-      existing: worktree.value ? existing.value : '',
+      existing: !props.fromSession && worktree.value ? existing.value : '',
+      session: props.fromSession,
       model: model.value.trim(),
     }
     await startSession(input, (ev) => {
@@ -134,7 +153,7 @@ function onKey(e) {
   <div class="backdrop" @click.self="emit('close')">
     <div class="dialog" role="dialog" aria-modal="true" :aria-label="t('repos.startTitle', { name: repo.name })" :lang="locale()" @dragover.prevent @drop.prevent="addImages($event.dataTransfer?.files ?? [])">
       <h2>{{ t('repos.startTitle', { name: repo.name }) }}</h2>
-      <p class="muted small"><code>{{ repo.local }}</code></p>
+      <p v-if="!fromSession" class="muted small"><code>{{ repo.local }}</code></p>
       <div class="row">
         <select v-model="agent" :disabled="running || finished" :aria-label="t('plans.form.agent')">
           <option value="claude">{{ t('source.claude') }}</option>
@@ -150,6 +169,18 @@ function onKey(e) {
           <option v-for="m in models[agent]?.models ?? []" :key="m" :value="m">{{ m }}</option>
         </select>
       </div>
+      <template v-if="fromSession">
+        <p v-if="place === undefined" class="muted small">{{ t('detail.loading') }}</p>
+        <p v-else-if="place" class="place">
+          {{ t('repos.samePlace') }} <code>{{ place.path }}</code>
+          <span>{{ t('repos.samePlaceBranch') }} <code>{{ place.branch || t('repos.detached') }}</code></span>
+        </p>
+        <p v-else class="chip warn">{{ placeError || t('repos.placeGone') }}</p>
+        <p v-if="place && recordedBranch && place.branch !== recordedBranch" class="muted small">
+          {{ t('repos.branchMoved', { was: recordedBranch, now: place.branch || t('repos.detached') }) }}
+        </p>
+      </template>
+      <template v-else>
       <label class="check">
         <input v-model="worktree" type="checkbox" :disabled="running || finished" />
         {{ t('repos.worktree') }}
@@ -178,6 +209,7 @@ function onKey(e) {
         :aria-label="t('repos.branch')"
         :disabled="running || finished"
       />
+      </template>
       <textarea v-model="prompt" rows="4" :placeholder="t('plans.form.prompt')" :disabled="running || finished" @keydown="onKey" @paste="onPaste" />
       <div v-if="attachments.length" class="thumbs">
         <span v-for="(a, i) in attachments" :key="a.url" class="thumb">
@@ -220,6 +252,8 @@ h2{font-size:22px; font-weight:400; margin:0 0 4px}
 .base{display:flex; align-items:center; gap:8px; font-size:13px; margin:0 0 8px}
 .base select{flex:1; min-width:0}
 .branch{width:100%; height:36px; border:1px solid var(--outline); border-radius:8px; padding:0 10px; font:inherit; font-family:"Roboto Mono","Noto Sans Mono CJK JP",monospace; font-size:13px; margin-bottom:8px}
+.place{display:flex; flex-wrap:wrap; align-items:center; gap:4px 8px; font-size:13px; margin:0 0 8px}
+.place code{font-size:12px; word-break:break-all}
 .ws{margin:12px 0 0; font-size:13px; color:var(--accent)}
 .ws code{font-size:12px; color:var(--ink-soft)}
 select{height:36px; border:1px solid var(--outline); border-radius:8px; padding:0 8px; background:var(--ground)}

@@ -110,6 +110,8 @@ export const sendInstruction = (id, prompt, mode, onEvent, images = []) =>
 export const getRepos = (refresh = false) => j(`/api/repos${refresh ? '?refresh=true' : ''}`)
 // そのリポジトリのセッション（このマシンのもの、新しい順）
 export const getRepoSessions = (repo) => j(`/api/repo-sessions?repo=${encodeURIComponent(unmask(repo))}`)
+// ヘッダーの検索: 空白で区切った語をすべて含むセッション（このマシンのもの、新しい順）
+export const searchSessions = (q) => j(`/api/search?q=${encodeURIComponent(q)}`)
 export const cloneRepo = (owner, name, root) => post('/api/repos/clone', { owner, name, root })
 // リポジトリで新しいセッションを始める。最初に { kind: 'session', id } が届く
 // リポジトリのメニュー: 片付けられる作業場所（git worktree）と手元のブランチ、その操作
@@ -125,7 +127,22 @@ export const getBranches = async (dir) => {
   const r = await j(`/api/repos/branches?dir=${encodeURIComponent(unmask(dir))}`)
   return { ...r, branches: [...new Set(r.branches)] }
 }
+// 会話から「新しいセッションで始める」ときの作業場所といまのブランチ（{ place: { path, branch, main } | null }）
+export const getPlace = (id) => j(`/api/session/${encodeURIComponent(id)}/place`)
 export const startSession = (input, onEvent) => streamPost('/api/repos/start', input, onEvent)
+// 始めたセッションが見えるまで待つ。始まった直後や終わった直後は、まだ記録を読み直していないことがあるので、
+// 読み直してセッションが見えるまで少し待つ（記録が書き出されるまで最大 10 秒）
+export async function waitForSession(id) {
+  for (let i = 0; i < 10; i++) {
+    try {
+      await rescan()
+      await getSession(id)
+      return
+    } catch {
+      await new Promise((ok) => setTimeout(ok, 1000))
+    }
+  }
+}
 
 // 予定
 export const getSchedules = () => j('/api/schedules')
