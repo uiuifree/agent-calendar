@@ -9,6 +9,9 @@ use std::process::{Command, Stdio};
 pub const DEFAULT_MODEL: &str = "sonnet";
 /// 動いている最中のセッションは要約しない（どうせ記録が増えて作り直しになる）
 const IDLE_MS: i64 = 30 * 60 * 1000;
+/// 題の無いセッション（Claude Code が題を付けていない・Codex）は、ここまで進んだら止まるのを待たずに要約して題を付ける。
+/// 止まったあとで、記録が増えた分を含めて作り直す
+const EARLY_TITLE_MS: i64 = 10 * 60 * 1000;
 /// 1 ブロックあたり・全体の上限。超えた分は冒頭と末尾を残して間を落とす
 const BLOCK_CHARS: usize = 800;
 const TOTAL_CHARS: usize = 80_000;
@@ -106,13 +109,19 @@ fn run_with(
 ) -> Result<usize> {
     let now = chrono::Utc::now().timestamp_millis();
     let exclude = serde_json::to_string(&crate::settings::load(conn)?.summary_exclude)?;
+    // 元の記録が消えて読めなかった失敗（0.1.12 まで）は、DB に残した文章から作れるようになったのでやり直す
+    conn.execute(
+        "DELETE FROM summary_failures WHERE error LIKE 'cannot read %No such file%'",
+        [],
+    )?;
     // 同じ記録のまま失敗したものは、失敗した回数 × 1 時間あけて、MAX_ATTEMPTS 回まで（いつも失敗するものが
     // 枠を埋めて、ほかのセッションの要約が進まなくならないように）
     let mut stmt = conn.prepare(
         "SELECT s.id, s.file, s.last_uuid, s.source FROM sessions s
          LEFT JOIN summaries m ON m.session_id = s.id
          LEFT JOIN summary_failures f ON f.session_id = s.id AND f.last_uuid = s.last_uuid
-         WHERE s.last_ts < ?1 AND (m.session_id IS NULL OR m.last_uuid != s.last_uuid)
+         WHERE (s.last_ts < ?1 OR (m.session_id IS NULL AND s.title = '' AND ?5 - s.first_ts >= ?7))
+           AND (m.session_id IS NULL OR m.last_uuid != s.last_uuid)
            AND s.repo NOT IN (SELECT value FROM json_each(?3))
            AND (f.session_id IS NULL OR (f.attempts < ?4 AND f.failed_at < ?5 - f.attempts * ?6))
          ORDER BY s.last_ts DESC LIMIT ?2",
@@ -125,7 +134,8 @@ fn run_with(
                 exclude,
                 MAX_ATTEMPTS,
                 now,
-                RETRY_MS
+                RETRY_MS,
+                EARLY_TITLE_MS
             ],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?
@@ -285,8 +295,14 @@ fn make(
     let Some(_busy) = claim(id) else {
         return Err(NotNow.into());
     };
-    let text = std::fs::read_to_string(file).with_context(|| format!("cannot read {file}"))?;
-    let (s, cost) = call_claude(claude, &digest(source, &text), model, lang)?;
+    let input = match std::fs::read_to_string(file) {
+        Ok(text) => digest(source, &text),
+        // 元の記録が消えた（Claude Code が古い記録を消した）ものは、DB に残した依頼と返答の文章から作る。
+        // 権限などで読めないだけのときは失敗にする（直れば元の記録から作り直せるように）
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => stored_digest(conn, id)?,
+        Err(e) => return Err(anyhow::Error::from(e).context(format!("cannot read {file}"))),
+    };
+    let (s, cost) = call_claude(claude, &input, model, lang)?;
     conn.execute(
         "INSERT OR REPLACE INTO summaries (session_id, last_uuid, model, body, created_at, cost_usd)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -309,6 +325,32 @@ pub fn digest(source: &str, text: &str) -> String {
         .map(|(user, t)| format!("[{}] {}", if *user { "user" } else { "agent" }, clip(t)))
         .collect();
     squeeze(&lines.join("\n\n"))
+}
+
+/// 元の記録が消えたセッションの要約に渡す本文: DB に残した依頼（順番どおり）と、検索用に残した返答の文章。
+/// 返答はいつのものか分からないので、依頼のあとにまとめて並べる
+fn stored_digest(conn: &Connection, id: &str) -> Result<String> {
+    let mut stmt = conn.prepare("SELECT text FROM prompts WHERE session_id = ?1 ORDER BY seq")?;
+    let prompts: Vec<String> = stmt
+        .query_map([id], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if prompts.is_empty() {
+        bail!("the transcript file is gone and no instructions are kept");
+    }
+    // 検索用の表には依頼を先に、返答をそのあとに入れている（scan の store・版 6 の移行）。
+    // 文で比べると依頼と同じ文の返答まで落ちるので、入れた順で依頼の数だけ飛ばす
+    let mut stmt = conn.prepare(
+        "SELECT text FROM texts WHERE session_id = ?1 ORDER BY rowid LIMIT -1 OFFSET ?2",
+    )?;
+    let replies: Vec<String> = stmt
+        .query_map(params![id, prompts.len() as i64], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let lines: Vec<String> = prompts
+        .iter()
+        .map(|t| format!("[user] {}", clip(t)))
+        .chain(replies.iter().map(|t| format!("[agent] {}", clip(t))))
+        .collect();
+    Ok(squeeze(&lines.join("\n\n")))
 }
 
 /// (人の依頼か, 本文)
@@ -460,6 +502,12 @@ mod tests {
         let conn = crate::db::open_at(&dir.join("t.db")).unwrap();
         seed(&conn, &dir, "old", 0);
         seed(&conn, &dir, "live", chrono::Utc::now().timestamp_millis());
+        // 始まったばかり（題を早めに付ける対象にもならない）
+        conn.execute(
+            "UPDATE sessions SET first_ts = last_ts WHERE id = 'live'",
+            [],
+        )
+        .unwrap();
         let ok = fake_claude(
             &dir,
             r#"{"result":"{\"title\":\"t\",\"bullets\":[],\"status\":\"完了\"}","total_cost_usd":0.03}"#,
@@ -550,15 +598,13 @@ mod tests {
             0
         );
         forget();
-        conn.execute("UPDATE sessions SET file = '/nonexistent.jsonl'", [])
-            .unwrap();
         assert_eq!(
             run_with(&conn, 10, "sonnet", Lang::En, &fake_claude(&dir, "{}", 0)).unwrap(),
             0
         );
         // 失敗は覚えて、詳細と裏の処理の状態に出す
         let f = failure(&conn, "a").unwrap().unwrap();
-        assert!(f["error"].as_str().unwrap().contains("cannot read"));
+        assert!(!f["error"].as_str().unwrap().is_empty());
         assert_eq!(f["attempts"], 1);
         let st = crate::status::all(&conn).unwrap();
         assert!(
@@ -578,8 +624,9 @@ mod tests {
         conn.execute("UPDATE summary_failures SET failed_at = 0", [])
             .unwrap();
         // 間が空いたら、もう一度試して回数を数える。MAX_ATTEMPTS 回でやめる
+        let bad = fake_claude(&dir, "{}", 0);
         for n in 2..=MAX_ATTEMPTS {
-            assert_eq!(run_with(&conn, 10, "sonnet", Lang::En, &ok).unwrap(), 0);
+            assert_eq!(run_with(&conn, 10, "sonnet", Lang::En, &bad).unwrap(), 0);
             assert_eq!(failure(&conn, "a").unwrap().unwrap()["attempts"], n);
             conn.execute("UPDATE summary_failures SET failed_at = 0", [])
                 .unwrap();
@@ -590,12 +637,8 @@ mod tests {
             MAX_ATTEMPTS
         );
         // 記録が増えたら古い失敗は数えず、もう一度試す。うまくいけば失敗は消える
-        let file = dir.join("a.jsonl");
-        conn.execute(
-            "UPDATE sessions SET last_uuid = 'u2', file = ?1 WHERE id = 'a'",
-            [file.to_string_lossy()],
-        )
-        .unwrap();
+        conn.execute("UPDATE sessions SET last_uuid = 'u2' WHERE id = 'a'", [])
+            .unwrap();
         assert!(failure(&conn, "a").unwrap().is_none());
         assert_eq!(run_with(&conn, 10, "sonnet", Lang::En, &ok).unwrap(), 1);
         let left: i64 = conn
@@ -628,6 +671,89 @@ mod tests {
         let e = one_with(&conn, "a", "sonnet", Lang::En, &ok).unwrap_err();
         assert!(e.to_string().contains("skip summaries"));
         assert!(excluded(&conn, "a").unwrap() && !excluded(&conn, "nope").unwrap());
+    }
+
+    #[test]
+    fn summarizes_removed_transcripts_from_what_is_kept() {
+        let dir = crate::db::temp_dir("summarize-gone");
+        let conn = crate::db::open_at(&dir.join("t.db")).unwrap();
+        seed(&conn, &dir, "gone", 0);
+        conn.execute("UPDATE sessions SET file = '/nonexistent.jsonl'", [])
+            .unwrap();
+        conn.execute_batch(
+            "INSERT INTO prompts VALUES ('gone', 0, 0, '請求書を直して');
+             INSERT INTO texts (session_id, text) VALUES ('gone', '請求書を直して'), ('gone', '直しました'), ('gone', '請求書を直して');",
+        )
+        .unwrap();
+        assert_eq!(
+            stored_digest(&conn, "gone").unwrap(),
+            // 依頼と同じ文の返答も落とさない
+            "[user] 請求書を直して\n\n[agent] 直しました\n\n[agent] 請求書を直して"
+        );
+        let ok = fake_claude(
+            &dir,
+            r#"{"result":"{\"title\":\"請求書\",\"bullets\":[],\"status\":\"done\"}"}"#,
+            0,
+        );
+        assert_eq!(run_with(&conn, 10, "sonnet", Lang::En, &ok).unwrap(), 1);
+        // 依頼も残っていなければ作れない（失敗として残る）
+        conn.execute_batch("DELETE FROM prompts; UPDATE sessions SET last_uuid = 'u2'")
+            .unwrap();
+        assert!(stored_digest(&conn, "gone").is_err());
+        assert_eq!(run_with(&conn, 10, "sonnet", Lang::En, &ok).unwrap(), 0);
+        assert!(
+            failure(&conn, "gone").unwrap().unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .contains("no instructions")
+        );
+        // 0.1.12 までの「読めなかった」失敗は消して、やり直す
+        conn.execute(
+            "UPDATE summary_failures SET error = 'cannot read /x.jsonl: No such file or directory (os error 2)', attempts = 3",
+            [],
+        )
+        .unwrap();
+        run_with(&conn, 10, "sonnet", Lang::En, &ok).unwrap();
+        assert_eq!(failure(&conn, "gone").unwrap().unwrap()["attempts"], 1);
+        // ファイルがあっても読めない（フォルダを指している）ときは、残した文章では作らず失敗にする
+        conn.execute("UPDATE sessions SET file = ?1", [dir.to_string_lossy()])
+            .unwrap();
+        let e = one_with(&conn, "gone", "sonnet", Lang::En, &ok).unwrap_err();
+        assert!(format!("{e:#}").starts_with("cannot read"));
+    }
+
+    #[test]
+    fn titles_untitled_sessions_before_they_stop() {
+        let dir = crate::db::temp_dir("summarize-early");
+        let conn = crate::db::open_at(&dir.join("t.db")).unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        seed(&conn, &dir, "early", now);
+        let ok = fake_claude(
+            &dir,
+            r#"{"result":"{\"title\":\"題\",\"bullets\":[],\"status\":\"wip\"}"}"#,
+            0,
+        );
+        // 始まったばかりなら待つ（最後の記録の時刻ではなく、始まってからの時間で見る）
+        conn.execute(
+            "UPDATE sessions SET first_ts = ?1, last_ts = ?1",
+            [now - 60_000],
+        )
+        .unwrap();
+        assert_eq!(run_with(&conn, 10, "sonnet", Lang::En, &ok).unwrap(), 0);
+        // Claude Code が題を付けていれば待つ
+        // 9 分で記録が止まっていても、始まって 10 分たてば対象（ここでは題があるので待つ）
+        conn.execute(
+            "UPDATE sessions SET first_ts = ?1, last_ts = ?2, title = 'AI の題'",
+            [now - EARLY_TITLE_MS, now - EARLY_TITLE_MS + 9 * 60_000],
+        )
+        .unwrap();
+        assert_eq!(run_with(&conn, 10, "sonnet", Lang::En, &ok).unwrap(), 0);
+        // 題が無く 10 分進んだら、動いていても作る。一度作れば、止まるまでは作り直さない
+        conn.execute("UPDATE sessions SET title = ''", []).unwrap();
+        assert_eq!(run_with(&conn, 10, "sonnet", Lang::En, &ok).unwrap(), 1);
+        conn.execute("UPDATE sessions SET last_uuid = 'u2'", [])
+            .unwrap();
+        assert_eq!(run_with(&conn, 10, "sonnet", Lang::En, &ok).unwrap(), 0);
     }
 
     #[test]
