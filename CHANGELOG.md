@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.13
+
+- Summaries: sessions whose transcript Claude Code has already removed are summarized in the background from the instructions and replies kept in the index, instead of failing again and again
+- Titles: sessions without a title (Codex, or before Claude Code names them) get one from an early summary once they have run for 10 minutes, without waiting for them to stop. Tabs fall back to the first instruction instead of "(untitled)", and update when a summary or title arrives later
+
 ## 0.1.12
 
 - 0.1.11 was built without its version number raised, so it called itself 0.1.10 and kept offering the update to 0.1.11. 0.1.12 is the same release with the right number; update to it to clear the notice

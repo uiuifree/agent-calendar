@@ -172,7 +172,9 @@ change the hours and intervals from the settings in the page. The summary langua
 - **Summaries** are written by `claude -p --no-session-persistence` using your own Claude Code login, so they
   use your Claude plan. Only your prompts and the agent's text replies are sent (no tool input or output).
   Turn them off with `--no-summarize`, or for some repositories only in Settings. A session that fails to summarize
-  is tried again later, up to 3 times while it does not change, and the reason shows in its details.
+  is tried again later, up to 3 times while it does not change, and the reason shows in its details. Sessions whose
+  transcript is already removed are summarized from the text kept in the index, and sessions without a title get an
+  early summary after 10 minutes.
 - **Cost** is an estimate at Anthropic API list prices (see `src/pricing.rs`, prices as of 2026-09-25), not your
   subscription bill. It includes advisor calls and subagents. Models without a known price are shown as `+`.
 - **Active time** merges 10-minute buckets across sessions; a pause of up to 30 minutes counts as continuous.

@@ -40,17 +40,18 @@ watch(
   () => props.active,
   (on) => on && load(props.id),
 )
-// App が読み直したら、表示中のものの完了の印・要約・最後の記録の時刻・端末での実行中の印を取り直す
+// App が読み直したら、完了の印・要約・題・依頼・最後の記録の時刻・端末での実行中の印を取り直す
 // （集計の画面で付け外ししたかもしれない。端末で進めているセッションは、last_ts が変わると会話が読み直す）。
+// 表示していないタブも取り直す（あとから要約や題が付いたら、上のタブの見出しを変えるため）。
 // sending は差し替えない。全部を差し替えると、ここから送った指示の実行中に「別の所で実行中」として扱ってしまう
 watch(
   () => props.version,
   async () => {
     const id = props.id
-    if (!props.active || !s.value) return
+    if (!s.value) return
     try {
       const r = await getSession(id)
-      if (id === props.id && s.value) Object.assign(s.value, { finished: r.finished, summary: r.summary, summary_failure: r.summary_failure, last_ts: r.last_ts, running: r.running })
+      if (id === props.id && s.value) Object.assign(s.value, { finished: r.finished, summary: r.summary, summary_failure: r.summary_failure, last_ts: r.last_ts, running: r.running, title: r.title, prompts: r.prompts, prompt_count: r.prompt_count })
     } catch {
       // 取り直せなくても前の表示のままでよい
     }
@@ -58,8 +59,11 @@ watch(
 )
 
 // 題。読み込めたら App にも知らせる（パネルの上のタブの見出しに出す）
-const title = computed(() => s.value?.summary?.title || s.value?.title || '')
-watch(s, (v) => v && emit('title', title.value))
+// 題は一覧（サーバーの pins::title）と同じ順: 要約の題 → Claude Code が付けた題 → 最初の依頼の書き出し
+// 40 字は文字単位で数える（サーバーの chars().take(40) と同じ。絵文字で割れないように）
+const title = computed(() => s.value?.summary?.title || s.value?.title || [...(s.value?.prompts?.[0]?.text ?? '')].slice(0, 40).join(''))
+// あとから要約や題が付いたとき（読み直しで差し替える）もタブの見出しを変える
+watch([s, title], ([v]) => v && emit('title', title.value))
 
 const repo = computed(() => (s.value && props.repos[s.value.repo]) ?? null)
 const repoName = computed(() => repo.value?.name ?? s.value?.repo.split('/').pop())
