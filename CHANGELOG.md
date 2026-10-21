@@ -1,7 +1,8 @@
 # Changelog
 
-## 0.1.11 (unreleased)
+## 0.1.12
 
+- 0.1.11 was built without its version number raised, so it called itself 0.1.10 and kept offering the update to 0.1.11. 0.1.12 is the same release with the right number; update to it to clear the notice
 - Usage limits: a new page shows each agent's 5-hour, weekly and per-model limits and when they reset, from local records only. Codex comes from its transcripts; Claude Code and Antigravity (Gemini) from what their status line receives, once you set `agent-calendar statusline --agent claude|gemini` as the status line command; Antigravity and Muse also from the times they hit a limit. Each value shows when it was recorded. `agent-calendar limits` prints the same
 - Running now: the header shows how many instructions, new sessions and schedules started from the page are running and how many wait for your approval (also in the tab title), and lists sessions that ended with the agent's reply and are waiting for your next instruction. Running sessions are marked on the calendar, in tabs and in pins
 - Background jobs: Settings shows when rescans, summaries and collecting from other machines last worked and why they failed; a mark in the header tells you when something failed. A transcript that cannot be read no longer stops the rest of the rescan, and one file that cannot be fetched no longer stops collecting the rest from that machine
