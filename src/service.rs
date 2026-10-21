@@ -16,6 +16,17 @@ pub fn install(args: &[String]) -> Result<()> {
             "`service install` is Linux only; run `agent-calendar serve` from your login items instead"
         );
     }
+    // サービスの中で動いているエージェント（画面から送った指示・予定）は、起こし直すと止まる。
+    // 本体のほかにプロセスがあれば、--force が無い限り入れ直さない
+    if !args.iter().any(|a| a == "--force") {
+        let others = other_processes(unit);
+        if others > 0 {
+            bail!(
+                "{unit} has {others} other processes running (agents started from the page or schedules); \
+                 restarting would stop them. Run again when they have finished, or add --force"
+            );
+        }
+    }
     let exe = std::env::current_exe().context("cannot find this executable")?;
     let path = std::env::var("PATH").unwrap_or_default();
     let cmd = if share {
@@ -55,6 +66,35 @@ pub fn install(args: &[String]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// サービスの cgroup の中の、本体以外のプロセスの数。サービスが無い・動いていなければ 0
+fn other_processes(unit: &str) -> usize {
+    let Ok(out) = Command::new("systemctl")
+        .args(["--user", "show", unit, "-p", "ControlGroup", "--value"])
+        .output()
+    else {
+        return 0;
+    };
+    let group = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    count_others(&group, std::path::Path::new("/sys/fs/cgroup"))
+}
+
+fn count_others(group: &str, root: &std::path::Path) -> usize {
+    if group.is_empty() {
+        return 0;
+    }
+    let procs = root
+        .join(group.trim_start_matches('/'))
+        .join("cgroup.procs");
+    std::fs::read_to_string(procs)
+        .map(|t| {
+            t.lines()
+                .filter(|l| !l.trim().is_empty())
+                .count()
+                .saturating_sub(1)
+        })
+        .unwrap_or(0)
 }
 
 fn share_args(args: &[String]) -> Vec<String> {
@@ -108,6 +148,20 @@ fn unit_text(exe: &str, args: &[String], path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counts_processes_besides_the_server() {
+        let root = crate::db::temp_dir("service-cgroup");
+        let g = root.join("user.slice/app.slice/agent-calendar.service");
+        std::fs::create_dir_all(&g).unwrap();
+        std::fs::write(g.join("cgroup.procs"), "100\n").unwrap();
+        let group = "/user.slice/app.slice/agent-calendar.service";
+        assert_eq!(count_others(group, &root), 0);
+        std::fs::write(g.join("cgroup.procs"), "100\n200\n201\n").unwrap();
+        assert_eq!(count_others(group, &root), 2);
+        assert_eq!(count_others("", &root), 0);
+        assert_eq!(count_others("/nope", &root), 0);
+    }
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()

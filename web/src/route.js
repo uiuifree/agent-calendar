@@ -1,5 +1,5 @@
 // URL と表示の状態の対応。カレンダー（日・週・月）は URL を変えず "/"、ほかの画面とセッションだけを URL に持つ。
-// 戻る・進む・ブックマーク・共有で、集計・予定・リポジトリの画面と、開いているセッションに戻れるように
+// 戻る・進む・ブックマーク・共有で、集計・予定・リポジトリ・利用枠の画面と、開いているセッションに戻れるように
 export const CALENDAR_VIEWS = ['day', 'week', 'month']
 
 const TABS = ['summary', 'conversation', 'changes']
@@ -10,7 +10,7 @@ export function parseRoute(pathname, search = '') {
   const [v, arg] = pathname.split('/').filter(Boolean).map(decodeURIComponent)
   const params = new URLSearchParams(search)
   const session = params.get('session') || null
-  const view = { stats: 'stats', schedules: 'plans', repos: 'repos' }[v] ?? 'calendar'
+  const view = { stats: 'stats', schedules: 'plans', repos: 'repos', limits: 'limits' }[v] ?? 'calendar'
   const tab = TABS.includes(params.get('tab')) ? params.get('tab') : 'summary'
   return {
     view,
@@ -25,7 +25,7 @@ export function parseRoute(pathname, search = '') {
 export function formatRoute({ view, owner, session, tab = 'summary', full = false }) {
   const path = CALENDAR_VIEWS.includes(view)
     ? '/'
-    : { stats: '/stats', plans: '/schedules', repos: owner ? `/repos/${encodeURIComponent(owner)}` : '/repos' }[view]
+    : { stats: '/stats', plans: '/schedules', limits: '/limits', repos: owner ? `/repos/${encodeURIComponent(owner)}` : '/repos' }[view]
   if (!session) return path
   const q = [`session=${encodeURIComponent(session)}`]
   if (tab !== 'summary') q.push(`tab=${tab}`)

@@ -87,13 +87,9 @@ export function assignLanes(pieces) {
   return pieces
 }
 
-// 発言量 → 濃さ（0.15〜0.9）。件数の差が大きいので対数で寄せる
-export function density(n, max) {
-  if (max <= 0) return 0.15
-  return 0.15 + 0.75 * Math.min(1, Math.log1p(n) / Math.log1p(max))
-}
-
 export function fmtTokens(n) {
+  // 集計の期間が長いと 10 億を超える（キャッシュの読み取り）
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`
   if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`
   if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`
   return String(n)

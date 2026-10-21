@@ -8,7 +8,7 @@ use serde_json::Value;
 /// ツールの入力・結果はここまでで切る（巨大なファイルの中身などで画面が重くならないように）
 const TOOL_CHARS: usize = 4000;
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Item {
     /// user / assistant / tool_use / tool_result
     pub kind: &'static str,
@@ -43,20 +43,42 @@ pub fn read(
     end: Option<usize>,
     limit: usize,
 ) -> Result<(usize, usize, Vec<Item>)> {
-    let text = std::fs::read_to_string(file).with_context(|| format!("cannot read {file}"))?;
-    let all = if source == "codex" {
-        codex_items(&text)
-    } else {
-        claude_items(&text)
-    };
+    let all = parsed(file, source)?;
     let total = all.len();
     let end = end.unwrap_or(total).min(total);
     let start = end.saturating_sub(limit);
-    Ok((
-        total,
-        start,
-        all.into_iter().skip(start).take(end - start).collect(),
-    ))
+    Ok((total, start, all[start..end].to_vec()))
+}
+
+/// 最後に読んだ記録（パス・大きさ・更新時刻・種類）と、その解析結果。
+/// 「古いものを読む」でさかのぼるたびに、画像の入った大きな記録を丸ごと解析し直さない
+type Cached = (
+    (String, u64, std::time::SystemTime, String),
+    std::sync::Arc<Vec<Item>>,
+);
+static LAST: std::sync::Mutex<Option<Cached>> = std::sync::Mutex::new(None);
+
+fn parsed(file: &str, source: &str) -> Result<std::sync::Arc<Vec<Item>>> {
+    let meta = std::fs::metadata(file).with_context(|| format!("cannot read {file}"))?;
+    let key = (
+        file.to_string(),
+        meta.len(),
+        meta.modified()?,
+        source.to_string(),
+    );
+    if let Some((k, items)) = LAST.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+        && *k == key
+    {
+        return Ok(items.clone());
+    }
+    let text = std::fs::read_to_string(file).with_context(|| format!("cannot read {file}"))?;
+    let items = std::sync::Arc::new(if source == "codex" {
+        codex_items(&text)
+    } else {
+        claude_items(&text)
+    });
+    *LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some((key, items.clone()));
+    Ok(items)
 }
 
 fn ts_of(v: &Value) -> i64 {

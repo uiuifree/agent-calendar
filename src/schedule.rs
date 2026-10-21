@@ -201,6 +201,9 @@ pub struct Input {
     pub prompt: String,
     pub repeat: Repeat,
     pub enabled: bool,
+    /// 新しく始めるときのモデル。空なら CLI の既定（前回に続けるときはそのセッションのモデルのまま）
+    #[serde(default)]
+    pub model: String,
 }
 
 /// 受け取った予定を確かめる（人が入力したものなので、ここで止める）
@@ -219,6 +222,9 @@ pub fn validate(i: &Input, now: DateTime<Local>) -> Result<()> {
             "the instruction must be 1-{} characters",
             send::MAX_PROMPT_CHARS
         );
+    }
+    if !i.model.is_empty() && !send::valid_model(&i.model) {
+        bail!("the model name is not valid: {}", i.model);
     }
     if i.worktree && git_toplevel(&i.dir).is_none() {
         bail!("a worktree needs a git repository: {}", i.dir);
@@ -257,9 +263,9 @@ pub fn save(conn: &Connection, id: Option<i64>, i: &Input, now: DateTime<Local>)
     match id {
         None => {
             conn.execute(
-                "INSERT INTO schedules (name, dir, agent, mode, worktree, continue_session, prompt, repeat, enabled, next_at, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![i.name.trim(), i.dir, i.agent, mode, i.worktree, i.continue_session, i.prompt.trim(), repeat, i.enabled, next, now.timestamp_millis()],
+                "INSERT INTO schedules (name, dir, agent, mode, worktree, continue_session, prompt, repeat, enabled, next_at, created_at, model)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![i.name.trim(), i.dir, i.agent, mode, i.worktree, i.continue_session, i.prompt.trim(), repeat, i.enabled, next, now.timestamp_millis(), i.model],
             )?;
             Ok(conn.last_insert_rowid())
         }
@@ -268,10 +274,10 @@ pub fn save(conn: &Connection, id: Option<i64>, i: &Input, now: DateTime<Local>)
                 // エージェント・ディレクトリ・作業コピーを変えたら、前回のセッションには続けられない
                 // （Claude のセッションを Codex では開けず、別の場所の会話も続けられない）。右辺の列は変更前の値
                 "UPDATE schedules SET name = ?2, dir = ?3, agent = ?4, mode = ?5, worktree = ?6, continue_session = ?7,
-                 prompt = ?8, repeat = ?9, enabled = ?10, next_at = ?11,
+                 prompt = ?8, repeat = ?9, enabled = ?10, next_at = ?11, model = ?12,
                  last_session_id = CASE WHEN agent != ?4 OR dir != ?3 OR worktree != ?6 THEN NULL ELSE last_session_id END
                  WHERE id = ?1",
-                params![id, i.name.trim(), i.dir, i.agent, mode, i.worktree, i.continue_session, i.prompt.trim(), repeat, i.enabled, next],
+                params![id, i.name.trim(), i.dir, i.agent, mode, i.worktree, i.continue_session, i.prompt.trim(), repeat, i.enabled, next, i.model],
             )?;
             if n == 0 {
                 bail!("no such schedule");
@@ -300,7 +306,7 @@ pub fn delete(conn: &Connection, id: i64) -> Result<bool> {
 /// 一覧（画面用）。各予定に最近の実行を 5 件付ける
 pub fn list(conn: &Connection) -> Result<Vec<Value>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, dir, agent, mode, worktree, continue_session, prompt, repeat, enabled, next_at, last_session_id
+        "SELECT id, name, dir, agent, mode, worktree, continue_session, prompt, repeat, enabled, next_at, last_session_id, model
          FROM schedules ORDER BY enabled DESC, next_at IS NULL, next_at, id",
     )?;
     let rows = stmt
@@ -311,7 +317,7 @@ pub fn list(conn: &Connection) -> Result<Vec<Value>> {
                 "continue_session": r.get::<_, bool>(6)?, "prompt": r.get::<_, String>(7)?,
                 "repeat": serde_json::from_str::<Value>(&r.get::<_, String>(8)?).unwrap_or(Value::Null),
                 "enabled": r.get::<_, bool>(9)?, "next_at": r.get::<_, Option<i64>>(10)?,
-                "last_session_id": r.get::<_, Option<String>>(11)?,
+                "last_session_id": r.get::<_, Option<String>>(11)?, "model": r.get::<_, String>(12)?,
             }))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -321,6 +327,78 @@ pub fn list(conn: &Connection) -> Result<Vec<Value>> {
         out.push(row);
     }
     Ok(out)
+}
+
+/// 予定の実行の数（全部・成功・失敗・実行されず・飛ばした・実行中）と平均の所要時間（秒）
+type Counts = (i64, i64, i64, i64, i64, i64, Option<f64>);
+
+/// 予定の実行の履歴（画面の「すべての実行」）。before（started_at の unix ms と実行の id）より前を新しい順に limit 件。
+/// 各回に費用（実行していた時間の分）と所要時間を付け、全期間の回数・成否・平均の所要時間・費用の合計も返す
+pub fn history(
+    conn: &Connection,
+    id: i64,
+    before: Option<(i64, i64)>,
+    limit: i64,
+) -> Result<Value> {
+    let (at, run) = before.map_or((None, None), |(a, r)| (Some(a), Some(r)));
+    let mut stmt = conn.prepare(
+        "SELECT id, started_at, finished_at, status, session_id, summary, branch, changes
+         FROM schedule_runs WHERE schedule_id = ?1
+           AND (?2 IS NULL OR started_at < ?2 OR (started_at = ?2 AND id < ?4))
+         ORDER BY started_at DESC, id DESC LIMIT ?3",
+    )?;
+    let rows = stmt
+        .query_map(params![id, at, limit, run], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, Option<i64>>(7)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut runs = Vec::new();
+    for (run, started, finished, status, session, summary, branch, changes) in rows {
+        let cost = match (&session, finished) {
+            (Some(s), Some(f)) => Some(crate::stats::cost_between(
+                conn,
+                s,
+                started / 1000,
+                f / 1000,
+            )?),
+            _ => None,
+        };
+        runs.push(json!({
+            "id": run, "started_at": started, "finished_at": finished, "status": status,
+            "session_id": session, "summary": summary, "branch": branch, "changes": changes,
+            "secs": finished.map(|f| (f - started) / 1000),
+            "usd": cost.as_ref().map(|c| c.usd),
+            "unpriced": cost.is_some_and(|c| !c.unpriced.is_empty()),
+        }));
+    }
+    // 合計の内訳には、いま動いている回も入れる（総数と内訳の和をそろえる）
+    let (total, ok, failed, missed, skipped, running, avg_secs): Counts = conn.query_row(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE status = 'ok'), COUNT(*) FILTER (WHERE status = 'failed'),
+                COUNT(*) FILTER (WHERE status = 'missed'), COUNT(*) FILTER (WHERE status = 'skipped'),
+                COUNT(*) FILTER (WHERE status = 'running'),
+                AVG(CASE WHEN status IN ('ok', 'failed') AND finished_at IS NOT NULL THEN (finished_at - started_at) / 1000.0 END)
+         FROM schedule_runs WHERE schedule_id = ?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+    )?;
+    let all = crate::stats::schedule_cost(conn, id)?;
+    let (usd, unpriced) = (all.usd, !all.unpriced.is_empty());
+    Ok(json!({
+        "runs": runs,
+        "totals": {
+            "runs": total, "ok": ok, "failed": failed, "missed": missed, "skipped": skipped,
+            "running": running, "avg_secs": avg_secs, "usd": usd, "unpriced": unpriced,
+        },
+    }))
 }
 
 pub fn runs(conn: &Connection, id: i64, limit: i64) -> Result<Vec<Value>> {
@@ -368,13 +446,14 @@ pub struct Due {
     pub continue_session: bool,
     pub prompt: String,
     pub last_session_id: Option<String>,
+    pub model: String,
 }
 
 /// 時刻が来た予定を拾い、次の時刻を進める。遅れすぎた回は「missed」と記録して実行しない
 pub fn take_due(conn: &Connection, now: DateTime<Local>) -> Result<Vec<Due>> {
     let now_ms = now.timestamp_millis();
     let mut stmt = conn.prepare(
-        "SELECT id, name, dir, agent, mode, worktree, continue_session, prompt, last_session_id, repeat, next_at
+        "SELECT id, name, dir, agent, mode, worktree, continue_session, prompt, last_session_id, repeat, next_at, model
          FROM schedules WHERE enabled = 1 AND next_at IS NOT NULL AND next_at <= ?1",
     )?;
     let rows = stmt
@@ -390,6 +469,7 @@ pub fn take_due(conn: &Connection, now: DateTime<Local>) -> Result<Vec<Due>> {
                     continue_session: r.get(6)?,
                     prompt: r.get(7)?,
                     last_session_id: r.get(8)?,
+                    model: r.get(11)?,
                 },
                 r.get::<_, String>(9)?,
                 r.get::<_, i64>(10)?,
@@ -405,10 +485,11 @@ pub fn take_due(conn: &Connection, now: DateTime<Local>) -> Result<Vec<Due>> {
             params![d.id, next],
         )?;
         if now_ms - next_at > LATE_MS {
+            // 逃した回は、動くはずだった時刻に出す（復帰した時刻に出すと、どの回が動かなかったか分からない）
             record(
                 conn,
                 d.id,
-                now_ms,
+                next_at,
                 "missed",
                 "the machine was off or asleep at the scheduled time",
             )?;
@@ -422,7 +503,7 @@ pub fn take_due(conn: &Connection, now: DateTime<Local>) -> Result<Vec<Due>> {
 pub fn get(conn: &Connection, id: i64) -> Result<Option<Due>> {
     Ok(conn
         .query_row(
-            "SELECT id, name, dir, agent, mode, worktree, continue_session, prompt, last_session_id FROM schedules WHERE id = ?1",
+            "SELECT id, name, dir, agent, mode, worktree, continue_session, prompt, last_session_id, model FROM schedules WHERE id = ?1",
             [id],
             |r| {
                 Ok(Due {
@@ -435,6 +516,7 @@ pub fn get(conn: &Connection, id: i64) -> Result<Option<Due>> {
                     continue_session: r.get(6)?,
                     prompt: r.get(7)?,
                     last_session_id: r.get(8)?,
+                    model: r.get(9)?,
                 })
             },
         )
@@ -672,13 +754,48 @@ pub fn mark(conn: &Connection, run_id: i64, status: &str, summary: &str) -> Resu
     Ok(())
 }
 
+/// 前回のセッションに続ける回を飛ばす理由。端末で開いて続けているなら、同じ記録に 2 か所から書かないよう飛ばす
+/// （画面からの続きと同じ扱い）。開いているか確かめられないときも飛ばす
+fn skip_reason(
+    agent: &str,
+    continuing: Option<&str>,
+    open_elsewhere: impl FnOnce(&str) -> Result<bool>,
+) -> Option<String> {
+    let sid = continuing.filter(|_| agent == "claude")?;
+    match open_elsewhere(sid) {
+        Ok(false) => None,
+        Ok(true) => Some("the previous session is open in a terminal or in the background".into()),
+        Err(e) => Some(format!(
+            "cannot check whether the previous session is open in a terminal: {e:#}"
+        )),
+    }
+}
+
+/// 起動できなかったときの記録の状態。CLI を起動できない（PATH に無いなど）のは失敗、実行の印が重なったのは飛ばした
+fn start_failure(e: &anyhow::Error) -> &'static str {
+    if e.downcast_ref::<std::io::Error>().is_some() {
+        "failed"
+    } else {
+        "skipped"
+    }
+}
+
+/// 起動の結果。動かさなかった（飛ばした・起動できなかった）ときは refused に理由
+#[derive(Debug, PartialEq)]
+pub struct Launched {
+    pub run_id: i64,
+    pub refused: Option<String>,
+}
+
 /// 予定を 1 回起動する（tokio の中から呼ぶ）。終わるのを待たずに返り、結果は実行の記録に書く。
-/// `after` は終わったあとに 1 回呼ぶ（日誌の読み直し）
+/// `after` は終わったあとに 1 回呼ぶ（日誌の読み直し）。
+/// `open_elsewhere` は、そのセッションが端末か裏で開いているか（`claude agents` に聞く）
 pub fn launch(
     running: &send::Running,
     d: &Due,
+    open_elsewhere: impl FnOnce(&str) -> Result<bool>,
     after: impl FnOnce() + Send + 'static,
-) -> Result<i64> {
+) -> Result<Launched> {
     let conn = db::open()?;
     let run_id = record(
         &conn,
@@ -687,9 +804,12 @@ pub fn launch(
         "running",
         "",
     )?;
-    let fail = |status: &str, msg: String| -> Result<i64> {
+    let fail = |status: &str, msg: String| -> Result<Launched> {
         mark(&conn, run_id, status, &msg)?;
-        Ok(run_id)
+        Ok(Launched {
+            run_id,
+            refused: Some(msg),
+        })
     };
     let (cwd, branch) = if d.worktree {
         match ensure_worktree(&d.dir, d.id, &worktrees_dir()) {
@@ -708,9 +828,12 @@ pub fn launch(
         );
     };
     let continuing = d.last_session_id.as_deref().filter(|_| d.continue_session);
+    if let Some(why) = skip_reason(&d.agent, continuing, open_elsewhere) {
+        return fail("skipped", why);
+    }
     let (program, args) = match continuing {
         Some(sid) => send::command(&d.agent, sid, mode),
-        None => send::command_new(&d.agent, mode, ""),
+        None => send::command_new(&d.agent, mode, &d.model),
     };
     let job = send::Job {
         program: program.to_string(),
@@ -726,12 +849,17 @@ pub fn launch(
         cleanup: Vec::new(),
         // 予定は無人で動くので、許可の問い合わせには答える人がいない（出たものは断られる）
         ask: false,
+        // 予定の印（schedule:<id>）に「止める」を送れば、この回が止まる
+        stop: Some(schedule_claim.stopper()),
     };
     let mut rx = match send::start(running, job, after) {
         Ok(rx) => rx,
-        Err(e) => return fail("skipped", format!("{e:#}")),
+        Err(e) => return fail(start_failure(&e), format!("{e:#}")),
     };
+    // 終わったときに前回のセッションを覚えるのは、起動したときと同じ設定のままのときだけ
+    // （実行中にエージェントや場所を変えたら、古い設定のセッションに続けないように）
     let (id, worktree) = (d.id, d.worktree);
+    let started_as = (d.agent.clone(), d.dir.clone(), d.worktree);
     tokio::spawn(async move {
         let _schedule_claim = schedule_claim;
         let (mut session, mut last_text, mut ok, mut error) =
@@ -752,7 +880,7 @@ pub fn launch(
         }
         let summary = if ok { last_text } else { error };
         let changes = if worktree { changes(&cwd) } else { None };
-        let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+        let saved = tokio::task::spawn_blocking(move || -> Result<()> {
             let conn = db::open()?;
             finish(
                 &conn,
@@ -764,13 +892,22 @@ pub fn launch(
                 changes,
             )?;
             if let Some(s) = session {
-                remember_session(&conn, id, &s)?;
+                remember_session(&conn, id, &s, &started_as)?;
             }
             Ok(())
         })
         .await;
+        // 書けなかったら「実行中」のまま残る（起動し直したときに中断として閉じる）。理由はログに出す
+        match saved {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("[schedule] cannot save run {run_id}: {e:#}"),
+            Err(e) => eprintln!("[schedule] cannot save run {run_id}: {e}"),
+        }
     });
-    Ok(run_id)
+    Ok(Launched {
+        run_id,
+        refused: None,
+    })
 }
 
 /// サービスが止まると、実行中の回の終わりを書く処理も消える。起動時に、残った「実行中」を中断として閉じる
@@ -782,10 +919,17 @@ pub fn recover(conn: &Connection) -> Result<usize> {
     )?)
 }
 
-pub fn remember_session(conn: &Connection, id: i64, session: &str) -> Result<()> {
+/// 前回のセッションを覚える。`(agent, dir, worktree)` は起動したときの設定で、
+/// そのあと予定を編集して変わっていたら覚えない（編集で消した前回のセッションを書き戻さない）
+pub fn remember_session(
+    conn: &Connection,
+    id: i64,
+    session: &str,
+    (agent, dir, worktree): &(String, String, bool),
+) -> Result<()> {
     conn.execute(
-        "UPDATE schedules SET last_session_id = ?2 WHERE id = ?1",
-        params![id, session],
+        "UPDATE schedules SET last_session_id = ?2 WHERE id = ?1 AND agent = ?3 AND dir = ?4 AND worktree = ?5",
+        params![id, session, agent, dir, worktree],
     )?;
     Ok(())
 }
@@ -1090,6 +1234,7 @@ mod tests {
                 minute: 8 * 60,
             },
             enabled: true,
+            model: String::new(),
         }
     }
 
@@ -1109,6 +1254,8 @@ mod tests {
         assert!(bad(&|i| i.agent = "gpt".into()));
         assert!(bad(&|i| i.prompt = String::new()));
         assert!(bad(&|i| i.worktree = true)); // git ではない
+        assert!(bad(&|i| i.model = "--dangerously-skip-permissions".into()));
+        assert!(!bad(&|i| i.model = "sonnet".into()));
         assert!(bad(&|i| i.repeat = Repeat::Once {
             at: now.timestamp_millis()
         }));
@@ -1154,6 +1301,8 @@ mod tests {
         assert!(take_due(&conn, t("2026-10-07 12:00")).unwrap().is_empty());
         let r = runs(&conn, id, 5).unwrap();
         assert_eq!(r[0]["status"], "missed");
+        // 逃した回は、動くはずだった時刻（10/6 8:00）に出す
+        assert_eq!(r[0]["started_at"], t("2026-10-06 08:00").timestamp_millis());
         assert_eq!(next(&conn), Some(t("2026-10-08 08:00").timestamp_millis()));
         // 1 回だけの予定は動いたら止まる
         let mut once = input(d);
@@ -1193,6 +1342,103 @@ mod tests {
     }
 
     #[test]
+    fn decides_whether_to_run() {
+        let open = |v: bool| move |_: &str| -> Result<bool> { Ok(v) };
+        assert_eq!(skip_reason("claude", None, open(true)), None); // 新しく始める回
+        assert_eq!(skip_reason("codex", Some("s"), open(true)), None); // Codex は確かめる口が無い
+        assert_eq!(skip_reason("claude", Some("s"), open(false)), None);
+        assert!(
+            skip_reason("claude", Some("s"), open(true))
+                .unwrap()
+                .contains("open in a terminal")
+        );
+        let broken = |_: &str| -> Result<bool> { anyhow::bail!("claude not found") };
+        assert!(
+            skip_reason("claude", Some("s"), broken)
+                .unwrap()
+                .contains("cannot check")
+        );
+        let spawn: anyhow::Error = std::io::Error::from(std::io::ErrorKind::NotFound).into();
+        assert_eq!(start_failure(&spawn), "failed");
+        assert_eq!(
+            start_failure(&anyhow::anyhow!("already running")),
+            "skipped"
+        );
+    }
+
+    #[test]
+    fn history_with_cost_and_totals() {
+        let dir = db::temp_dir("sched-history");
+        let conn = db::open_at(&dir.join("t.db")).unwrap();
+        let id = save(
+            &conn,
+            None,
+            &input(dir.to_str().unwrap()),
+            t("2026-10-04 12:00"),
+        )
+        .unwrap();
+        // 前回に続ける予定なので、2 回とも同じセッションに書く。費用は実行していた時間で切る
+        for (start, end, ok) in [(600_000, 1_800_000, true), (6_000_000, 6_600_000, false)] {
+            let run = record(&conn, id, start, "running", "").unwrap();
+            finish(&conn, run, ok, Some("s1"), "x", "", None).unwrap();
+            conn.execute(
+                "UPDATE schedule_runs SET finished_at = ?2 WHERE id = ?1",
+                params![run, end],
+            )
+            .unwrap();
+        }
+        record(&conn, id, 9_000_000, "missed", "").unwrap();
+        for (bucket, output) in [(600, 1_000_000), (6000, 2_000_000)] {
+            conn.execute(
+                "INSERT INTO usage VALUES ('s1', ?1, 'claude-opus-5-5', 'main', 0, 0, ?2, 0, 0, 0)",
+                params![bucket, output],
+            )
+            .unwrap();
+        }
+        let h = history(&conn, id, None, 2).unwrap();
+        let runs = h["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0]["status"], "missed");
+        assert_eq!(runs[0]["usd"], Value::Null);
+        assert_eq!(runs[1]["status"], "failed");
+        assert_eq!(
+            (runs[1]["secs"].as_i64(), runs[1]["usd"].as_f64()),
+            (Some(600), Some(40.0))
+        );
+        // 続き（それより前）
+        let cursor = (
+            runs[1]["started_at"].as_i64().unwrap(),
+            runs[1]["id"].as_i64().unwrap(),
+        );
+        let older = history(&conn, id, Some(cursor), 10).unwrap();
+        assert_eq!(older["runs"][0]["usd"], 20.0);
+        let tot = &h["totals"];
+        assert_eq!(
+            (
+                tot["runs"].as_i64(),
+                tot["ok"].as_i64(),
+                tot["failed"].as_i64(),
+                tot["missed"].as_i64()
+            ),
+            (Some(3), Some(1), Some(1), Some(1))
+        );
+        assert_eq!(tot["avg_secs"], 900.0);
+        assert_eq!(tot["usd"], 60.0);
+        // 同じ 10 分の枠に 2 回入っても、合計では 1 回だけ数える
+        let again = record(&conn, id, 6_300_000, "running", "").unwrap();
+        finish(&conn, again, true, Some("s1"), "x", "", None).unwrap();
+        conn.execute(
+            "UPDATE schedule_runs SET finished_at = 6_500_000 WHERE id = ?1",
+            [again],
+        )
+        .unwrap();
+        assert_eq!(history(&conn, id, None, 1).unwrap()["totals"]["usd"], 60.0);
+        // 動いている回も内訳に入る
+        record(&conn, id, 9_500_000, "running", "").unwrap();
+        assert_eq!(history(&conn, id, None, 1).unwrap()["totals"]["running"], 1);
+    }
+
+    #[test]
     fn records_runs_and_sessions() {
         let dir = db::temp_dir("sched-runs");
         let conn = db::open_at(&dir.join("t.db")).unwrap();
@@ -1214,7 +1460,9 @@ mod tests {
             Some(2),
         )
         .unwrap();
-        remember_session(&conn, id, "s1").unwrap();
+        let started_as =
+            |agent: &str| (agent.to_string(), dir.to_str().unwrap().to_string(), false);
+        remember_session(&conn, id, "s1", &started_as("claude")).unwrap();
         let r = runs(&conn, id, 5).unwrap();
         assert_eq!(
             (
@@ -1239,6 +1487,14 @@ mod tests {
         renamed.agent = "codex".into();
         save(&conn, Some(id), &renamed, t("2026-10-04 12:00")).unwrap();
         assert_eq!(get(&conn, id).unwrap().unwrap().last_session_id, None);
+        // 実行中に編集してエージェントを変えたなら、古い回が終わっても前回のセッションを書き戻さない
+        remember_session(&conn, id, "old", &started_as("claude")).unwrap();
+        assert_eq!(get(&conn, id).unwrap().unwrap().last_session_id, None);
+        remember_session(&conn, id, "s2", &started_as("codex")).unwrap();
+        assert_eq!(
+            get(&conn, id).unwrap().unwrap().last_session_id.as_deref(),
+            Some("s2")
+        );
         // 再起動で残った「実行中」は中断として閉じる
         let stuck = record(&conn, id, 2000, "running", "").unwrap();
         assert_eq!(recover(&conn).unwrap(), 1);

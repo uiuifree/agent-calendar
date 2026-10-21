@@ -175,6 +175,12 @@ const RULES = {
   branches: fakeBranch, default: fakeBranch, default_branch: fakeBranch,
   // リポジトリのメニュー: ブランチを使っているフォルダ
   checked_out: fakePath,
+  // リポジトリの画面: 手元の clone でいま出ているブランチと、片付けのメニューで比べる既定のブランチ
+  current_branch: fakeBranch, base: fakeBranch,
+  // GitHub から取り直せなかった理由（前の一覧を出しているとき）
+  stale: fakeText,
+  // 要約しないリポジトリ（設定）
+  summary_exclude: fakePath,
   label: (v) => (v === 'WSL' || v === 'this PC' ? v : 'server'),
   owner: orgName, owners: orgName, github_owners: orgName, roots: () => '/home/me/projects', repo_roots: () => '/home/me/projects', dirs: fakePath,
   project: projectName, known_projects: projectName,
@@ -187,21 +193,27 @@ const RULES = {
 function fakeBranch(v) {
   if (v.startsWith('https://')) return fakeGithub(v)
   // 出発点の一覧の origin/… は、origin/ を残して名前だけ作り物にする
-  if (v.startsWith('origin/')) return `origin/${fakeBranch(v.slice('origin/'.length))}`
-  return v === 'main' || v === 'master' ? v : `feature/${pick(['login-fix', 'search-speedup', 'settings', 'csv-import'], v)}`
+  // 作り物の名前は逆引きに覚える（「このブランチ全体」の比べる相手に選んだとき、本物に戻して問い合わせるため）
+  if (v.startsWith('origin/')) return remember(`origin/${fakeBranch(v.slice('origin/'.length))}`, v)
+  return v === 'main' || v === 'master' ? v : remember(`feature/${pick(['login-fix', 'search-speedup', 'settings', 'csv-import'], v)}`, v)
 }
 
 // 受け取ったデータ全体を、項目の名前を見ながらたどって置き換える。
 // キーがパスの表（週のデータのリポジトリの表）は、キーも置き換える
 // ツールの呼び出し（会話の履歴・途中経過）の name はツールの名前（Bash など）なので残す
 const TOOL_KINDS = new Set(['tool_use', 'tool'])
+// 利用枠の枠の label はモデル名か枠の名前なので残す（ホストの label と同じ置き換えにしない）
+const LIMIT_KINDS = new Set(['five_hour', 'seven_day', 'window', 'model', 'quota'])
+// 残すもの: ツールの名前、利用枠の名前、裏の処理の名前（scan・remote:<ホストの id>。ホストの id は週のデータでも本物のまま）
+const keep = (k, data) =>
+  (k === 'name' && (TOOL_KINDS.has(data.kind) || 'ok_at' in data)) || (k === 'label' && LIMIT_KINDS.has(data.kind))
 export function maskData(data, key = '') {
   if (typeof data === 'string') return data && RULES[key] ? RULES[key](data) : data
   if (Array.isArray(data)) return data.map((v) => maskData(v, key))
   if (data && typeof data === 'object') {
     return Object.fromEntries(
       Object.entries(data).map(([k, v]) => {
-        if (k === 'name' && TOOL_KINDS.has(data.kind)) return [k, v]
+        if (keep(k, data)) return [k, v]
         return [k.startsWith('/') ? fakePath(k) : k, maskData(v, k.startsWith('/') ? key : k)]
       }),
     )

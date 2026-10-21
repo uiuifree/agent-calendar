@@ -1,6 +1,6 @@
 import { describe as group, expect, it } from 'vitest'
 import { setLang } from './i18n.js'
-import { ALL_DAYS, WEEKDAYS, WEEKEND, copyOf, dayLabel, describe, everyLabel } from './plans.js'
+import { ALL_DAYS, WEEKDAYS, WEEKEND, copyOf, dayLabel, describe, everyLabel, mergeRuns } from './plans.js'
 
 group('予定の文', () => {
   it('曜日', () => {
@@ -53,4 +53,15 @@ group('予定のコピー', () => {
     const weekly = { ...plan, repeat: { kind: 'weekly', days: WEEKDAYS, minute: 540 } }
     expect(copyOf(weekly).repeat).toEqual(weekly.repeat)
   })
+})
+
+it('履歴を読み直しても、さらに読んだ分は後ろに残す', () => {
+  const run = (id, started_at, status = 'ok') => ({ id, started_at, status })
+  // いま出している一覧（さらに読んで 4 行）。読み直すと新しい回が増え、動いていた回が終わっている
+  const shown = [run(4, 400, 'running'), run(3, 300), run(2, 300), run(1, 100)]
+  const fresh = [run(5, 500), run(4, 400), run(3, 300)]
+  expect(mergeRuns(fresh, shown)).toEqual([run(5, 500), run(4, 400), run(3, 300), run(2, 300), run(1, 100)])
+  // 最初のページしか読んでいなければ、取り直したものだけ
+  expect(mergeRuns(fresh, [run(4, 400, 'running'), run(3, 300)])).toEqual(fresh)
+  expect(mergeRuns([], shown)).toEqual([])
 })

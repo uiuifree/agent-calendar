@@ -76,7 +76,8 @@ pub struct Summary {
 
 /// 状態を言語に依らない符号にそろえる。初期の要約は「完了／途中／相談のみ」で入っている
 pub fn status_code(s: &str) -> &'static str {
-    match s.trim() {
+    // モデルが `Done` や `wip.` と返すこともある
+    match s.trim().trim_end_matches('.').to_lowercase().as_str() {
         "done" | "完了" => "done",
         "wip" | "途中" => "wip",
         "talk" | "相談のみ" => "talk",
@@ -104,25 +105,88 @@ fn run_with(
     claude: &str,
 ) -> Result<usize> {
     let now = chrono::Utc::now().timestamp_millis();
+    let exclude = serde_json::to_string(&crate::settings::load(conn)?.summary_exclude)?;
+    // 同じ記録のまま失敗したものは、失敗した回数 × 1 時間あけて、MAX_ATTEMPTS 回まで（いつも失敗するものが
+    // 枠を埋めて、ほかのセッションの要約が進まなくならないように）
     let mut stmt = conn.prepare(
         "SELECT s.id, s.file, s.last_uuid, s.source FROM sessions s
          LEFT JOIN summaries m ON m.session_id = s.id
+         LEFT JOIN summary_failures f ON f.session_id = s.id AND f.last_uuid = s.last_uuid
          WHERE s.last_ts < ?1 AND (m.session_id IS NULL OR m.last_uuid != s.last_uuid)
+           AND s.repo NOT IN (SELECT value FROM json_each(?3))
+           AND (f.session_id IS NULL OR (f.attempts < ?4 AND f.failed_at < ?5 - f.attempts * ?6))
          ORDER BY s.last_ts DESC LIMIT ?2",
     )?;
     let todo: Vec<(String, String, String, String)> = stmt
-        .query_map(params![now - IDLE_MS, limit as i64], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-        })?
+        .query_map(
+            params![
+                now - IDLE_MS,
+                limit as i64,
+                exclude,
+                MAX_ATTEMPTS,
+                now,
+                RETRY_MS
+            ],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?
         .collect::<rusqlite::Result<_>>()?;
-    let mut done = 0;
+    let (mut done, mut failed) = (0, Vec::new());
     for (id, file, last_uuid, source) in todo {
         match make(conn, claude, (&id, &file, &last_uuid, &source), model, lang) {
             Ok(_) => done += 1,
-            Err(e) => eprintln!("[summarize] {id} failed: {e:#}"),
+            // 画面から同じセッションを要約している最中か、本体の入れ替えの最中。失敗ではないので数えない
+            Err(e) if e.is::<NotNow>() => {}
+            Err(e) => {
+                eprintln!("[summarize] {id} failed: {e:#}");
+                remember_failure(conn, &id, &last_uuid, &format!("{e:#}"), now)?;
+                failed.push(format!("{e:#}"));
+            }
         }
     }
+    let error = failed
+        .first()
+        .map(|first| format!("{} sessions could not be summarized: {first}", failed.len()));
+    crate::status::set(conn, "summarize", error.as_deref())?;
     Ok(done)
+}
+
+/// 同じ記録のまま失敗し続けたら、この回数でやめる（記録が増えたらまた試す）
+const MAX_ATTEMPTS: i64 = 3;
+const RETRY_MS: i64 = 3600 * 1000;
+
+fn remember_failure(
+    conn: &Connection,
+    id: &str,
+    last_uuid: &str,
+    error: &str,
+    now: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO summary_failures (session_id, last_uuid, error, failed_at, attempts) VALUES (?1, ?2, ?3, ?4, 1)
+         ON CONFLICT(session_id) DO UPDATE SET error = ?3, failed_at = ?4,
+           attempts = CASE WHEN last_uuid = ?2 THEN attempts + 1 ELSE 1 END, last_uuid = ?2",
+        params![id, last_uuid, error, now],
+    )?;
+    Ok(())
+}
+
+/// セッションの要約の最後の失敗（詳細に出す）。記録が増えていれば古い失敗なので出さない
+pub fn failure(conn: &Connection, id: &str) -> Result<Option<Value>> {
+    Ok(conn
+        .query_row(
+            "SELECT f.error, f.failed_at, f.attempts FROM summary_failures f
+             JOIN sessions s ON s.id = f.session_id AND s.last_uuid = f.last_uuid
+             WHERE f.session_id = ?1",
+            [id],
+            |r| {
+                Ok(serde_json::json!({
+                    "error": r.get::<_, String>(0)?,
+                    "failed_at": r.get::<_, i64>(1)?,
+                    "attempts": r.get::<_, i64>(2)?,
+                }))
+            },
+        )
+        .optional()?)
 }
 
 /// 画面から押したセッションを、いま要約する（止まっていなくても、要約済みでも作り直す）
@@ -131,6 +195,9 @@ pub fn one(conn: &Connection, id: &str, model: &str, lang: Lang) -> Result<Summa
 }
 
 fn one_with(conn: &Connection, id: &str, model: &str, lang: Lang, claude: &str) -> Result<Summary> {
+    if excluded(conn, id)? {
+        bail!("this repository is set to skip summaries");
+    }
     let (file, last_uuid, source): (String, String, String) = conn
         .query_row(
             "SELECT file, last_uuid, source FROM sessions WHERE id = ?1",
@@ -146,13 +213,49 @@ fn one_with(conn: &Connection, id: &str, model: &str, lang: Lang, claude: &str) 
 /// 二重に作らない（Claude を 2 回呼ぶうえ、古い内容で作ったほうが後から上書きしうる）
 static BUSY: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-/// いま要約を作っているか（本体の入れ替えは、作り終わるまで待つ）
-pub fn busy() -> bool {
-    !BUSY.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+/// いまは要約を始めない（同じセッションを要約している最中か、本体の入れ替えの最中）
+#[derive(Debug)]
+pub struct NotNow;
+
+impl std::fmt::Display for NotNow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("this session is already being summarized, or Agent Calendar is updating")
+    }
+}
+
+impl std::error::Error for NotNow {}
+
+/// 要約しないと設定したリポジトリか（画面の「今すぐ要約」でも送らない）
+pub fn excluded(conn: &Connection, id: &str) -> Result<bool> {
+    let repo: Option<String> = conn
+        .query_row("SELECT repo FROM sessions WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    Ok(repo.is_some_and(|r| {
+        crate::settings::load(conn)
+            .map(|s| s.summary_exclude.contains(&r))
+            .unwrap_or(false)
+    }))
+}
+
+/// 本体の入れ替えが始まったら、新しい要約は始めない（作っている最中のものは待たない。
+/// 保存する前に止まった要約は残らないので、次の回で作り直される）
+static PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn pause(on: bool) {
+    PAUSED.store(on, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// 印を付ける。すでに付いていれば None。戻り値を手放すと外れる（期間の要約も同じ印を使う）
 pub fn claim(id: &str) -> Option<Busy> {
+    claim_unless(id, PAUSED.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+fn claim_unless(id: &str, paused: bool) -> Option<Busy> {
+    if paused {
+        return None;
+    }
     let mut busy = BUSY.lock().unwrap_or_else(|e| e.into_inner());
     if busy.iter().any(|b| b == id) {
         return None;
@@ -180,7 +283,7 @@ fn make(
     lang: Lang,
 ) -> Result<Summary> {
     let Some(_busy) = claim(id) else {
-        bail!("this session is already being summarized");
+        return Err(NotNow.into());
     };
     let text = std::fs::read_to_string(file).with_context(|| format!("cannot read {file}"))?;
     let (s, cost) = call_claude(claude, &digest(source, &text), model, lang)?;
@@ -189,6 +292,7 @@ fn make(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![id, last_uuid, model, serde_json::to_string(&s)?, chrono::Utc::now().timestamp_millis(), cost],
     )?;
+    conn.execute("DELETE FROM summary_failures WHERE session_id = ?1", [id])?;
     println!("[summarize] {id} {}", s.title);
     Ok(s)
 }
@@ -344,7 +448,7 @@ mod tests {
         let file = dir.join(format!("{id}.jsonl"));
         std::fs::write(&file, r#"{"type":"user","message":{"content":"直して"}}"#).unwrap();
         conn.execute(
-            "INSERT INTO sessions VALUES (?1, ?2, 0, 0, '/r', '/r', 'main', '', 0, ?3, 'u1', 1, 'claude', '')",
+            "INSERT INTO sessions VALUES (?1, ?2, 0, 0, '/r', '/r', 'main', '', 0, ?3, 'u1', 1, 'claude', '', 0)",
             params![id, file.to_string_lossy(), last_ts],
         )
         .unwrap();
@@ -405,8 +509,10 @@ mod tests {
         assert!(one_with(&conn, "live", "sonnet", Lang::Ja, &ok).is_ok());
         // 作っている最中（裏の自動の要約など）なら断る。終われば外れる
         let held = claim("live").unwrap();
-        assert!(busy());
         assert!(claim("live").is_none());
+        // 入れ替えの最中は、ほかのセッションも始めない
+        assert!(claim_unless("other", true).is_none());
+        assert!(claim_unless("other", false).is_some());
         assert!(one_with(&conn, "live", "sonnet", Lang::Ja, &ok).is_err());
         drop(held);
         assert!(one_with(&conn, "live", "sonnet", Lang::Ja, &ok).is_ok());
@@ -428,23 +534,113 @@ mod tests {
         let dir = crate::db::temp_dir("summarize-fail");
         let conn = crate::db::open_at(&dir.join("t.db")).unwrap();
         seed(&conn, &dir, "a", 0);
+        let forget = || {
+            conn.execute("DELETE FROM summary_failures", []).unwrap();
+        };
         for bad in [
             fake_claude(&dir, "x", 1),
             fake_claude(&dir, "not json", 0),
             fake_claude(&dir, "{}", 0),
         ] {
             assert_eq!(run_with(&conn, 10, "sonnet", Lang::En, &bad).unwrap(), 0);
+            forget();
         }
         assert_eq!(
             run_with(&conn, 10, "sonnet", Lang::En, "/nonexistent/claude").unwrap(),
             0
         );
+        forget();
         conn.execute("UPDATE sessions SET file = '/nonexistent.jsonl'", [])
             .unwrap();
         assert_eq!(
             run_with(&conn, 10, "sonnet", Lang::En, &fake_claude(&dir, "{}", 0)).unwrap(),
             0
         );
+        // 失敗は覚えて、詳細と裏の処理の状態に出す
+        let f = failure(&conn, "a").unwrap().unwrap();
+        assert!(f["error"].as_str().unwrap().contains("cannot read"));
+        assert_eq!(f["attempts"], 1);
+        let st = crate::status::all(&conn).unwrap();
+        assert!(
+            st[0]["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("1 sessions could not be summarized")
+        );
+        // 間を空けるまでは選び直さない（いつも失敗するものが枠を埋めないように）
+        let ok = fake_claude(
+            &dir,
+            r#"{"result":"{\"title\":\"t\",\"bullets\":[],\"status\":\"done\"}"}"#,
+            0,
+        );
+        seed(&conn, &dir, "b", 0);
+        assert_eq!(run_with(&conn, 10, "sonnet", Lang::En, &ok).unwrap(), 1);
+        conn.execute("UPDATE summary_failures SET failed_at = 0", [])
+            .unwrap();
+        // 間が空いたら、もう一度試して回数を数える。MAX_ATTEMPTS 回でやめる
+        for n in 2..=MAX_ATTEMPTS {
+            assert_eq!(run_with(&conn, 10, "sonnet", Lang::En, &ok).unwrap(), 0);
+            assert_eq!(failure(&conn, "a").unwrap().unwrap()["attempts"], n);
+            conn.execute("UPDATE summary_failures SET failed_at = 0", [])
+                .unwrap();
+        }
+        assert_eq!(run_with(&conn, 10, "sonnet", Lang::En, &ok).unwrap(), 0);
+        assert_eq!(
+            failure(&conn, "a").unwrap().unwrap()["attempts"],
+            MAX_ATTEMPTS
+        );
+        // 記録が増えたら古い失敗は数えず、もう一度試す。うまくいけば失敗は消える
+        let file = dir.join("a.jsonl");
+        conn.execute(
+            "UPDATE sessions SET last_uuid = 'u2', file = ?1 WHERE id = 'a'",
+            [file.to_string_lossy()],
+        )
+        .unwrap();
+        assert!(failure(&conn, "a").unwrap().is_none());
+        assert_eq!(run_with(&conn, 10, "sonnet", Lang::En, &ok).unwrap(), 1);
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM summary_failures", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0);
+        assert!(crate::status::all(&conn).unwrap()[0]["error"].is_null());
+    }
+
+    #[test]
+    fn run_skips_excluded_repositories() {
+        let dir = crate::db::temp_dir("summarize-exclude");
+        let conn = crate::db::open_at(&dir.join("t.db")).unwrap();
+        seed(&conn, &dir, "a", 0);
+        crate::settings::save(
+            &conn,
+            &crate::settings::Settings {
+                summary_exclude: vec!["/r".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let ok = fake_claude(
+            &dir,
+            r#"{"result":"{\"title\":\"t\",\"bullets\":[],\"status\":\"done\"}"}"#,
+            0,
+        );
+        assert_eq!(run_with(&conn, 10, "sonnet", Lang::En, &ok).unwrap(), 0);
+        // 画面の「今すぐ要約」でも送らない
+        let e = one_with(&conn, "a", "sonnet", Lang::En, &ok).unwrap_err();
+        assert!(e.to_string().contains("skip summaries"));
+        assert!(excluded(&conn, "a").unwrap() && !excluded(&conn, "nope").unwrap());
+    }
+
+    #[test]
+    fn busy_is_not_a_failure() {
+        let dir = crate::db::temp_dir("summarize-busy");
+        let conn = crate::db::open_at(&dir.join("t.db")).unwrap();
+        seed(&conn, &dir, "held", 0);
+        let _held = claim("held").unwrap();
+        let ok = fake_claude(&dir, "{}", 0);
+        assert_eq!(run_with(&conn, 10, "sonnet", Lang::En, &ok).unwrap(), 0);
+        // 要約している最中で断られた回は、失敗として数えない
+        assert!(failure(&conn, "held").unwrap().is_none());
+        assert!(NotNow.to_string().contains("already being summarized"));
     }
 
     #[test]
@@ -474,6 +670,8 @@ mod tests {
         assert_eq!(status_code("途中"), "wip");
         assert_eq!(status_code("相談のみ"), "talk");
         assert_eq!(status_code(" done "), "done");
+        assert_eq!(status_code("Done."), "done");
+        assert_eq!(status_code("WIP"), "wip");
         assert_eq!(status_code("?"), "");
         assert!(read("not json").is_none());
     }

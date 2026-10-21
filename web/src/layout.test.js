@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { setLang } from './i18n.js'
-import { PLAN_MS, dayEntries, planPieces, startOfDay, monthGrid, assignLanes, density, fmtDuration, fmtHours, fmtTokens, fmtUsd, segments, splitByDay, sumUsd, weekStart, addDays } from './layout.js'
+import { PLAN_MS, dayEntries, planPieces, startOfDay, monthGrid, assignLanes, fmtDuration, fmtHours, fmtTokens, fmtUsd, segments, splitByDay, sumUsd, weekStart, addDays } from './layout.js'
 
 const at = (s) => new Date(s).getTime()
 const sec = (s) => at(s) / 1000
@@ -54,15 +54,10 @@ describe('assignLanes', () => {
 })
 
 describe('表示用の整形', () => {
-  it('density は対数で 0.15〜0.9', () => {
-    expect(density(0, 0)).toBe(0.15)
-    expect(density(0, 10)).toBeCloseTo(0.15)
-    expect(density(10, 10)).toBeCloseTo(0.9)
-    expect(density(100, 10)).toBeCloseTo(0.9)
-  })
   it('トークン数と時間', () => {
     setLang('ja')
     expect(fmtTokens(26_300_000)).toBe('26.3M')
+    expect(fmtTokens(1_263_800_000)).toBe('1.3B')
     expect(fmtTokens(1500)).toBe('1.5k')
     expect(fmtTokens(12)).toBe('12')
     expect(fmtDuration(45 * 60000)).toBe('45 分')

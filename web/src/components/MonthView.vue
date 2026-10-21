@@ -64,12 +64,12 @@ const cells = computed(() => {
           v-else
           class="entry"
           :class="{ selected: e.session.id === selectedId }"
-          :title="`${e.session.title || t('untitled')}\n${e.name}${machineLabels ? ` (${machineLabels[e.session.machine] ?? e.session.machine})` : ''}`"
+          :title="`${e.session.title || t('untitled')}\n${e.name}${machineLabels ? ` (${machineLabels[e.session.machine] ?? e.session.machine})` : ''}${e.session.running ? `\n${t('running.mark')}` : ''}`"
           @click="emit('select', e.session.id)"
         >
           <i class="dot" :style="{ background: e.color }" />
           <span class="time num">{{ clock(e.start) }}</span>
-          <span class="title">{{ e.session.title || t('untitled') }}</span>
+          <span class="title"><span v-if="e.session.running" class="live">▶</span> {{ e.session.title || t('untitled') }}</span>
         </button>
         </template>
         <button v-if="c.more" class="more" @click="emit('open-day', c.d)">{{ t('moreSessions', { n: c.more }) }}</button>

@@ -1,10 +1,14 @@
 <script setup>
 import { onMounted, ref } from 'vue'
-import { checkUpdate, getSettings, getUpdate, saveSettings } from '../api.js'
+import { checkUpdate, getSettings, getStatus, getUpdate, saveSettings } from '../api.js'
 import { useEscape } from '../dialog.js'
 import { locale, t } from '../i18n.js'
+import { jobParts } from '../running.js'
 
 // 自動で動かす時間帯と間隔。保存すると裏の処理は次の 1 分から新しい設定で動く
+defineProps({
+  machineLabels: { type: Object, default: () => ({}) }, // ホスト id → 表示名（裏の処理の名前に出す）
+})
 const emit = defineEmits(['close', 'saved', 'update'])
 useEscape(() => emit('close'))
 
@@ -12,6 +16,7 @@ const form = ref(null)
 // 組織は空白区切り、フォルダは 1 行に 1 つで入力し、保存するときに配列へ戻す
 const owners = ref('')
 const roots = ref('')
+const exclude = ref('')
 const words = (s) => s.split(/[\s,]+/).filter(Boolean)
 const lines = (s) => s.split('\n').map((l) => l.trim()).filter(Boolean)
 const summarizing = ref(true)
@@ -42,7 +47,21 @@ async function checkNow() {
   }
 }
 
+// 裏の処理（読み直し・要約・別マシンの取り込み）の最後の結果。止まっていることに気づけるように
+const jobs = ref(null)
+const at = (ms) => new Date(ms).toLocaleString(locale(), { month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+function jobName(name, labels) {
+  const { kind, machine } = jobParts(name)
+  const host = labels[machine] ?? machine
+  if (kind === 'remote') return t('jobs.remote', { host })
+  if (kind === 'scan') return machine ? t('jobs.scanHost', { host }) : t('jobs.scan')
+  return kind === 'summarize' ? t('jobs.summarize') : name
+}
+
 onMounted(async () => {
+  getStatus()
+    .then((r) => (jobs.value = r.jobs))
+    .catch(() => {})
   getUpdate()
     .then(gotVersion)
     .catch(() => {})
@@ -51,6 +70,7 @@ onMounted(async () => {
     form.value = { ...r.settings }
     owners.value = (r.settings.github_owners ?? []).join(' ')
     roots.value = (r.settings.repo_roots ?? []).join('\n')
+    exclude.value = (r.settings.summary_exclude ?? []).join('\n')
     summarizing.value = r.summarizing
   } catch (e) {
     error.value = String(e)
@@ -60,7 +80,7 @@ onMounted(async () => {
 async function save() {
   error.value = ''
   try {
-    await saveSettings({ ...form.value, github_owners: words(owners.value), repo_roots: lines(roots.value) })
+    await saveSettings({ ...form.value, github_owners: words(owners.value), repo_roots: lines(roots.value), summary_exclude: lines(exclude.value) })
     saved.value = true
     emit('saved')
     setTimeout(() => emit('close'), 600)
@@ -112,6 +132,11 @@ async function save() {
           <textarea v-model="roots" rows="3" spellcheck="false" placeholder="/home/me/projects" />
           <small class="muted">{{ t('settings.rootsHint') }}</small>
         </label>
+        <label class="field">
+          <span>{{ t('settings.summaryExclude') }}</span>
+          <textarea v-model="exclude" rows="2" spellcheck="false" placeholder="/home/me/projects/client-a" />
+          <small class="muted">{{ t('settings.summaryExcludeHint') }}</small>
+        </label>
         <div class="field">
           <span>{{ t('settings.updates') }}</span>
           <label class="check"><input v-model="form.update_check" type="checkbox" /> {{ t('settings.updateCheck') }}</label>
@@ -123,6 +148,15 @@ async function save() {
             </span>
             <button class="btn tiny" type="button" :disabled="checking" @click="checkNow">{{ t('settings.checkNow') }}</button>
           </span>
+        </div>
+        <div v-if="jobs" class="field">
+          <span>{{ t('jobs.title') }}</span>
+          <p v-if="!jobs.length" class="muted small">{{ t('jobs.none') }}</p>
+          <div v-for="j in jobs" :key="j.name" class="job">
+            <span class="job-name">{{ jobName(j.name, machineLabels) }}</span>
+            <span class="muted small num">{{ j.ok_at ? t('jobs.okAt', { when: at(j.ok_at) }) : t('jobs.never') }}</span>
+            <span v-if="j.error" class="job-error">{{ t('jobs.failed', { when: at(j.error_at), e: j.error }) }}</span>
+          </div>
         </div>
         <div class="actions">
           <button class="btn" @click="emit('close')">{{ t('settings.cancel') }}</button>
@@ -148,5 +182,8 @@ small{font-size:12px; line-height:1.5}
 .check{display:flex; align-items:center; gap:8px; font-size:14px}
 .small{font-size:12px}
 .btn.tiny{height:26px; padding:0 10px; font-size:12px}
+.job{display:flex; flex-wrap:wrap; align-items:baseline; gap:4px 10px; padding:4px 0; border-top:1px solid var(--rule-soft); font-size:13px}
+.job-name{font-weight:500}
+.job-error{flex-basis:100%; color:var(--warn); font-size:12px; white-space:pre-wrap; word-break:break-word}
 .actions{display:flex; justify-content:flex-end; gap:8px; margin-top:8px}
 </style>

@@ -40,17 +40,53 @@ pub fn is_pinned(conn: &Connection, id: &str) -> Result<bool> {
 
 /// ピン留めしたセッション。最近動いたものから
 pub fn list(conn: &Connection) -> Result<Vec<Value>> {
+    rows(
+        conn,
+        "FROM pins x JOIN sessions s ON s.id = x.session_id
+         LEFT JOIN summaries m ON m.session_id = s.id
+         ORDER BY s.last_ts DESC",
+        [],
+    )
+}
+
+/// 指定したセッション（画面の「実行中」）。並びは最近動いたものから。記録にまだ無いものは出ない
+pub fn brief(conn: &Connection, ids: &[String]) -> Result<Vec<Value>> {
+    rows(
+        conn,
+        "FROM sessions s LEFT JOIN summaries m ON m.session_id = s.id
+         WHERE s.id IN (SELECT value FROM json_each(?1))
+         ORDER BY s.last_ts DESC",
+        [serde_json::to_string(ids)?],
+    )
+}
+
+/// 返事を待っているセッション: このマシンで since（unix ms）より後に動き、エージェントの返答で終わっていて、
+/// 完了の印が無く、要約も完了でないもの。最近動いたものから
+pub fn waiting(conn: &Connection, since: i64) -> Result<Vec<Value>> {
+    // 要約したあとで続けたセッションは、要約（「完了」かもしれない）が古いので使わない
+    let list = rows(
+        conn,
+        &format!(
+            "FROM sessions s LEFT JOIN summaries m ON m.session_id = s.id AND m.last_uuid = s.last_uuid
+             WHERE s.waiting = 1 AND s.machine = '' AND s.last_ts >= ?1 AND NOT {}
+             ORDER BY s.last_ts DESC",
+            finished::SQL
+        ),
+        [since],
+    )?;
+    Ok(list.into_iter().filter(|v| v["status"] != "done").collect())
+}
+
+fn rows(conn: &Connection, from: &str, args: impl rusqlite::Params) -> Result<Vec<Value>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT s.id, s.repo, s.title, m.body,
                 (SELECT text FROM prompts p WHERE p.session_id = s.id ORDER BY seq LIMIT 1),
                 s.last_ts, s.source, s.machine, {}
-         FROM pins x JOIN sessions s ON s.id = x.session_id
-         LEFT JOIN summaries m ON m.session_id = s.id
-         ORDER BY s.last_ts DESC",
+         {from}",
         finished::SQL
     ))?;
     let rows = stmt
-        .query_map([], |r| {
+        .query_map(args, |r| {
             let summary = r
                 .get::<_, Option<String>>(3)?
                 .and_then(|b| summarize::read(&b));
@@ -103,7 +139,7 @@ mod tests {
 
     fn session(conn: &Connection, id: &str, title: &str, last_ts: i64) {
         conn.execute(
-            "INSERT INTO sessions VALUES (?1, ?1, 0, 0, '/r', '/r', 'main', ?2, 0, ?3, 'u', 1, 'claude', '')",
+            "INSERT INTO sessions VALUES (?1, ?1, 0, 0, '/r', '/r', 'main', ?2, 0, ?3, 'u', 1, 'claude', '', 0)",
             params![id, title, last_ts],
         )
         .unwrap();
@@ -144,6 +180,43 @@ mod tests {
         set(&conn, "a", false, 4).unwrap();
         assert!(!is_pinned(&conn, "a").unwrap());
         assert_eq!(list(&conn).unwrap().len(), 1);
+        // 指定したセッションだけ（記録に無いものは出ない）
+        let b = brief(&conn, &["a".into(), "nope".into()]).unwrap();
+        assert_eq!((b.len(), b[0]["title"].as_str()), (1, Some("要約の題")));
+    }
+
+    #[test]
+    fn lists_sessions_waiting_for_the_next_instruction() {
+        let conn = crate::db::open_at(&crate::db::temp_dir("pins-waiting").join("t.db")).unwrap();
+        session(&conn, "w", "待ち", 5000);
+        session(&conn, "old", "前の日", 100);
+        session(&conn, "busy", "動いている途中", 5000);
+        session(&conn, "done", "済み", 5000);
+        conn.execute(
+            "UPDATE sessions SET waiting = 1 WHERE id IN ('w', 'old', 'done')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO summaries (session_id, last_uuid, model, body, created_at) VALUES ('done', 'u', 'm', ?1, 0)",
+            [r#"{"title":"済み","bullets":[],"status":"done"}"#],
+        )
+        .unwrap();
+        let ids = |v: Vec<Value>| {
+            v.iter()
+                .map(|x| x["id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(waiting(&conn, 1000).unwrap()), ["w"]);
+        // 「完了」と要約したあとで続けて、また返事を待っているものは出す
+        conn.execute("UPDATE sessions SET last_uuid = 'u2' WHERE id = 'done'", [])
+            .unwrap();
+        assert_eq!(ids(waiting(&conn, 1000).unwrap()), ["done", "w"]);
+        conn.execute("UPDATE sessions SET last_uuid = 'u' WHERE id = 'done'", [])
+            .unwrap();
+        // 完了の印を付けたら出さない
+        crate::finished::set(&conn, "w", true, 6000).unwrap();
+        assert!(waiting(&conn, 1000).unwrap().is_empty());
     }
 
     #[test]

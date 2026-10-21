@@ -1,6 +1,6 @@
 use crate::{
-    db, diff, finished, github, manage, opt, period, pins, place, pricing, remote, repo, resume,
-    scan, schedule, search, send, settings, stats, summarize, transcript, update,
+    db, diff, finished, github, limits, manage, opt, period, pins, place, pricing, remote, repo,
+    resume, scan, schedule, search, send, settings, stats, status, summarize, transcript, update,
 };
 use anyhow::{Context, Result};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -55,6 +55,9 @@ struct UpdateState {
     error: Option<String>,
     /// 入れ替えたが、まだ再起動していない（systemd の外で動いているとき）
     installed: Option<String>,
+    /// 自動の入れ替えに失敗した版。次に確かめるまで（1 日）同じ版を取り直さない
+    #[serde(skip)]
+    failed: Option<String>,
 }
 
 /// 新しい版を確かめる間隔と、確かめるかどうかを見る間隔
@@ -75,6 +78,7 @@ async fn check_update(app: &App) -> UpdateState {
         Ok(Ok(latest)) => {
             st.latest = Some(latest);
             st.error = None;
+            st.failed = None;
         }
         Ok(Err(e)) => st.error = Some(format!("{e:#}")),
         Err(e) => st.error = Some(e.to_string()),
@@ -91,7 +95,8 @@ fn install_blocker(app: &App, latest: &update::Latest) -> Option<&'static str> {
     if latest.asset.is_none() || latest.checksum.is_none() {
         return Some("no_asset");
     }
-    if !app.running.idle() || summarize::busy() {
+    // 要約の最中は待たない（`claude -p` が返らないと、いつまでも入れ替えられなくなる）
+    if !app.running.idle() {
         return Some("busy");
     }
     None
@@ -103,15 +108,17 @@ async fn install_update(app: Shared, latest: update::Latest) -> Result<bool> {
         .parent()
         .map(|p| p.join("update"))
         .unwrap_or_default();
-    let _ = std::fs::remove_dir_all(&work);
-    // ここから再起動までは新しい実行を受け付けない（動いていれば始めない）
+    // ここから再起動までは新しい実行も要約も受け付けない（動いていれば始めない。入れ替えの最中に押し直しても断る）
     if !app.running.begin_update() {
-        anyhow::bail!("an agent is running; try again when it has finished");
+        return Err(UpdateBusy.into());
     }
+    summarize::pause(true);
+    let _ = std::fs::remove_dir_all(&work);
     let l = latest.clone();
     let installed = tokio::task::spawn_blocking(move || update::install(&l, &work)).await;
     if !matches!(installed, Ok(Ok(_))) {
         app.running.end_update();
+        summarize::pause(false);
     }
     installed??;
     println!("[update] installed {}", latest.version);
@@ -119,6 +126,7 @@ async fn install_update(app: Shared, latest: update::Latest) -> Result<bool> {
     if !restart {
         // 再起動しないなら、いまの本体のまま受け付けを戻す（入れ替えは次の起動から効く）
         app.running.end_update();
+        summarize::pause(false);
     }
     if restart {
         tokio::spawn(async {
@@ -163,13 +171,42 @@ async fn update_loop(app: Shared) {
             .filter(|l| update::is_newer(&l.version, update::CURRENT))
             && set.auto_update
             && st.installed.is_none()
+            && st.failed.as_deref() != Some(latest.version.as_str())
             && install_blocker(&app, &latest).is_none()
-            && let Err(e) = install_update(app.clone(), latest).await
         {
-            eprintln!("[update] failed: {e:#}");
+            let version = latest.version.clone();
+            if let Err(e) = install_update(app.clone(), latest).await {
+                eprintln!("[update] failed: {e:#}");
+                // 設定の画面の「更新」の欄に出す
+                auto_update_failed(&app, &version, &e);
+            }
         }
         tokio::time::sleep(UPDATE_TICK).await;
     }
+}
+
+/// 入れ替えを始められなかった（エージェントが動き出した・別の入れ替えの最中）。失敗ではなく、あとでまた試す
+#[derive(Debug)]
+struct UpdateBusy;
+
+impl std::fmt::Display for UpdateBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "an agent is running or an update is in progress; try again when it has finished",
+        )
+    }
+}
+
+impl std::error::Error for UpdateBusy {}
+
+fn auto_update_failed(app: &App, version: &str, e: &anyhow::Error) {
+    // 始められなかっただけなら、次の回（10 分後）にまた試す
+    if e.is::<UpdateBusy>() {
+        return;
+    }
+    let mut st = app.update.lock().unwrap_or_else(|e| e.into_inner());
+    st.error = Some(format!("cannot update to {version}: {e:#}"));
+    st.failed = Some(version.to_string());
 }
 
 fn update_json(app: &App, st: &UpdateState) -> Value {
@@ -201,6 +238,7 @@ async fn update_handler(State(app): State<Shared>) -> ApiResult<Json<Value>> {
 async fn update_check_handler(
     State(app): State<Shared>,
     headers: HeaderMap,
+    Json(_): Json<Value>,
 ) -> ApiResult<Json<Value>> {
     same_origin(&headers)?;
     let st = check_update(&app).await;
@@ -211,6 +249,7 @@ async fn update_check_handler(
 async fn update_install_handler(
     State(app): State<Shared>,
     headers: HeaderMap,
+    Json(_): Json<Value>,
 ) -> ApiResult<Json<Value>> {
     same_origin(&headers)?;
     let latest = app
@@ -278,6 +317,12 @@ pub async fn run(args: &[String]) -> Result<()> {
         println!("[schedule] closed {closed} runs interrupted by the last stop");
     }
     tokio::spawn(schedule_loop(state.clone()));
+    // 前に止まったときに消し損ねた、Codex に渡した画像の一時ファイル。同じ置き場所を使うほかの agent-calendar
+    // （開発版など）が渡している最中のものは消さないよう、1 回の指示の上限より古いものだけ
+    let left = clear_old_files(&uploads_dir(), send::TIMEOUT * 2);
+    if left > 0 {
+        println!("[uploads] removed {left} files left from the last run");
+    }
     let api = Router::new()
         .route("/week", get(week))
         .route("/stats", get(stats_handler))
@@ -296,6 +341,10 @@ pub async fn run(args: &[String]) -> Result<()> {
         .route("/session/{id}/diff", get(diff_handler))
         .route("/session/{id}/image", get(image_handler))
         .route("/pins", get(pins_handler))
+        .route("/running", get(running_handler))
+        .route("/status", get(status_handler))
+        .route("/todo", get(todo_handler))
+        .route("/limits", get(limits_handler))
         .route("/update", get(update_handler))
         .route("/update/check", post(update_check_handler))
         .route("/update/install", post(update_install_handler))
@@ -312,6 +361,8 @@ pub async fn run(args: &[String]) -> Result<()> {
         .route("/schedules/{id}", post(update_schedule))
         .route("/schedules/{id}/delete", post(delete_schedule))
         .route("/schedules/{id}/run", post(run_schedule))
+        .route("/schedules/{id}/stop", post(stop_schedule))
+        .route("/schedules/{id}/history", get(schedule_history))
         .route("/dirs", get(known_dirs))
         .route("/repos", get(repos_handler))
         .route("/repos/branches", get(branches_handler))
@@ -385,14 +436,23 @@ async fn refresh_loop(summarize: Option<SummarizeOpts>) {
                 return Ok((false, false));
             }
             let refresh = settings::due(lr, set.refresh_minutes, now);
+            // 読み直しに失敗しても要約は進める（失敗は画面の「裏の処理」に出る）
             if refresh {
-                remote::pull_all(&conn)?;
-                let n = scan::run(&mut conn)?;
-                println!("[scan] re-read {n} sessions");
+                let read = remote::pull_all(&conn).and_then(|()| scan::run(&mut conn));
+                match read {
+                    Ok(n) => println!("[scan] re-read {n} sessions"),
+                    Err(e) => {
+                        eprintln!("[scan] failed: {e:#}");
+                        status::set(&conn, "scan", Some(&format!("{e:#}")))?;
+                    }
+                }
             }
             let summary = opts.is_some() && settings::due(ls, set.summary_minutes, now);
-            if let Some(o) = opts.filter(|_| summary) {
-                summarize::run(&conn, SUMMARIZE_PER_ROUND, &o.model, o.lang)?;
+            if let Some(o) = opts.filter(|_| summary)
+                && let Err(e) = summarize::run(&conn, SUMMARIZE_PER_ROUND, &o.model, o.lang)
+            {
+                eprintln!("[summarize] failed: {e:#}");
+                status::set(&conn, "summarize", Some(&format!("{e:#}")))?;
             }
             Ok((refresh, summary))
         })
@@ -493,6 +553,9 @@ struct Range {
     /// 集計をホストで絞る。JSON の配列（手元は空文字）。無ければ全部
     #[serde(default)]
     machines: Option<String>,
+    /// 集計から外すリポジトリ（絶対パスの JSON の配列）。サイドバーでチェックを外したもの
+    #[serde(default)]
+    exclude: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -510,6 +573,8 @@ struct WeekSession {
     usd: Vec<(i64, f64)>,
     /// 単価の分からないモデルを使っていた（金額が少なめに出ている）
     unpriced: bool,
+    /// この画面から送った指示・「ここで始める」・予定がいま動いている
+    running: bool,
 }
 
 #[derive(Serialize)]
@@ -523,6 +588,11 @@ struct RepoInfo {
 async fn week(State(app): State<Shared>, Query(r): Query<Range>) -> ApiResult<Json<Value>> {
     let conn = app.db.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut v = week_data(&conn, r.from / 1000, r.to / 1000)?;
+    // いま動いているもの（帯に印を出す）
+    for s in v["sessions"].as_array_mut().into_iter().flatten() {
+        let id = s["id"].as_str().unwrap_or("").to_string();
+        s["running"] = app.running.contains(&id).into();
+    }
     let now = chrono::Local::now();
     // これから動く回は今から先だけ（過ぎた回は実行の記録の側で出す）
     let from = chrono::Local
@@ -542,14 +612,20 @@ async fn week(State(app): State<Shared>, Query(r): Query<Range>) -> ApiResult<Js
 fn week_data(conn: &Connection, from: i64, to: i64) -> Result<Value> {
     let mut sessions: Vec<WeekSession> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
+    // 題・要約・最初の依頼・完了の印はセッションごとに 1 回だけ引く（10 分の枠の行ごとに引き直さない）
     let mut stmt = conn.prepare(&format!(
-        "SELECT a.session_id, a.bucket, a.n, s.repo, s.title, m.body,
-                (SELECT text FROM prompts p WHERE p.session_id = s.id ORDER BY seq LIMIT 1), s.source, s.machine,
-                {}
-         FROM activity a JOIN sessions s ON s.id = a.session_id
-         LEFT JOIN summaries m ON m.session_id = s.id
+        "WITH info AS MATERIALIZED (
+            SELECT s.id, s.repo, s.title, m.body,
+                   (SELECT text FROM prompts p WHERE p.session_id = s.id ORDER BY seq LIMIT 1) AS first_prompt,
+                   s.source, s.machine, {} AS fin, s.first_ts
+            FROM sessions s LEFT JOIN summaries m ON m.session_id = s.id
+            WHERE s.id IN (SELECT session_id FROM activity WHERE bucket >= ?1 AND bucket < ?2)
+         )
+         SELECT a.session_id, a.bucket, a.n, info.repo, info.title, info.body, info.first_prompt,
+                info.source, info.machine, info.fin
+         FROM activity a JOIN info ON info.id = a.session_id
          WHERE a.bucket >= ?1 AND a.bucket < ?2
-         ORDER BY s.first_ts, a.bucket",
+         ORDER BY info.first_ts, a.bucket",
         finished::SQL
     ))?;
     let mut rows = stmt.query([from, to])?;
@@ -572,6 +648,7 @@ fn week_data(conn: &Connection, from: i64, to: i64) -> Result<Value> {
                     buckets: Vec::new(),
                     usd: Vec::new(),
                     unpriced: false,
+                    running: false,
                 });
                 index.insert(id, sessions.len() - 1);
                 sessions.len() - 1
@@ -686,7 +763,7 @@ async fn session(State(app): State<Shared>, Path(id): Path<String>) -> ApiResult
     // 別のマシンのセッションは、手元の claude にも git にも聞けない
     let local = detail["machine"] == "";
     let is_claude = local && detail["source"] == "claude";
-    let (commits, running, github) = tokio::task::spawn_blocking(move || {
+    let (commits, running, github, workdir) = tokio::task::spawn_blocking(move || {
         // 実行中かどうかは画面の表示に使うだけなので、claude が答えなければ「不明」で返す。
         // Codex には実行中の一覧を取る口が無い
         let running = if is_claude {
@@ -698,18 +775,32 @@ async fn session(State(app): State<Shared>, Path(id): Path<String>) -> ApiResult
         } else {
             None
         };
-        let commits = if local {
-            commits(&repo, first, last)
-        } else {
-            Vec::new()
+        // 続きを送ると動く場所。記録の作業場所（worktree）が消えていれば本体で動く（画面で知らせる）
+        let dir = local.then(|| resume::workdir(&cwd, &repo)).flatten();
+        let gone = dir.is_some_and(|d| d != cwd);
+        let commits = match dir {
+            // 作業場所が残っていれば、セッションのブランチから辿れるものだけ（並行する worktree のコミットを混ぜない）
+            Some(d) if !gone => commits(d, Some(&branch), first, last),
+            Some(_) => commits(&repo, None, first, last),
+            None => Vec::new(),
         };
         // GitHub へのリンクは作業フォルダ（worktree ならそこ）の origin から
-        let github = local
-            .then(|| resume::workdir(&cwd, &repo).and_then(|d| github::links(d, &branch)))
-            .flatten();
-        (commits, running, github)
+        let github = dir.and_then(|d| github::links(d, &branch));
+        let workdir = dir.map(|d| {
+            json!({ "path": d, "gone": gone, "branch": place::current_branch(d).unwrap_or_default() })
+        });
+        (commits, running, github, workdir)
     })
     .await?;
+    if let Some(w) = &workdir {
+        detail["resume_command"] = resume::resume_command(
+            detail["source"].as_str().unwrap_or(""),
+            w["path"].as_str().unwrap_or(""),
+            &id,
+        )
+        .into();
+    }
+    detail["workdir"] = workdir.unwrap_or(Value::Null);
     detail["commits"] = commits.into();
     detail["github"] = github.unwrap_or(Value::Null);
     detail["sending"] = app.running.contains(&id).into();
@@ -775,11 +866,13 @@ fn session_data(conn: &Connection, id: &str) -> Result<Option<Value>> {
     detail["resume_command"] = resume::resume_command(&source, &cwd, id).into();
     detail["pinned"] = pins::is_pinned(conn, id)?.into();
     detail["finished"] = finished::is_finished(conn, id)?.into();
+    detail["summary_failure"] = summarize::failure(conn, id)?.unwrap_or(Value::Null);
     Ok(Some(detail))
 }
 
-/// セッションの間に自分が入れたコミット。リポジトリが消えていれば空
-fn commits(repo: &str, first_ms: i64, last_ms: i64) -> Vec<Value> {
+/// セッションの間に自分が入れたコミット。リポジトリが消えていれば空。
+/// all なら全ブランチから（作業場所が消えて、どのブランチだったか辿れないとき）。でなければ dir の HEAD から辿れるもの
+fn commits(repo: &str, branch: Option<&str>, first_ms: i64, last_ms: i64) -> Vec<Value> {
     let git = |args: &[&str]| -> Option<String> {
         let out = Command::new("git")
             .arg("-C")
@@ -795,9 +888,28 @@ fn commits(repo: &str, first_ms: i64, last_ms: i64) -> Vec<Value> {
     let since = format!("@{}", first_ms / 1000);
     // 最後の発言のあとに手でコミットすることがあるので 10 分延ばす
     let until = format!("@{}", last_ms / 1000 + 600);
+    // セッションが記録したブランチが手元にあればそこから（あとで作業場所を別のブランチに切り替えていても）。
+    // 無ければいまの HEAD から。branch が None（作業場所が消えた）なら全部のブランチから
+    let refs = match branch {
+        None => "--all".to_string(),
+        Some(b)
+            if !b.is_empty()
+                && !b.starts_with('-')
+                && git(&[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{b}"),
+                ])
+                .is_some() =>
+        {
+            format!("refs/heads/{b}")
+        }
+        Some(_) => "HEAD".to_string(),
+    };
     let mut args = vec![
         "log",
-        "--all",
+        &refs,
         "--no-merges",
         "--since",
         &since,
@@ -845,8 +957,14 @@ async fn schedule_loop(app: Shared) {
             Ok(Ok(list)) => {
                 for d in list {
                     println!("[schedule] {} ({})", d.name, d.id);
-                    if let Err(e) = schedule::launch(&app.running, &d, rescan_after) {
-                        eprintln!("[schedule] {} failed to start: {e:#}", d.name);
+                    match launch_schedule(&app, d.clone()).await {
+                        Ok(l) if l.refused.is_some() => eprintln!(
+                            "[schedule] {} did not start: {}",
+                            d.name,
+                            l.refused.unwrap_or_default()
+                        ),
+                        Ok(_) => {}
+                        Err(e) => eprintln!("[schedule] {} failed to start: {e:#}", d.name),
                     }
                 }
             }
@@ -855,6 +973,23 @@ async fn schedule_loop(app: Shared) {
         }
         tokio::time::sleep(Duration::from_secs(30)).await;
     }
+}
+
+/// 予定を起動する。DB と git（worktree を切る）を同期で触るので、画面の応答を止めないよう別のスレッドで
+async fn launch_schedule(app: &Shared, d: schedule::Due) -> Result<schedule::Launched> {
+    let running = app.running.clone();
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        // 起動したエージェントを読む処理は tokio の上で動かす
+        let _rt = handle.enter();
+        schedule::launch(&running, &d, open_elsewhere, rescan_after)
+    })
+    .await?
+}
+
+/// そのセッションが端末か裏で開いているか（`claude agents` に聞く）。答えなければ Err
+fn open_elsewhere(session: &str) -> Result<bool> {
+    Ok(resume::agents()?.iter().any(|a| a.session_id == session))
 }
 
 /// 実行が終わったら読み直して、追記された分を日誌に出す
@@ -924,8 +1059,12 @@ async fn run_schedule(
             anyhow::anyhow!("no such schedule"),
         ));
     };
-    let run = schedule::launch(&app.running, &d, rescan_after)?;
-    Ok(Json(json!({ "run_id": run })))
+    let l = launch_schedule(&app, d).await?;
+    // 前の回がまだ動いている・端末で開いているなどで動かさなかったら、画面に理由を出す
+    if let Some(why) = l.refused {
+        return Err(ApiError(StatusCode::CONFLICT, anyhow::anyhow!(why)));
+    }
+    Ok(Json(json!({ "run_id": l.run_id })))
 }
 
 /// 予定の登録で選ぶディレクトリの候補（このマシンのセッションがあったもの、多い順）
@@ -966,16 +1105,31 @@ async fn stats_handler(
     Query(r): Query<Range>,
 ) -> ApiResult<Json<Value>> {
     let conn = app.db.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let machines = parse_machines(r.machines.as_deref())?;
+    let machines = parse_list("machines", r.machines.as_deref())?;
+    let exclude = parse_list("exclude", r.exclude.as_deref())?.unwrap_or_default();
     let mut v = with_slots(
         &conn,
-        stats::stats(&conn, r.from / 1000, r.to / 1000, machines.as_deref())?,
+        stats::stats(
+            &conn,
+            r.from / 1000,
+            r.to / 1000,
+            machines.as_deref(),
+            &exclude,
+        )?,
     )?;
     // 同じ期間の残タスク（要約が途中か、残っていることが書かれていて、完了の印の無いもの）
-    let (todo, unsummarized) =
-        finished::todo(&conn, r.from / 1000, r.to / 1000, machines.as_deref())?;
+    let (todo, pending) = finished::todo(
+        &conn,
+        &finished::Query {
+            range: Some((r.from / 1000, r.to / 1000)),
+            machines: machines.as_deref(),
+            repo: None,
+            exclude: &exclude,
+        },
+    )?;
     v["todo"] = serde_json::to_value(todo)?;
-    v["unsummarized"] = unsummarized.into();
+    v["unsummarized"] = pending.len().into();
+    v["unsummarized_list"] = serde_json::to_value(pending)?;
     v["period_summary"] = serde_json::to_value(period::load(
         &conn,
         r.from / 1000,
@@ -1022,13 +1176,14 @@ async fn period_summary_handler(
     Ok(Json(json!({ "period_summary": s })))
 }
 
-fn parse_machines(s: Option<&str>) -> ApiResult<Option<Vec<String>>> {
+/// 問い合わせの JSON の配列（machines・exclude）を読む。無ければ None
+fn parse_list(name: &str, s: Option<&str>) -> ApiResult<Option<Vec<String>>> {
     s.map(serde_json::from_str::<Vec<String>>)
         .transpose()
         .map_err(|e| {
             ApiError(
                 StatusCode::BAD_REQUEST,
-                anyhow::anyhow!("machines must be a JSON array of strings: {e}"),
+                anyhow::anyhow!("{name} must be a JSON array of strings: {e}"),
             )
         })
 }
@@ -1121,6 +1276,23 @@ struct SendBody {
 /// 画像付きの指示の本文の上限（base64 で 4/3 倍になる分と、指示の文の分を見込む）
 const SEND_BODY_LIMIT: usize = send::MAX_IMAGES * send::MAX_IMAGE_BYTES * 4 / 3 + 1024 * 1024;
 
+/// フォルダの中の、older より前に書かれたファイルを消す（フォルダは残す）。戻り値は消した数
+fn clear_old_files(dir: &std::path::Path, older: Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter(|e| {
+            e.metadata()
+                .and_then(|m| m.modified())
+                .is_ok_and(|t| t.elapsed().is_ok_and(|a| a >= older))
+        })
+        .filter(|e| std::fs::remove_file(e.path()).is_ok())
+        .count()
+}
+
 /// Codex に渡す画像を一時的に置く場所（終わったら消す）
 fn uploads_dir() -> std::path::PathBuf {
     db::path()
@@ -1171,6 +1343,9 @@ fn session_dir(app: &App, id: &str) -> ApiResult<String> {
 struct ChangesQuery {
     /// あればそのコミットで変わったファイル。無ければまだ commit していない変更
     commit: Option<String>,
+    /// あればこのブランチ全体（そのブランチから分かれたところと、いまの作業コピーの差）
+    #[serde(default)]
+    base: Option<String>,
     /// 差分を見るファイル（/diff のとき）
     path: Option<String>,
 }
@@ -1183,12 +1358,10 @@ async fn changes_handler(
 ) -> ApiResult<Json<Value>> {
     let dir = session_dir(&app, &id)?;
     let d = dir.clone();
-    let files = tokio::task::spawn_blocking(move || match q.commit.as_deref() {
-        Some(h) => diff::commit_files(&d, h),
-        None => diff::working(&d),
-    })
-    .await?
-    .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
+    let against = diff::Against::from_query(q.commit.as_deref(), q.base.as_deref());
+    let files = tokio::task::spawn_blocking(move || diff::files(&d, &against))
+        .await?
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
     Ok(Json(json!({ "dir": dir, "files": files })))
 }
 
@@ -1205,10 +1378,12 @@ async fn diff_handler(
             anyhow::anyhow!("path is required"),
         ));
     };
-    let (patch, truncated) =
-        tokio::task::spawn_blocking(move || diff::patch(&dir, q.commit.as_deref(), &path))
-            .await?
-            .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
+    let (patch, truncated) = tokio::task::spawn_blocking(move || {
+        let against = diff::Against::from_query(q.commit.as_deref(), q.base.as_deref());
+        diff::patch(&dir, &against, &path)
+    })
+    .await?
+    .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
     Ok(Json(json!({ "patch": patch, "truncated": truncated })))
 }
 
@@ -1216,6 +1391,9 @@ async fn diff_handler(
 struct ImageQuery {
     /// あればそのコミット。無ければまだ commit していない変更
     commit: Option<String>,
+    /// あればこのブランチ全体
+    #[serde(default)]
+    base: Option<String>,
     path: String,
     side: diff::Side,
 }
@@ -1228,7 +1406,12 @@ async fn image_handler(
 ) -> ApiResult<Response> {
     let dir = session_dir(&app, &id)?;
     let found = tokio::task::spawn_blocking(move || {
-        diff::image(&dir, q.commit.as_deref(), &q.path, q.side)
+        diff::image(
+            &dir,
+            &diff::Against::from_query(q.commit.as_deref(), q.base.as_deref()),
+            &q.path,
+            q.side,
+        )
     })
     .await?
     .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
@@ -1277,6 +1460,8 @@ async fn stop_handler(
     State(app): State<Shared>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    // ほかの書き込みと同じく JSON の本文を必須にする（フォームからの送信を通さない）
+    Json(_): Json<Value>,
 ) -> ApiResult<Json<Value>> {
     same_origin(&headers)?;
     if !app.running.stop(&id) {
@@ -1355,17 +1540,42 @@ async fn repo_sessions_handler(
 #[derive(Deserialize)]
 struct SearchQuery {
     q: String,
+    /// claude / codex で絞る
+    #[serde(default)]
+    source: Option<String>,
+    /// 最後に動いた時刻（unix ms）の範囲
+    #[serde(default)]
+    from: Option<i64>,
+    #[serde(default)]
+    to: Option<i64>,
+    /// さらに読む: この時刻より前（同じ時刻なら before_id より前）
+    #[serde(default)]
+    before: Option<i64>,
+    #[serde(default)]
+    before_id: Option<String>,
 }
 
-/// ヘッダーの検索。続きをしたい会話を、リポジトリ・ブランチ・文章から探す（新しい順に 50 件まで）
+/// 1 回に返す件数
+const SEARCH_LIMIT: i64 = 50;
+
+/// ヘッダーの検索。続きをしたい会話を、リポジトリ・ブランチ・文章から探す（新しい順に 50 件ずつ）
 async fn search_handler(
     State(app): State<Shared>,
     Query(q): Query<SearchQuery>,
 ) -> ApiResult<Json<Value>> {
-    let conn = app.db.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(Json(
-        json!({ "sessions": search::sessions(&conn, &q.q, 50)? }),
-    ))
+    let filter = search::Filter {
+        source: q.source.filter(|s| !s.is_empty()),
+        from: q.from,
+        to: q.to,
+        before: q.before,
+        before_id: q.before_id,
+    };
+    let found = {
+        let conn = app.db.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+        search::sessions(&conn, &q.q, &filter, SEARCH_LIMIT)?
+    };
+    let more = found.len() as i64 == SEARCH_LIMIT;
+    Ok(Json(json!({ "sessions": found, "more": more })))
 }
 
 /// このマシンのセッションの作業場所。git は DB の口を放してから動かす。セッションが無ければ 404
@@ -1385,6 +1595,138 @@ async fn place_handler(
     Ok(Json(json!({ "place": session_place(&app, id).await? })))
 }
 
+/// 返事を待っているとみなす期間（これより前に止まったものは、もう待っていないとみなす）
+const WAITING_MS: i64 = 24 * 3600 * 1000;
+
+/// いま動いている実行（画面から送った指示・「ここで始める」・予定）と、許可の答えを待っている数、
+/// 動いている予定、エージェントの返答で止まって次の指示を待っているセッション（このマシンの直近 24 時間）
+async fn running_handler(State(app): State<Shared>) -> ApiResult<Json<Value>> {
+    let (runs, schedules) = app.running.overview();
+    let asks = app.running.waiting_asks();
+    let conn = app.db.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let ids: Vec<String> = runs.iter().filter_map(|r| r.session.clone()).collect();
+    let known = pins::brief(&conn, &ids)?;
+    let list: Vec<Value> = runs
+        .iter()
+        .map(|r| {
+            let info = r
+                .session
+                .as_ref()
+                .and_then(|id| known.iter().find(|k| k["id"] == id.as_str()))
+                .cloned()
+                .unwrap_or(Value::Null);
+            json!({
+                "key": r.key,
+                "session_id": r.session,
+                "session": info,
+                "asks": r.session.as_ref().and_then(|id| asks.get(id)).copied().unwrap_or(0),
+            })
+        })
+        .collect();
+    let names = schedule::list(&conn)?
+        .into_iter()
+        .filter(|p| schedules.contains(&p["id"].as_i64().unwrap_or(-1)))
+        .map(|p| json!({ "id": p["id"], "name": p["name"] }))
+        .collect::<Vec<_>>();
+    let now = chrono::Utc::now().timestamp_millis();
+    let waiting: Vec<Value> = pins::waiting(&conn, now - WAITING_MS)?
+        .into_iter()
+        .filter(|w| !ids.iter().any(|id| w["id"] == id.as_str()))
+        .collect();
+    Ok(Json(
+        json!({ "runs": list, "schedules": names, "waiting": waiting }),
+    ))
+}
+
+/// 裏の処理（読み直し・要約・別マシンの取り込み）の最後の結果
+async fn status_handler(State(app): State<Shared>) -> ApiResult<Json<Value>> {
+    let conn = app.db.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(Json(json!({ "jobs": status::all(&conn)? })))
+}
+
+#[derive(Deserialize)]
+struct TodoQuery {
+    #[serde(default)]
+    machines: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+    /// 出さないリポジトリ（絶対パスの JSON の配列）
+    #[serde(default)]
+    exclude: Option<String>,
+}
+
+/// 期間を問わない残タスク（集計の「すべての残タスク」）と、まだ要約していないセッション
+async fn todo_handler(
+    State(app): State<Shared>,
+    Query(q): Query<TodoQuery>,
+) -> ApiResult<Json<Value>> {
+    let machines = parse_list("machines", q.machines.as_deref())?;
+    let exclude = parse_list("exclude", q.exclude.as_deref())?.unwrap_or_default();
+    let conn = app.db.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (todo, pending) = finished::todo(
+        &conn,
+        &finished::Query {
+            range: None,
+            machines: machines.as_deref(),
+            repo: q.repo.as_deref().filter(|r| !r.is_empty()),
+            exclude: &exclude,
+        },
+    )?;
+    Ok(Json(json!({ "todo": todo, "unsummarized_list": pending })))
+}
+
+/// 利用枠（5 時間・週・モデルごと）の使い具合と戻る時刻。手元の記録と statusline が残した分から
+async fn limits_handler() -> ApiResult<Json<Value>> {
+    let v = tokio::task::spawn_blocking(|| {
+        limits::all(
+            &db::home(),
+            &limits::dir(),
+            chrono::Utc::now().timestamp_millis(),
+        )
+    })
+    .await?;
+    Ok(Json(v))
+}
+
+#[derive(Deserialize)]
+struct HistoryQuery {
+    #[serde(default)]
+    before: Option<i64>,
+    /// before と同じ時刻なら、この実行の id より前
+    #[serde(default)]
+    before_id: Option<i64>,
+}
+
+/// 予定の実行の履歴（50 件ずつ。before より前）と全期間の集計
+async fn schedule_history(
+    State(app): State<Shared>,
+    Path(id): Path<i64>,
+    Query(q): Query<HistoryQuery>,
+) -> ApiResult<Json<Value>> {
+    let conn = app.db.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let before = q.before.map(|t| (t, q.before_id.unwrap_or(i64::MAX)));
+    Ok(Json(schedule::history(&conn, id, before, 50)?))
+}
+
+/// 動いている予定を止める（その回の実行に「中断」を送る）。動いていなければ 409
+async fn stop_schedule(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(_): Json<Value>,
+) -> ApiResult<Json<Value>> {
+    same_origin(&headers)?;
+    // 動いている回は、予定の印（schedule:<id>）と止める合図を分け合っている。
+    // セッション ID で止めると、同じセッションに画面から送った指示まで止めてしまう
+    if !app.running.stop(&format!("schedule:{id}")) {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            anyhow::anyhow!("this schedule is not running"),
+        ));
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
 async fn pins_handler(State(app): State<Shared>) -> ApiResult<Json<Value>> {
     let conn = app.db.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(Json(json!({ "pins": pins::list(&conn)? })))
@@ -1396,6 +1738,8 @@ async fn summarize_handler(
     State(app): State<Shared>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    // ほかの書き込みと同じく JSON の本文を必須にする（フォームからの送信を通さない）
+    Json(_): Json<Value>,
 ) -> ApiResult<Json<Value>> {
     same_origin(&headers)?;
     let Some(o) = app.summary.clone() else {
@@ -1460,14 +1804,19 @@ async fn send_handler(
     };
     if source == "claude" {
         let sid = id.clone();
-        let open = tokio::task::spawn_blocking(move || {
-            resume::agents().map(|l| l.into_iter().any(|a| a.session_id == sid))
-        })
-        .await??;
-        if open {
-            return refuse(
-                "this session is open in a terminal or in the background; continue it there",
-            );
+        // 端末で開いているのに送ると、同じ記録に 2 か所から書く。確かめられないときも送らない（理由を出す）
+        match tokio::task::spawn_blocking(move || open_elsewhere(&sid)).await? {
+            Ok(false) => {}
+            Ok(true) => {
+                return refuse(
+                    "this session is open in a terminal or in the background; continue it there",
+                );
+            }
+            Err(e) => {
+                return refuse(&format!(
+                    "cannot check whether this session is open in a terminal ({e:#}); try again, or continue it there"
+                ));
+            }
         }
     }
     let checked =
@@ -1494,6 +1843,7 @@ async fn send_handler(
         timeout: send::TIMEOUT,
         cleanup,
         ask: true,
+        stop: None,
     };
     let rx =
         send::start(&app.running, job, after).map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
@@ -1547,24 +1897,38 @@ async fn repos_handler(
             .get(owner)
             .filter(|(at, _)| !q.refresh && at.elapsed() < GH_CACHE)
             .map(|(_, l)| l.clone());
-        let list = match cached {
-            Some(l) => Ok(l),
+        let (list, stale) = match cached {
+            Some(l) => (Ok(l), None),
             None => {
                 let (s, o) = (set.clone(), owner.clone());
                 let got = tokio::task::spawn_blocking(move || github::list(&s, &o)).await?;
-                if let Ok(l) = &got {
-                    app.gh_cache
-                        .lock()
-                        .map_err(|e| anyhow::anyhow!("{e}"))?
-                        .insert(owner.clone(), (std::time::Instant::now(), l.clone()));
+                let mut cache = app.gh_cache.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+                match got {
+                    Ok(l) => {
+                        cache.insert(owner.clone(), (std::time::Instant::now(), l.clone()));
+                        (Ok(l), None)
+                    }
+                    // 取り直せなければ、前に取れた一覧を古いと添えて出す（手元の clone で作業を続けられるように）
+                    Err(e) => match cache.get(owner) {
+                        Some((_, l)) => (Ok(l.clone()), Some(format!("{e:#}"))),
+                        None => (Err(e), None),
+                    },
                 }
-                got
             }
         };
-        groups.push((owner.clone(), list));
+        groups.push((owner.clone(), list, stale));
     }
     let roots = set.repo_roots.clone();
-    let locals = tokio::task::spawn_blocking(move || github::locals(&roots)).await?;
+    // 手元の clone ごとに、いま出ているブランチ
+    let (locals, current) = tokio::task::spawn_blocking(move || {
+        let locals = github::locals(&roots);
+        let current: HashMap<String, String> = locals
+            .iter()
+            .filter_map(|l| Some((l.path.clone(), place::current_branch(&l.path)?)))
+            .collect();
+        (locals, current)
+    })
+    .await?;
     // 手元のリポジトリごとの、セッションの数と最後に動いた時刻
     let mut worked: HashMap<String, (i64, i64)> = HashMap::new();
     {
@@ -1580,7 +1944,7 @@ async fn repos_handler(
     }
     let groups: Vec<Value> = groups
         .into_iter()
-        .map(|(owner, list)| match list {
+        .map(|(owner, list, stale)| match list {
             Ok(list) => {
                 let repos: Vec<Value> = list
                     .into_iter()
@@ -1595,13 +1959,14 @@ async fn repos_handler(
                             .and_then(|p| worked.get(p))
                             .map_or((0, None), |&(n, t)| (n, Some(t)));
                         let mut v = serde_json::to_value(&r).unwrap_or(Value::Null);
+                        v["current_branch"] = json!(local.as_ref().and_then(|p| current.get(p)));
                         v["local"] = json!(local);
                         v["sessions"] = json!(sessions);
                         v["last_ts"] = json!(last_ts);
                         v
                     })
                     .collect();
-                json!({ "owner": owner, "repos": repos })
+                json!({ "owner": owner, "repos": repos, "stale": stale })
             }
             Err(e) => json!({ "owner": owner, "error": format!("{e:#}"), "repos": [] }),
         })
@@ -1779,20 +2144,72 @@ async fn manage_handler(
 ) -> ApiResult<Json<Value>> {
     require_startable(&app, &q.dir)?;
     let dir = q.dir.clone();
-    let (worktrees, branches) = tokio::task::spawn_blocking(move || {
-        manage::branches(&dir).map(|b| (schedule::worktrees(&dir), b))
+    // 片付けの目安に、作業場所ごとの未コミットの変更の数と、既定のブランチに取り込み済みかを付ける
+    let (worktrees, branches, merged, base) = tokio::task::spawn_blocking(move || {
+        manage::branches(&dir).map(|b| {
+            let worktrees: Vec<_> = schedule::worktrees(&dir)
+                .into_iter()
+                .map(|w| {
+                    let changes = schedule::changes(&w.path);
+                    (w, changes)
+                })
+                .collect();
+            let base = github::default_branch(&dir);
+            // 手元の main は遅れていることがあるので origin の側と比べる
+            let merged = base
+                .as_deref()
+                .and_then(|b| manage::merged(&dir, &format!("origin/{b}")).ok())
+                .unwrap_or_default();
+            (worktrees, b, merged, base)
+        })
     })
     .await??;
     let mut list = Vec::new();
-    for w in worktrees {
+    for (w, changes) in worktrees {
+        let last = {
+            let conn = app.db.lock().map_err(|e| anyhow::anyhow!("{e}"))?;
+            last_session_in(&conn, &w.path)?
+        };
         list.push(json!({
             "schedule": used_by_schedule(&app, &w.path, &w.branch)?,
             "running": app.running.busy_in(&w.path),
+            "changes": changes,
+            "merged": merged.contains(&w.branch),
+            "last_session": last,
             "path": w.path,
             "branch": w.branch,
         }));
     }
-    Ok(Json(json!({ "worktrees": list, "branches": branches })))
+    let branches: Vec<Value> = branches
+        .into_iter()
+        .map(|b| {
+            let mut v = serde_json::to_value(&b).unwrap_or(Value::Null);
+            v["merged"] = merged.contains(&b.branch).into();
+            v
+        })
+        .collect();
+    Ok(Json(
+        json!({ "worktrees": list, "branches": branches, "base": base }),
+    ))
+}
+
+/// そのフォルダ（の中）で最後に動いたセッション（片付けのメニューから開けるように）
+fn last_session_in(conn: &Connection, dir: &str) -> Result<Value> {
+    Ok(conn
+        .query_row(
+            "SELECT id, last_ts FROM sessions WHERE machine = '' AND (cwd = ?1 OR cwd LIKE ?2 ESCAPE '\\')
+             ORDER BY last_ts DESC LIMIT 1",
+            rusqlite::params![
+                dir,
+                format!(
+                    "{}/%",
+                    dir.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+                )
+            ],
+            |r| Ok(json!({ "id": r.get::<_, String>(0)?, "last_ts": r.get::<_, i64>(1)? })),
+        )
+        .optional()?
+        .unwrap_or(Value::Null))
 }
 
 /// 手元のリポジトリを書き換える操作を 1 つ動かす。同じリポジトリでは同時に 1 つだけ。
@@ -1947,6 +2364,8 @@ async fn start_handler(
     // すでにある作業場所で始めるなら、そのリポジトリの作業場所として git が挙げるものだけを受ける
     // （画面から来たパスをそのまま使うと、どのフォルダでも始められてしまう）。
     // 作業場所を切るなら、先に作ってそこで始める。どこで始めたかを最初の 1 行で知らせる
+    // このために切った作業場所（起動できなかったら消す）
+    let mut created: Option<(String, String)> = None;
     let (cwd, first) = if let Some(p) = place {
         let line = json!({ "kind": "worktree", "path": p.path, "branch": p.branch });
         (p.path, Some(format!("{line}\n")))
@@ -1978,34 +2397,53 @@ async fn start_handler(
         .await?
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
         let line = json!({ "kind": "worktree", "path": path, "branch": branch, "base": base });
+        created = Some((path.clone(), branch));
         (path, Some(format!("{line}\n")))
     } else {
         (b.dir.clone(), None)
     };
     let (program, mut args) = send::command_new(&b.agent, b.mode, &model);
     // 画面から動かすので、許可の問い合わせは画面で受ける（Claude だけ）
-    let (stdin, cleanup) = send::attach(
+    let started = send::attach(
         &b.agent,
         &mut args,
         &prompt,
         (&b.images, &checked),
         &uploads_dir(),
         true,
-    )?;
-    let job = send::Job {
-        program: program.to_string(),
-        args,
-        source: b.agent.clone(),
-        // 同じフォルダで二重に押しても 1 つだけ
-        id: format!("new:{cwd}"),
-        cwd,
-        prompt: stdin,
-        timeout: send::TIMEOUT,
-        cleanup,
-        ask: true,
+    )
+    .and_then(|(stdin, cleanup)| {
+        let job = send::Job {
+            program: program.to_string(),
+            args,
+            source: b.agent.clone(),
+            // 同じフォルダで二重に押しても 1 つだけ
+            id: format!("new:{cwd}"),
+            cwd,
+            prompt: stdin,
+            timeout: send::TIMEOUT,
+            cleanup,
+            ask: true,
+            stop: None,
+        };
+        send::start(&app.running, job, rescan_after)
+    });
+    let rx = match started {
+        Ok(rx) => rx,
+        Err(e) => {
+            // 画像を置けなかった・起動できなかったら、このために切った作業場所とブランチは残さない
+            // （押し直すと同じ名前で断られる）
+            if let Some((path, branch)) = created {
+                let dir = b.dir.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    manage::remove_worktree(&dir, &path)
+                        .and_then(|()| manage::delete_branch(&dir, &branch, true))
+                })
+                .await;
+            }
+            return Err(ApiError(StatusCode::CONFLICT, e));
+        }
     };
-    let rx = send::start(&app.running, job, rescan_after)
-        .map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
     ndjson_after(first, rx)
 }
 
@@ -2016,7 +2454,7 @@ mod tests {
 
     fn seed(conn: &Connection, id: &str, repo: &str, bucket: i64, title: &str) {
         conn.execute(
-            "INSERT INTO sessions VALUES (?1, ?1, 0, 0, ?2, ?2, 'main', ?3, ?4, ?4, 'u', 1, 'claude', '')",
+            "INSERT INTO sessions VALUES (?1, ?1, 0, 0, ?2, ?2, 'main', ?3, ?4, ?4, 'u', 1, 'claude', '', 0)",
             params![id, repo, title, bucket * 1000],
         )
         .unwrap();
@@ -2117,13 +2555,138 @@ mod tests {
             .unwrap();
         let d = session_data(&conn, "a").unwrap().unwrap();
         assert_eq!(d["resume_command"], "cd /r/x && codex resume a");
+        assert_eq!(d["summary_failure"], Value::Null);
+    }
+
+    #[test]
+    fn clears_left_uploads() {
+        let dir = db::temp_dir("uploads-clear");
+        std::fs::write(dir.join("a.png"), "x").unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        // 書いたばかりのもの（ほかの agent-calendar が渡している最中かもしれない）は残す
+        assert_eq!(clear_old_files(&dir, Duration::from_secs(3600)), 0);
+        assert_eq!(clear_old_files(&dir, Duration::ZERO), 1);
+        assert!(dir.join("sub").is_dir());
+        assert_eq!(clear_old_files(&dir.join("none"), Duration::ZERO), 0);
+    }
+
+    #[test]
+    fn last_session_in_a_folder() {
+        let conn = db::open_at(&db::temp_dir("last-in").join("t.db")).unwrap();
+        seed(&conn, "a", "/r/app", 6000, "");
+        seed(&conn, "b", "/r/app", 6600, "");
+        seed(&conn, "c", "/r/app_x", 7200, "");
+        conn.execute("UPDATE sessions SET cwd = '/wt/f_1/web' WHERE id = 'b'", [])
+            .unwrap();
+        conn.execute("UPDATE sessions SET cwd = '/wt/f_12' WHERE id = 'c'", [])
+            .unwrap();
+        // 中のフォルダで動いたものも入る。名前の _ は 1 文字の当てはめにしない
+        assert_eq!(last_session_in(&conn, "/wt/f_1").unwrap()["id"], "b");
+        assert_eq!(last_session_in(&conn, "/wt/none").unwrap(), Value::Null);
+    }
+
+    #[tokio::test]
+    async fn overview_apis() {
+        let (app, _) = test_app("overview-apis");
+        let now = chrono::Utc::now().timestamp_millis();
+        {
+            let conn = app.db.lock().unwrap();
+            seed(&conn, "run", "/r/a", now / 1000, "動いている");
+            seed(&conn, "wait", "/r/a", now / 1000, "返事待ち");
+            conn.execute("UPDATE sessions SET waiting = 1, last_ts = ?1", [now])
+                .unwrap();
+            status::set(&conn, "scan", Some("could not read 1 files")).unwrap();
+        }
+        let _held = app.running.claim("run").unwrap();
+        let _sched = app.running.claim("schedule:99").unwrap();
+        let Json(v) = running_handler(State(app.clone())).await.unwrap();
+        assert_eq!(v["runs"][0]["session_id"], "run");
+        assert_eq!(v["runs"][0]["session"]["title"], "動いている");
+        assert_eq!(v["runs"][0]["asks"], 0);
+        // 動いているものは返事待ちに出さない。無い予定の番号は出さない
+        assert_eq!(v["waiting"].as_array().unwrap().len(), 1);
+        assert_eq!(v["waiting"][0]["id"], "wait");
+        assert_eq!(v["schedules"], json!([]));
+        let Json(v) = status_handler(State(app.clone())).await.unwrap();
+        assert_eq!(v["jobs"][0]["error"], "could not read 1 files");
+        let Json(v) = todo_handler(
+            State(app.clone()),
+            Query(TodoQuery {
+                machines: None,
+                repo: Some("/r/a".into()),
+                exclude: Some("[]".into()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v["unsummarized_list"].as_array().unwrap().len(), 2);
+        let Json(v) = schedule_history(
+            State(app.clone()),
+            Path(1),
+            Query(HistoryQuery {
+                before: None,
+                before_id: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(v["totals"]["runs"], 0);
+        // 動いている予定は止められる（予定の印に「中断」を送る）
+        let _new = app.running.claim("schedule:2").unwrap();
+        assert!(
+            stop_schedule(
+                State(app.clone()),
+                local_headers(),
+                Path(2),
+                Json(json!({}))
+            )
+            .await
+            .is_ok()
+        );
+        // 動いていない予定は止められない
+        let e = stop_schedule(
+            State(app.clone()),
+            local_headers(),
+            Path(1),
+            Json(json!({})),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.0, StatusCode::CONFLICT);
+        let Json(v) = limits_handler().await.unwrap();
+        assert_eq!(v["agents"].as_array().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn detail_says_where_a_continuation_runs() {
+        let (app, root) = test_app("detail-workdir");
+        let repo = root.join("agent-calendar").to_string_lossy().into_owned();
+        {
+            let conn = app.db.lock().unwrap();
+            seed(&conn, "w", &repo, 6000, "題");
+            conn.execute(
+                // Codex にしておく（claude agents を呼ばない）
+                "UPDATE sessions SET cwd = '/nonexistent/wt', source = 'codex' WHERE id = 'w'",
+                [],
+            )
+            .unwrap();
+        }
+        let res = session(State(app.clone()), Path("w".into())).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        // 作業場所（worktree）が消えているので本体で動く。コピーするコマンドも本体へ cd する
+        assert_eq!(v["workdir"]["path"], repo.as_str());
+        assert_eq!(v["workdir"]["gone"], true);
+        assert_eq!(v["resume_command"], format!("cd {repo} && codex resume w"));
     }
 
     #[test]
     fn stats_rows_carry_colors() {
         let conn = db::open_at(&db::temp_dir("slots").join("t.db")).unwrap();
         seed(&conn, "a", "/r/x", 6000, "");
-        let v = with_slots(&conn, stats::stats(&conn, 0, 100_000, None).unwrap()).unwrap();
+        let v = with_slots(&conn, stats::stats(&conn, 0, 100_000, None, &[]).unwrap()).unwrap();
         assert_eq!(v["projects"][0]["repos"][0]["slot"], 0);
     }
 
@@ -2146,13 +2709,15 @@ mod tests {
 
     #[test]
     fn machines_param() {
-        assert_eq!(parse_machines(None).ok().unwrap(), None);
+        assert_eq!(parse_list("machines", None).ok().unwrap(), None);
         assert_eq!(
-            parse_machines(Some(r#"["","ai-node"]"#)).ok().unwrap(),
+            parse_list("machines", Some(r#"["","ai-node"]"#))
+                .ok()
+                .unwrap(),
             Some(vec![String::new(), "ai-node".into()])
         );
         assert_eq!(
-            parse_machines(Some("ai-node")).err().unwrap().0,
+            parse_list("machines", Some("ai-node")).err().unwrap().0,
             StatusCode::BAD_REQUEST
         );
     }
@@ -2488,6 +3053,13 @@ mod tests {
         assert!(e.1.to_string().contains("running"), "{}", e.1);
         drop(running);
         assert!(!app.running.busy_in("/x/wt"));
+        // 中のフォルダで動いていても使っている。名前が続いているだけの別のフォルダは別
+        let inner = app.running.enter("/x/wt/web");
+        assert!(app.running.busy_in("/x/wt") && !app.running.busy_in("/x/w"));
+        assert!(!app.running.busy_in("") && !app.running.busy_in("/"));
+        let _sibling = app.running.enter("/x/wt2");
+        drop(inner);
+        assert!(!app.running.busy_in("/x/wt"));
         // 予定の作業場所は、その予定があるあいだだけ「使っている」
         let id = {
             let conn = app.db.lock().unwrap();
@@ -2504,6 +3076,7 @@ mod tests {
                     minute: 8 * 60,
                 },
                 enabled: true,
+                model: String::new(),
             };
             schedule::save(&conn, None, &input, chrono::Local::now()).unwrap()
         };
@@ -2607,8 +3180,19 @@ mod tests {
     async fn search_sessions() {
         let (app, _) = test_app("search-api");
         seed(&app.db.lock().unwrap(), "s1", "/r/a", 6000, "題");
-        let search =
-            |q: &str| search_handler(State(app.clone()), Query(SearchQuery { q: q.into() }));
+        let search = |q: &str| {
+            search_handler(
+                State(app.clone()),
+                Query(SearchQuery {
+                    q: q.into(),
+                    source: None,
+                    from: None,
+                    to: None,
+                    before: None,
+                    before_id: None,
+                }),
+            )
+        };
         let Json(v) = search("/r/a").await.unwrap();
         assert_eq!(v["sessions"][0]["id"], "s1");
         let Json(v) = search("nothing").await.unwrap();
@@ -2644,6 +3228,7 @@ mod tests {
         assert_eq!(status(), (json!(false), json!("wip")));
         let todo = || async {
             let q = |machines: Option<&str>| Range {
+                exclude: None,
                 from: 0,
                 to: 10_000_000,
                 machines: machines.map(String::from),
@@ -2705,6 +3290,7 @@ mod tests {
         );
         // 保存した要約は、同じ期間の集計と一緒に返す
         let q = |machines: Option<&str>| Range {
+            exclude: None,
             from: 0,
             to: 3_000_000,
             machines: machines.map(String::from),
@@ -2740,8 +3326,14 @@ mod tests {
     #[tokio::test]
     async fn stop_needs_a_running_instruction_and_the_same_origin() {
         let (app, _) = test_app("stop-api");
-        let stop =
-            |headers: HeaderMap| stop_handler(State(app.clone()), headers, Path("s1".into()));
+        let stop = |headers: HeaderMap| {
+            stop_handler(
+                State(app.clone()),
+                headers,
+                Path("s1".into()),
+                Json(json!({})),
+            )
+        };
         // 実行中でなければ断る
         assert_eq!(
             stop(local_headers()).await.unwrap_err().0,
@@ -2798,6 +3390,7 @@ mod tests {
         }
         let q = |commit: Option<&str>, path: Option<&str>| {
             Query(ChangesQuery {
+                base: None,
                 commit: commit.map(str::to_string),
                 path: path.map(str::to_string),
             })
@@ -2818,6 +3411,7 @@ mod tests {
         std::fs::write(repo.join("p.png"), b"png").unwrap();
         let img = |path: &str, side| {
             Query(ImageQuery {
+                base: None,
                 commit: None,
                 path: path.to_string(),
                 side,
@@ -2901,7 +3495,7 @@ mod tests {
             (Some(update::CURRENT), Some(false))
         );
         let refuse = |app: Shared| async move {
-            update_install_handler(State(app), local_headers())
+            update_install_handler(State(app), local_headers(), Json(json!({})))
                 .await
                 .unwrap_err()
                 .0
@@ -2920,18 +3514,40 @@ mod tests {
             (Some(true), Some("dev"))
         );
         assert_eq!(refuse(app.clone()).await, StatusCode::CONFLICT);
+        // 自動の入れ替えに失敗したら、設定の画面に理由が出る
+        auto_update_failed(&app, "999.0.0", &anyhow::anyhow!("disk full"));
+        let Json(v) = update_handler(State(app.clone())).await.unwrap();
+        assert_eq!(v["error"], "cannot update to 999.0.0: disk full");
+        assert_eq!(
+            app.update.lock().unwrap().failed.as_deref(),
+            Some("999.0.0")
+        );
+        // 始められなかっただけなら失敗として残さない
+        app.update.lock().unwrap().failed = None;
+        auto_update_failed(&app, "999.0.0", &UpdateBusy.into());
+        assert_eq!(app.update.lock().unwrap().failed, None);
+        assert!(UpdateBusy.to_string().contains("try again"));
         // 別のオリジンからは受けない
         let mut evil = local_headers();
         evil.insert("origin", "http://evil.example".parse().unwrap());
-        assert!(update_install_handler(State(app), evil).await.is_err());
+        assert!(
+            update_install_handler(State(app), evil, Json(json!({})))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
     async fn summarize_needs_summaries_on() {
         let (app, _) = test_app("summarize-off");
-        let e = summarize_handler(State(app), local_headers(), Path("s1".into()))
-            .await
-            .unwrap_err();
+        let e = summarize_handler(
+            State(app),
+            local_headers(),
+            Path("s1".into()),
+            Json(json!({})),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(e.0, StatusCode::CONFLICT);
     }
 
@@ -2992,13 +3608,29 @@ mod tests {
         let start = chrono::DateTime::parse_from_rfc3339("2026-10-01T11:00:00Z")
             .unwrap()
             .timestamp_millis();
-        let c = commits(&repo, start, start + 3_600_000);
-        assert_eq!(
-            c.iter()
-                .map(|c| c["subject"].as_str().unwrap())
-                .collect::<Vec<_>>(),
-            ["中"]
+        let subjects = |branch: Option<&str>| {
+            commits(&repo, branch, start, start + 3_600_000)
+                .iter()
+                .map(|c| c["subject"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(subjects(Some("")), ["中"]);
+        // 別のブランチ（並行する worktree など）のコミットは、作業場所のブランチからは拾わない
+        git(&[], &["branch", "side"]);
+        git(&[], &["checkout", "-q", "side"]);
+        git(
+            &at("2026-10-01T11:30:00Z"),
+            &["commit", "-q", "--allow-empty", "-m", "横"],
         );
-        assert!(commits("/nonexistent", 0, 1).is_empty());
+        git(&[], &["checkout", "-q", "-"]);
+        assert_eq!(subjects(Some("")), ["中"]);
+        // セッションが side で動いていたなら、いま別のブランチに出ていても side から辿る
+        assert_eq!(subjects(Some("side")), ["横", "中"]);
+        assert_eq!(subjects(Some("no-such")), ["中"]);
+        // 作業場所が消えてどのブランチか分からないときは全部から
+        assert_eq!(subjects(None), ["中", "横"]);
+        assert!(commits("/nonexistent", None, 0, 1).is_empty());
+        assert!(place::current_branch(&repo).is_some_and(|b| b != "side"));
+        assert_eq!(place::current_branch("/nonexistent"), None);
     }
 }

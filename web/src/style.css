@@ -55,3 +55,8 @@ button{cursor:pointer}
 .note .title{font-weight:500; color:var(--accent)}
 
 code,.code{font-family:"Roboto Mono","Noto Sans Mono CJK JP",monospace; font-size:12px; background:var(--hover); border-radius:4px; padding:1px 6px}
+
+/* いま動いているセッションの小さな印（▶）。許可を待っていれば「!」で赤く。色だけに頼らず、記号と title でも分かるように */
+.live{display:inline-flex; align-items:center; justify-content:center; flex:none; min-width:14px; height:14px; padding:0 2px; border-radius:7px;
+  background:var(--wip); color:#fff; font-size:8px; font-weight:700; line-height:1; font-style:normal; vertical-align:1px}
+.live.asks{background:var(--warn); font-size:10px}

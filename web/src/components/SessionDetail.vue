@@ -40,8 +40,9 @@ watch(
   () => props.active,
   (on) => on && load(props.id),
 )
-// App が読み直したら、表示中のものの完了の印と要約だけ取り直す（集計の画面で付け外ししたかもしれない）。
-// 全部を差し替えると、ここから送った指示の実行中に「別の所で実行中」として扱ってしまう
+// App が読み直したら、表示中のものの完了の印・要約・最後の記録の時刻・端末での実行中の印を取り直す
+// （集計の画面で付け外ししたかもしれない。端末で進めているセッションは、last_ts が変わると会話が読み直す）。
+// sending は差し替えない。全部を差し替えると、ここから送った指示の実行中に「別の所で実行中」として扱ってしまう
 watch(
   () => props.version,
   async () => {
@@ -49,7 +50,7 @@ watch(
     if (!props.active || !s.value) return
     try {
       const r = await getSession(id)
-      if (id === props.id && s.value) Object.assign(s.value, { finished: r.finished, summary: r.summary })
+      if (id === props.id && s.value) Object.assign(s.value, { finished: r.finished, summary: r.summary, summary_failure: r.summary_failure, last_ts: r.last_ts, running: r.running })
     } catch {
       // 取り直せなくても前の表示のままでよい
     }
@@ -67,6 +68,7 @@ const when = computed(() => {
   const fmt = new Intl.DateTimeFormat(locale(), { month: 'short', day: 'numeric', weekday: 'short', hour: 'numeric', minute: '2-digit' })
   return fmt.formatRange(new Date(s.value.first_ts), new Date(s.value.last_ts))
 })
+const stamp = (ms) => new Date(ms).toLocaleString(locale(), { month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit' })
 const clock = (ms) => new Date(ms).toLocaleTimeString(locale(), { hour: 'numeric', minute: '2-digit' })
 
 const costRows = computed(() =>
@@ -175,11 +177,19 @@ async function copy() {
   }
 }
 
+// 概要のコミットを押したら、そのコミットを選んだ状態で「変更」を開く（変更のタブで選び直したものも覚えておく）
+const commit = ref('')
+function openCommit(hash) {
+  commit.value = hash
+  tab.value = 'changes'
+}
+
 // 選び直したら前のセッションの再開結果・コピー済みの表示を消す（ref の宣言より後に置く）
 watch(
   () => props.id,
   (id) => {
     s.value = null
+    commit.value = ''
     error.value = ''
     resume.value = null
     copied.value = false
@@ -299,10 +309,12 @@ watch(
         </button>
       </nav>
 
-      <Changes v-if="tab === 'changes' && !s.machine" :id="s.id" :commits="s.commits" :github="s.github" class="conv" />
+      <Changes v-if="tab === 'changes' && !s.machine" :id="s.id" v-model:commit="commit" :commits="s.commits" :github="s.github" class="conv" />
       <Conversation
         v-else-if="tab === 'conversation'"
         :id="s.id"
+        :active="active"
+        :workdir="s.workdir ?? null"
         :blocked="blocked"
         :remote="!!s.machine"
         :following="!!s.sending"
@@ -315,7 +327,8 @@ watch(
         {{ t('detail.summary') }}
         <span v-if="status" class="chip" :class="status" :title="s.finished ? t('detail.markedDone') : null">{{ t(`status.${status}`) }}</span>
         <span class="spacer" />
-        <button v-if="s.finished || status === 'wip' || s.summary?.next" class="btn small" @click="toggleFinished">
+        <!-- 要約が無くても（要約を切って動かしていても）完了にできる。印はこのマシンの記録に持つので、別のマシンのセッションにも付けられる -->
+        <button class="btn small" @click="toggleFinished">
           {{ s.finished ? t('detail.unmarkDone') : t('detail.markDone') }}
         </button>
         <button class="btn small" :disabled="summarizingId !== null" @click="doSummarize">
@@ -323,6 +336,10 @@ watch(
         </button>
       </h3>
       <p v-if="summaryError" class="chip warn">{{ summaryError }}</p>
+      <!-- 裏の要約が失敗している（要約が前にできていても、作り直しで失敗していれば出す） -->
+      <p v-if="s.summary_failure" class="failure" :title="stamp(s.summary_failure.failed_at)">
+        {{ t('detail.summaryFailed', { n: s.summary_failure.attempts, e: s.summary_failure.error }) }}
+      </p>
       <template v-if="s.summary">
         <ul class="bullets">
           <li v-for="(b, i) in s.summary.bullets" :key="i">{{ b }}</li>
@@ -361,7 +378,9 @@ watch(
 
       <h3 class="section-title">{{ t('detail.commits', { n: s.commits.length }) }}</h3>
       <ul v-if="s.commits.length" class="commits">
-        <li v-for="c in s.commits" :key="c.hash"><code>{{ c.hash }}</code> {{ c.subject }}</li>
+        <li v-for="c in s.commits" :key="c.hash">
+          <button class="commit" :title="t('detail.openCommit')" @click="openCommit(c.hash)"><code>{{ c.hash }}</code> {{ c.subject }}</button>
+        </li>
       </ul>
       <p v-else-if="s.machine" class="muted small">{{ t('detail.remoteCommits') }}</p>
       <p v-else class="muted small">{{ t('detail.noCommits') }}</p>
@@ -438,8 +457,12 @@ h2{font-size:22px; font-weight:400; line-height:1.35; margin:0; color:var(--ink)
 .bullets li{margin:4px 0}
 .totalrow td{border-top:1px solid var(--rule)}
 .warn{color:var(--warn)}
+.failure{margin:0 0 10px; color:var(--warn); font-size:13px; white-space:pre-wrap; word-break:break-word}
 .commits{list-style:none; padding:0; margin:0}
 .commits li{margin:4px 0}
+.commit{border:0; background:none; padding:2px 6px; margin:0 -6px; border-radius:6px; font:inherit; color:inherit; text-align:left; cursor:pointer}
+.commit:hover{background:var(--hover)}
+.commit:hover code{color:var(--accent)}
 .prompts{list-style:none; padding:0; margin:0}
 .prompts li{display:grid; grid-template-columns:64px 1fr; gap:8px; padding:6px 0; border-top:1px solid var(--rule-soft)}
 .prompts li:first-child{border-top:0}

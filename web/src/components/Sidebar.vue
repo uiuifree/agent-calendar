@@ -19,10 +19,12 @@ const props = defineProps({
   hosts: { type: Array, default: null }, // 選んだホストの id。null = すべて
   repos: { type: Array, required: true }, // [{ repo, name, slot, count }]（多い順）
   hostCounts: { type: Object, default: () => ({}) }, // ホスト id → 表示中の期間の件数
+  hostErrors: { type: Object, default: () => ({}) }, // ホスト id → 取り込みに失敗している理由
   hiddenRepos: { type: Array, required: true },
   pins: { type: Array, default: () => [] }, // ピン留めしたセッション（最近動いた順）
   selectedId: { type: String, default: null },
-  page: { type: String, default: 'calendar' }, // いまの画面（calendar / stats / plans / repos）
+  marks: { type: Object, default: () => ({}) }, // セッション id → { asks }（いま動いているもの）
+  page: { type: String, default: 'calendar' }, // いまの画面（calendar / stats / plans / repos / limits）
 })
 const emit = defineEmits(['pick', 'update:hosts', 'update:hiddenRepos', 'more', 'create', 'select', 'go'])
 
@@ -32,6 +34,7 @@ const PAGES = [
   { id: 'stats', icon: '◔', key: 's' },
   { id: 'plans', icon: '⏱', key: 'a' },
   { id: 'repos', icon: '⑂', key: 'r' },
+  { id: 'limits', icon: '◑', key: 'l' },
 ]
 
 // 小さな月のカレンダー。表示中の週に合わせて月を動かし、矢印でも動かせる
@@ -67,13 +70,18 @@ const rangeLabel = computed(() => {
   if (b - a <= DAY_MS) return new Date(a).toLocaleDateString(locale(), { month: 'short', day: 'numeric', weekday: 'short' })
   return new Intl.DateTimeFormat(locale(), { month: 'short', day: 'numeric' }).formatRange(new Date(a), new Date(b - 1))
 })
+// 範囲を続けて送ったときなど、前の問い合わせの答えが後から届いても、最新の問い合わせの答えだけを使う。
+// チェックを外したリポジトリは、カレンダーと同じく集計からも外す
+let insightSeq = 0
 watch(
-  [() => props.insightRange, () => props.version, () => props.hosts],
+  [() => props.insightRange, () => props.version, () => props.hosts, () => props.hiddenRepos],
   async () => {
+    const mine = ++insightSeq
     try {
-      insights.value = await getStats(...props.insightRange, props.hosts)
+      const r = await getStats(...props.insightRange, props.hosts, props.hiddenRepos)
+      if (mine === insightSeq) insights.value = r
     } catch {
-      insights.value = null
+      if (mine === insightSeq) insights.value = null
     }
   },
   { immediate: true, deep: true },
@@ -121,7 +129,10 @@ const toggleRepo = (repo) =>
     <section v-if="pins.length" class="pins">
       <h3>{{ t('sidebar.pinned') }}</h3>
       <button v-for="p in pins" :key="p.id" class="pin" :class="{ selected: p.id === selectedId }" @click="emit('select', p.id)">
-        <span class="pin-title">{{ p.title || t('untitled') }}</span>
+        <span class="pin-title">
+          <span v-if="marks[p.id]" class="live" :class="{ asks: marks[p.id].asks }" :title="marks[p.id].asks ? t('running.markAsks') : t('running.mark')">{{ marks[p.id].asks ? '!' : '▶' }}</span>
+          {{ p.title || t('untitled') }}
+        </span>
         <span class="pin-meta muted">
           {{ repoName(p.repo) }} · <span class="num">{{ ago(p.last_ts) }}</span>
           <span v-if="p.status" class="chip" :class="p.status">{{ t(`status.${p.status}`) }}</span>
@@ -155,7 +166,7 @@ const toggleRepo = (repo) =>
       <div class="muted small">{{ rangeLabel }}</div>
       <template v-if="insights">
         <div class="total">
-          {{ t('stats.activeTime') }} <b class="num">{{ fmtHours(insights.total.secs) }}</b> · <span class="num">{{ fmtUsd(insights.total.usd) }}</span>
+          {{ t('stats.activeTime') }} <b class="num">{{ fmtHours(insights.total.secs) }}</b> · <span class="num" :title="insights.total.unpriced ? t('unpricedHint') : null">{{ fmtUsd(insights.total.usd) }}{{ insights.total.unpriced ? '+' : '' }}</span>
         </div>
         <div class="bar" aria-hidden="true">
           <i v-for="b in bars" :key="b.key" :style="{ width: `${b.pct}%`, background: b.color }" :title="b.name" />
@@ -169,6 +180,7 @@ const toggleRepo = (repo) =>
       <label v-for="m in machines" :key="m.id" class="check">
         <input type="checkbox" :checked="hostOn(m.id)" @change="toggleHost(m.id)" />
         <span class="name">{{ m.label }}</span>
+        <span v-if="hostErrors[m.id]" class="host-warn" :title="t('jobs.hostFailed', { e: hostErrors[m.id] })" :aria-label="t('jobs.hostFailed', { e: hostErrors[m.id] })">⚠</span>
         <span class="muted num">{{ hostCounts[m.id] ?? 0 }}</span>
       </label>
     </section>
@@ -229,4 +241,5 @@ h3{font-size:14px; font-weight:500; margin:0 0 8px; color:var(--ink)}
 .check input{width:18px; height:18px; margin:0; accent-color:var(--accent)}
 .check .name{flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
 .check .muted{font-size:12px}
+.host-warn{color:var(--warn); font-size:13px}
 </style>

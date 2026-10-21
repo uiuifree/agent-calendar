@@ -7,6 +7,7 @@ defineProps({
   tabs: { type: Array, required: true }, // [{ id, kept, tab }]
   active: { type: String, default: null },
   titles: { type: Object, required: true }, // id → 題（読み込めたものだけ）
+  marks: { type: Object, default: () => ({}) }, // id → { asks }（いま動いているもの）
 })
 const emit = defineEmits(['select', 'keep', 'close'])
 </script>
@@ -15,6 +16,7 @@ const emit = defineEmits(['select', 'keep', 'close'])
   <nav class="strip" role="tablist" :aria-label="t('tabs.label')">
     <div v-for="x in tabs" :key="x.id" class="tab" :class="{ on: x.id === active, kept: x.kept }">
       <button class="name" role="tab" :aria-selected="x.id === active" :title="titles[x.id]" @click="emit('select', x.id)">
+        <span v-if="marks[x.id]" class="live" :class="{ asks: marks[x.id].asks }" :title="marks[x.id].asks ? t('running.markAsks') : t('running.mark')">{{ marks[x.id].asks ? '!' : '▶' }}</span>
         {{ titles[x.id] === undefined ? '…' : titles[x.id] || t('untitled') }}
       </button>
       <button

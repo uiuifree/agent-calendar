@@ -1,5 +1,5 @@
 import { expect, it } from 'vitest'
-import { isImage, lineKind, patchRows, splitPath } from './diffview.js'
+import { defaultBase, isImage, lineKind, patchRows, splitPath } from './diffview.js'
 
 it('差分の行を分ける（見出しより前はファイルの情報）', () => {
   expect(lineKind('diff --git a/a b/a', true)).toBe('meta')
@@ -49,4 +49,15 @@ it('パスを分ける', () => {
 it('前と後を並べる画像か', () => {
   expect(['a.png', 'docs/b.JPG', 'c.jpeg', 'd.gif', 'e.webp'].every(isImage)).toBe(true)
   expect(['f.svg', 'g.png.txt', 'png'].some(isImage)).toBe(false)
+})
+
+it('このブランチ全体で比べる相手の既定', () => {
+  expect(defaultBase(['origin/dev', 'origin/master', 'origin/main'])).toBe('origin/main')
+  expect(defaultBase(['main', 'origin/master'])).toBe('origin/master')
+  expect(defaultBase(['origin/dev', 'main'])).toBe('origin/dev')
+  expect(defaultBase([])).toBe(null)
+  // origin の既定のブランチが一覧にあればそれを先に選ぶ。無ければ今の順
+  expect(defaultBase(['origin/main', 'origin/develop'], 'develop')).toBe('origin/develop')
+  expect(defaultBase(['origin/dev', 'origin/main'], 'develop')).toBe('origin/main')
+  expect(defaultBase(['origin/dev', 'origin/main'], null)).toBe('origin/main')
 })

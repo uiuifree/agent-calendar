@@ -13,6 +13,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "getrandom 0.4.3",
+ "libc",
  "mime_guess",
  "rcgen",
  "reqwest",

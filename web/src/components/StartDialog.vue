@@ -16,9 +16,15 @@ const props = defineProps({
   // （どこで始めるかはサーバーが記録から決める）
   fromSession: { type: String, default: '' },
   recordedBranch: { type: String, default: '' }, // そのセッションの記録にあるブランチ（いまのブランチと違えば知らせる）
+  hidden: { type: Boolean, default: false }, // 親が隠している（会話の画面へ移ったか、実行中に閉じた）
 })
-const emit = defineEmits(['close', 'opened', 'ran', 'failed'])
-useEscape(() => emit('close'))
+const emit = defineEmits(['close', 'hide', 'opened', 'ran', 'failed'])
+// 実行中に閉じたら（閉じるボタン・Esc・背景）、外さずに隠すだけにしてもらう。外すと実行は続くのに、
+// セッションの ID が届いても会話が開かず、終わりの失敗も届かなくなる
+function close() {
+  emit(running.value ? 'hide' : 'close')
+}
+useEscape(close)
 
 const agent = ref('claude')
 const mode = rememberedMode() // 許可の範囲。既定は自動判定で、前回選んだものを覚えている
@@ -134,9 +140,9 @@ async function run() {
   } finally {
     running.value = false
     finished.value = true
-    // 会話の画面へ移ったあと（ダイアログは隠れている）に失敗したら、理由を親に渡して見えるところに出す
+    // 隠れているあいだ（会話の画面へ移ったか、実行中に閉じた）に失敗したら、理由を親に渡して見えるところに出す
     const end = live.value.at(-1)
-    if (sessionId.value && end?.kind === 'done' && !end.ok && !end.stopped) emit('failed', end.text ?? '')
+    if (props.hidden && end?.kind === 'done' && !end.ok && !end.stopped) emit('failed', end.text ?? '')
     emit('ran')
   }
 }
@@ -150,7 +156,7 @@ function onKey(e) {
 </script>
 
 <template>
-  <div class="backdrop" @click.self="emit('close')">
+  <div class="backdrop" @click.self="close">
     <div class="dialog" role="dialog" aria-modal="true" :aria-label="t('repos.startTitle', { name: repo.name })" :lang="locale()" @dragover.prevent @drop.prevent="addImages($event.dataTransfer?.files ?? [])">
       <h2>{{ t('repos.startTitle', { name: repo.name }) }}</h2>
       <p v-if="!fromSession" class="muted small"><code>{{ repo.local }}</code></p>
@@ -233,7 +239,7 @@ function onKey(e) {
       </div>
 
       <div class="actions">
-        <button class="btn" @click="emit('close')">{{ t('repos.close') }}</button>
+        <button class="btn" @click="close">{{ t('repos.close') }}</button>
         <button class="btn primary" :disabled="!canRun" @click="run">{{ running ? t('repos.running') : t('repos.run') }}</button>
       </div>
     </div>

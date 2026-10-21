@@ -99,20 +99,34 @@ pub fn list(conn: &Connection) -> Result<Vec<Remote>> {
 
 /// 取ってきた記録と集計は消さない（日誌には残す）。以後取りに行かなくなるだけ
 pub fn remove(conn: &Connection, name: &str) -> Result<bool> {
+    conn.execute(
+        "DELETE FROM job_status WHERE name IN (?1, ?2)",
+        [format!("remote:{name}"), format!("scan:{name}")],
+    )?;
     Ok(conn.execute("DELETE FROM remotes WHERE name = ?1", [name])? > 0)
 }
 
 /// 取り込みは同時に 1 つだけ（自動更新と「読み直す」が重なると、同じ差分を二重に足してしまう）
 static PULLING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// 登録した全部のマシンから取ってくる。1 台つながらなくても他は続ける
+/// 登録した全部のマシンから取ってくる。1 台つながらなくても他は続ける。
+/// 結果はマシンごとに `job_status` の remote:<名前> に残す（画面のホストの一覧に出す）
 pub fn pull_all(conn: &Connection) -> Result<()> {
     let _one_at_a_time = PULLING.lock().unwrap_or_else(|e| e.into_inner());
     for r in list(conn)? {
-        match r.pull() {
-            Ok(n) => println!("[remote] {}: updated {n} transcripts", r.name),
-            Err(e) => eprintln!("[remote] {}: failed: {e:#}", r.name),
+        let error = match r.pull() {
+            Ok((n, failed)) => {
+                println!("[remote] {}: updated {n} transcripts", r.name);
+                failed
+                    .first()
+                    .map(|first| format!("could not fetch {} transcripts: {first}", failed.len()))
+            }
+            Err(e) => Some(format!("{e:#}")),
+        };
+        if let Some(e) = &error {
+            eprintln!("[remote] {}: failed: {e}", r.name);
         }
+        crate::status::set(conn, &format!("remote:{}", r.name), error.as_deref())?;
     }
     Ok(())
 }
@@ -165,64 +179,84 @@ impl Remote {
     }
 
     /// 変わった記録だけ取る。後ろに足されただけなら足された分だけ、縮んだ・書き直されたなら丸ごと。
-    /// 戻り値は取り直したファイルの数
-    pub fn pull(&self) -> Result<usize> {
+    /// 戻り値は取り直したファイルの数と、取れなかったファイルの理由（1 つ取れなくても残りは取る）
+    pub fn pull(&self) -> Result<(usize, Vec<String>)> {
         self.pull_into(&self.dir())
     }
 
-    fn pull_into(&self, dir: &Path) -> Result<usize> {
+    fn pull_into(&self, dir: &Path) -> Result<(usize, Vec<String>)> {
         let client = self.client()?;
         // 取り込んだ記録には依頼文がそのまま入るので、本人だけが入れるようにする
         private_dir(dir)?;
-        let mut n = 0;
+        let (mut n, mut failed) = (0, Vec::new());
         for e in self.list_files()? {
-            // 相手が返すパスも信用しない（claude/・codex/ の下の .jsonl だけ書く）
-            let Some(local) = local_path(dir, &e.path) else {
-                continue;
-            };
-            let meta = std::fs::metadata(&local).ok();
-            let have = meta.as_ref().map_or(0, |m| m.len());
-            // 大きさも更新時刻も同じなら変わっていない。時刻だけ違えば書き直されたので丸ごと取る
-            if have == e.size && meta.as_ref().map(share::mtime_ms) == Some(e.mtime) {
-                continue;
+            match self.pull_one(&client, dir, &e) {
+                Ok(true) => n += 1,
+                Ok(false) => {}
+                Err(err) => {
+                    failed.push(format!("{}: {err:#}", e.path));
+                    // つながらなくなったら残りも取れない（1 つずつ時間切れを待たない）
+                    if lost_connection(&err) {
+                        break;
+                    }
+                }
             }
-            let have = if have == e.size { 0 } else { have };
-            let (offset, prefix) = if have > 0 && have < e.size {
-                (have, share::sha256_hex(&std::fs::read(&local)?))
-            } else {
-                (0, String::new())
-            };
-            let fetch = |offset: u64, prefix: &str| {
-                client
-                    .get(format!("{}/file", self.url))
-                    .bearer_auth(&self.token)
-                    .query(&[
-                        ("path", e.path.as_str()),
-                        ("offset", &offset.to_string()),
-                        ("prefix", prefix),
-                    ])
-                    .send()
-            };
-            let mut res = fetch(offset, &prefix)?;
-            let mut append = offset > 0;
-            if res.status() == reqwest::StatusCode::CONFLICT {
-                res = fetch(0, "")?;
-                append = false;
-            }
-            if !res.status().is_success() {
-                eprintln!(
-                    "[remote] {}: {} answered {}",
-                    self.name,
-                    e.path,
-                    res.status()
-                );
-                continue;
-            }
-            write(&local, &res.bytes()?, append, e.mtime)?;
-            n += 1;
         }
-        Ok(n)
+        Ok((n, failed))
     }
+
+    /// 1 ファイル取る。変わっていなければ false
+    fn pull_one(&self, client: &reqwest::blocking::Client, dir: &Path, e: &Entry) -> Result<bool> {
+        // 相手が返すパスも信用しない（claude/・codex/ の下の .jsonl だけ書く）
+        let Some(local) = local_path(dir, &e.path) else {
+            return Ok(false);
+        };
+        let meta = std::fs::metadata(&local).ok();
+        let have = meta.as_ref().map_or(0, |m| m.len());
+        // 大きさも更新時刻も同じなら変わっていない。時刻だけ違えば書き直されたので丸ごと取る
+        if have == e.size && meta.as_ref().map(share::mtime_ms) == Some(e.mtime) {
+            return Ok(false);
+        }
+        let have = if have == e.size { 0 } else { have };
+        let (offset, prefix) = if have > 0 && have < e.size {
+            (
+                have,
+                share::sha256_prefix(&mut std::fs::File::open(&local)?, have)?,
+            )
+        } else {
+            (0, String::new())
+        };
+        let fetch = |offset: u64, prefix: &str| {
+            client
+                .get(format!("{}/file", self.url))
+                .bearer_auth(&self.token)
+                .query(&[
+                    ("path", e.path.as_str()),
+                    ("offset", &offset.to_string()),
+                    ("prefix", prefix),
+                ])
+                .send()
+        };
+        let mut res = fetch(offset, &prefix)?;
+        let mut append = offset > 0;
+        if res.status() == reqwest::StatusCode::CONFLICT {
+            res = fetch(0, "")?;
+            append = false;
+        }
+        if !res.status().is_success() {
+            bail!("answered {}", res.status());
+        }
+        write(&local, &res.bytes()?, append, e.mtime)?;
+        Ok(true)
+    }
+}
+
+/// 相手につながらなくなった（時間切れ・接続できない）失敗か。応答の中身の失敗や手元に書けない失敗とは分ける
+fn lost_connection(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<reqwest::Error>()
+            .is_some_and(|r| r.is_timeout() || r.is_connect())
+    })
 }
 
 fn local_path(dir: &Path, path: &str) -> Option<PathBuf> {
@@ -392,6 +426,28 @@ mod tests {
     }
 
     #[test]
+    fn tells_lost_connections_apart() {
+        // 何も待ち受けていないポート（空いているポートを取ってすぐ閉じる）にはつながらない
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let refused = client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .send()
+            .unwrap_err();
+        assert!(lost_connection(
+            &anyhow::Error::from(refused).context("fetching")
+        ));
+        assert!(!lost_connection(&anyhow::anyhow!("answered 500")));
+    }
+
+    #[test]
     fn stores_and_removes_remotes() {
         let conn = db::open_at(&db::temp_dir("remotes").join("t.db")).unwrap();
         conn.execute(
@@ -403,8 +459,11 @@ mod tests {
         assert_eq!(v[0].name, "ai-node");
         assert!(v[0].claude_dir().ends_with("remotes/ai-node/claude"));
         assert!(v[0].codex_dir().ends_with("remotes/ai-node/codex"));
+        crate::status::set(&conn, "remote:ai-node", Some("down")).unwrap();
         assert!(remove(&conn, "ai-node").unwrap());
         assert!(!remove(&conn, "ai-node").unwrap());
+        // 消したマシンの状態も残さない
+        assert!(crate::status::all(&conn).unwrap().is_empty());
     }
 
     /// 本物の share をこのプロセスで立て、指紋が合えば取れ、合わなければ断られることを確かめる
@@ -432,7 +491,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap(),
-            1
+            (1, vec![])
         );
         assert_eq!(std::fs::read(&dest).unwrap(), b"line1\n");
         // 足された分だけ取る
@@ -446,7 +505,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap(),
-            1
+            (1, vec![])
         );
         assert_eq!(std::fs::read(&dest).unwrap(), b"line1\nline2\n");
         // 書き直されて長くなった（先頭が違う）ら丸ごと取り直す
@@ -460,7 +519,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap(),
-            1
+            (1, vec![])
         );
         assert_eq!(std::fs::read(&dest).unwrap(), b"LINE1\nline2\nline3\n");
         // 縮んだら丸ごと
@@ -474,7 +533,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap(),
-            1
+            (1, vec![])
         );
         assert_eq!(std::fs::read(&dest).unwrap(), b"x\n");
         // 同じ大きさで書き直されたら（時刻が変わる）丸ごと取り直す
@@ -492,7 +551,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap(),
-            1
+            (1, vec![])
         );
         assert_eq!(std::fs::read(&dest).unwrap(), b"y\n");
         {
@@ -512,7 +571,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap(),
-            0
+            (0, vec![])
         );
         // 指紋が違えば断られる・トークンが違えば断られる
         let bad_fp = Remote {

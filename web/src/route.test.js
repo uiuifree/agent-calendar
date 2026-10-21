@@ -11,6 +11,7 @@ describe('URL と表示', () => {
     expect(parseRoute('/', '?session=a&tab=x')).toMatchObject({ tab: 'summary' })
     expect(parseRoute('/stats').view).toBe('stats')
     expect(parseRoute('/schedules').view).toBe('plans')
+    expect(parseRoute('/limits')).toMatchObject({ view: 'limits', owner: null })
     expect(parseRoute('/repos/my-org')).toMatchObject({ view: 'repos', owner: 'my-org', session: null })
     expect(parseRoute('/repos')).toMatchObject({ view: 'repos', owner: null, session: null })
     // 知らない URL（前の版の /week/… など）はカレンダー
@@ -25,6 +26,7 @@ describe('URL と表示', () => {
     expect(formatRoute({ view: 'week', tab: 'changes', full: true })).toBe('/')
     expect(formatRoute({ view: 'stats' })).toBe('/stats')
     expect(formatRoute({ view: 'plans' })).toBe('/schedules')
+    expect(formatRoute({ view: 'limits', session: 's' })).toBe('/limits?session=s')
     expect(formatRoute({ view: 'repos', owner: 'uiuifree' })).toBe('/repos/uiuifree')
     expect(formatRoute({ view: 'repos', owner: null })).toBe('/repos')
   })
