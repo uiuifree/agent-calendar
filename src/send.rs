@@ -1310,22 +1310,30 @@ mod tests {
         assert!(running.stop("p2"));
         collect(rx).await;
         let pid = std::fs::read_to_string(&pidfile).unwrap();
-        // シグナル 0 で確かめる（Linux 以外でも同じ）。止めた直後の回収待ち（Z）は止まったとみなす
+        // シグナル 0 で確かめる。Linux では /proc も見て、記録が消えた・回収待ち（Z）なら止まったとみなす
+        // （シグナルが届いた直後に記録が消えることがあり、シグナルだけでは「生きている」と誤ることがある）
         let pid: libc::pid_t = pid.trim().parse().unwrap();
-        let alive = || {
+        // 止まったかは 1 回の見た結果で決める（見直すと、そのあいだに番号が別のプロセス・スレッドに
+        // 使い回されて「生きている」に戻ることがある）。Linux では /proc も見て、sleep のままで回収待ち（Z）でなければ動いている
+        let running_sleep = || {
             // SAFETY: シグナル 0 は届くかを確かめるだけ
             let exists = unsafe { libc::kill(pid, 0) } == 0;
+            if !cfg!(target_os = "linux") {
+                return exists;
+            }
             exists
-                && !std::fs::read_to_string(format!("/proc/{pid}/stat"))
-                    .is_ok_and(|st| st.contains(") Z "))
+                && std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .is_ok_and(|st| st.contains("(sleep) ") && !st.contains(") Z "))
         };
-        for _ in 0..100 {
-            if !alive() {
+        let mut stopped = false;
+        for _ in 0..250 {
+            if !running_sleep() {
+                stopped = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(!alive());
+        assert!(stopped, "the child {pid} is still running");
         // 新しく始めたセッションは、分かった ID でも止められる
         let script = fake(
             &dir,
