@@ -97,13 +97,14 @@ pub fn check() -> Result<Latest> {
     parse_release(&v, target()).context("the latest release has no version")
 }
 
-/// 開発中のビルド（cargo の target/ の下の release / debug。テストの本体がある deps も含む）か。
-/// 入れ替えると開発の作業を上書きするので触らない
+/// ソースからビルドしたものか（cargo の target/ の下の release / debug。テストの本体がある deps も含む。
+/// `cargo install` で入れた ~/.cargo/bin も）。入れ替えると開発の作業を上書きするので触らない
 pub fn dev_build(exe: &Path) -> bool {
     let parts: Vec<_> = exe.components().map(|c| c.as_os_str()).collect();
-    parts
-        .windows(2)
-        .any(|w| w[0] == "target" && (w[1] == "release" || w[1] == "debug"))
+    parts.windows(2).any(|w| {
+        (w[0] == "target" && (w[1] == "release" || w[1] == "debug"))
+            || (w[0] == ".cargo" && w[1] == "bin")
+    })
 }
 
 /// チェックサムのファイル（`<hex>  <name>`）と中身が合うか
@@ -158,7 +159,15 @@ pub fn install(latest: &Latest, work: &Path) -> Result<PathBuf> {
 
 /// tar.gz を作業フォルダに開き、中の本体で入れ替える
 fn unpack_and_replace(bytes: &[u8], target: &str, work: &Path, exe: &Path) -> Result<()> {
-    std::fs::create_dir_all(work)?;
+    // 自分だけが入れるフォルダを新しく作る。すでにあれば使わない（共有の一時フォルダに
+    // 他人が先に置いたフォルダやリンクへ書かないように）
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(work)
+            .with_context(|| format!("cannot create {}", work.display()))?;
+    }
     let archive = work.join("update.tar.gz");
     std::fs::write(&archive, bytes)?;
     let out = std::process::Command::new("tar")
@@ -245,6 +254,7 @@ mod tests {
         assert!(dev_build(Path::new(
             "/x/target/release/deps/agent_calendar-1a2b"
         ))); // テストの本体
+        assert!(dev_build(Path::new("/home/u/.cargo/bin/agent-calendar"))); // cargo install
         assert!(!dev_build(Path::new("/home/u/.local/bin/agent-calendar")));
     }
 
@@ -294,5 +304,18 @@ mod tests {
             .is_err()
         );
         assert_eq!(std::fs::read(&exe).unwrap(), b"new");
+        // 作業フォルダがすでにあれば使わない
+        let taken = dir.join("taken");
+        std::fs::create_dir_all(&taken).unwrap();
+        let e = unpack_and_replace(&bytes, "x86_64-unknown-linux-gnu", &taken, &exe).unwrap_err();
+        assert!(e.to_string().contains("cannot create"));
+        assert_eq!(
+            std::fs::metadata(dir.join("work"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
     }
 }

@@ -19,27 +19,47 @@ Everything runs on your machine. The page is served on `127.0.0.1` only.
 - **Calendar** – day, week and month views in a Google Calendar–style layout. Filter by host and repository.
 - **Session details** – summary (what was done, done / in progress / discussion, what is left), cost split into
   agent / subagents / advisor, your git commits made during the session, the conversation history, and the changes
-  as a GitHub-style diff (images before and after, side by side). Summarize a session on demand with *Summarize now*, or mark it done with *Mark done*.
+  as a GitHub-style diff (images before and after, side by side) for uncommitted work, one commit, or the whole branch
+  against `origin/main` or another base. Summarize a session on demand with *Summarize now*, or mark it done with *Mark done*.
   Details open in tabs at the top of the right panel: keep a tab with ＋ to have several sessions side by side, and drag
   the panel's edge to make it wider.
 - **Stats** – active time, session count and cost per project for a day, week or month. You assign repositories
   to projects in the page. Below it, a summary of the period that you write with a button and that is kept, and
   what is left to do in that period: sessions in progress, or not done with something left in their summary, which you
-  can open or mark done.
+  can open or mark done (or undo right after). Switch the list to any time to see work left from earlier weeks, and open
+  the sessions that are not summarized yet to summarize or mark them. Below the table: cost and tokens per model and per
+  kind (agent / subagents / advisor), each repository's sessions, and *Download CSV*. Repositories hidden in the sidebar are
+  left out of the numbers.
 - **Continue** – send the next instruction to a Claude Code or Codex session from the page (read-only, allowed
   to edit, or Claude's auto mode). When Claude needs approval for a command, the page asks you to allow or deny it.
-  *Stop* stops an instruction that is running; an instruction runs for up to 60 minutes. You can also resume a Claude Code session in the background with Remote Control, or copy the
+  *Stop* stops an instruction that is running, together with the commands the agent started (tests, dev servers); an
+  instruction runs for up to 60 minutes. If the session's worktree has been removed, the page tells you it will run in the
+  main repository. What you are writing is kept when you switch tabs, and comes back if sending fails. You can also resume a Claude Code session in the background with Remote Control, or copy the
   `claude --resume` / `codex resume` command.
 - **Schedules** – run a prompt with Claude Code or Codex in a chosen directory once, on chosen weekdays, or every
-  N minutes within a time window, optionally in a separate git worktree. Results show up on the calendar.
+  N minutes within a time window, optionally in a separate git worktree and with a chosen model. Results show up on the
+  calendar. Each schedule has its full history with the cost and duration of each run and the success and failure counts,
+  and a running one can be stopped. A run that would continue a session open in a terminal is skipped.
 - **Repositories** – pick a GitHub organization (only the ones you list in Settings) and see its repositories next to
   your local clones (matched by `origin` in the folders you list), when you last worked in each, and when it was last
   updated on GitHub. Start a new Claude Code or Codex session in a clone (choose the model, and work in a new worktree
   cut from `origin/main` or another branch, or in a worktree that already exists), or clone a missing one. The ⋯ menu
-  of each repository fetches from GitHub and removes finished worktrees and local branches. Uses your `gh` login.
+  of each repository fetches from GitHub and removes finished worktrees and local branches, showing for each worktree its
+  uncommitted changes, whether its branch is merged, and the last session there. Local clones show their current branch, and
+  if GitHub cannot be reached the last list is shown with a note. Uses your `gh` login.
+- **Usage limits** – each agent's 5-hour, weekly and per-model limits and when they reset, from local records only:
+  Codex from its transcripts, Claude Code and Antigravity (Gemini) from what their status line receives (add
+  `agent-calendar statusline` as the status line command), and Antigravity and Muse from the times they hit a limit.
+  Each value shows when it was recorded.
+- **Running now** – the header shows how many instructions, new sessions and schedules started from the page are running,
+  and how many are waiting for your approval (also in the browser tab title). The list also shows sessions that ended with
+  the agent's reply and are waiting for your next instruction. Running sessions are marked on the calendar and in tabs and pins.
+- **Background jobs** – Settings shows when rescans, summaries and collecting from other machines last worked, and why
+  they failed if they did; a mark in the header tells you when something failed.
 - **Pins** – pin the conversations you are working on; they stay at the top of the sidebar.
 - **Search** (the box in the header, or `/`) – find past sessions on this machine by repository, branch, worktree folder, or words from
-  the title, summary or your instructions (all words must match). Pick one to open its conversation; an instruction sent from there runs
+  the title, summary, your instructions or the agent's replies (all words must match). Narrow it to Claude or Codex and a period,
+  move with ↑ ↓ and Enter, and load more results. Pick one to open its conversation; an instruction sent from there runs
   where the session ran. Sessions whose worktree has been removed are marked, since continuing them runs in the main repository.
 - **New session here** (session details) – start a fresh session, without the earlier conversation, in the same folder (main repository
   or worktree) on the branch checked out there, and open its conversation. The dialog shows the folder and branch and tells you if the
@@ -93,7 +113,9 @@ and open <http://127.0.0.1:23848/>.
 Agent Calendar checks GitHub Releases once a day and shows **Update to vX.Y.Z** in the header when a new version is out.
 Clicking it downloads the release for your machine, verifies it against the published sha256, replaces the binary and
 restarts the service (when it runs under systemd). Updates never start while an agent is running. You can also turn on
-automatic updates in Settings, or run `agent-calendar update` (`--check` to only look). Builds from source are not replaced.
+automatic updates in Settings, or run `agent-calendar update` (`--check` to only look). Builds from source (under cargo's
+`target/` or installed with `cargo install` into `~/.cargo/bin`) are not replaced. An update can start while a summary is
+being written; that summary is written again later.
 
 ### From source
 
@@ -109,15 +131,30 @@ cargo install --path .
 agent-calendar serve [--port 23848] [--no-summarize] [--summary-model sonnet] [--summary-lang en|ja]
 agent-calendar scan
 agent-calendar summarize [--limit 20] [--model sonnet] [--lang en|ja]
-agent-calendar todo [--from 2026-10-06] [--to 2026-10-07]
+agent-calendar todo [--from 2026-10-06] [--to 2026-10-07] [--all] [--repo <path>]
 agent-calendar done <session id> [--undo]
-agent-calendar service install [--port 23848] [--no-summarize] [--summary-lang en|ja]
+agent-calendar stats [--from …] [--to …] [--json | --csv]
+agent-calendar report [--from …] [--to …]
+agent-calendar search <words…> [--json]
+agent-calendar limits
+agent-calendar statusline --agent claude|gemini
+agent-calendar service install [--port 23848] [--no-summarize] [--summary-lang en|ja] [--force]
 ```
 
 `todo` lists the sessions of those days (default: today) that are in progress, or not done with something left to do in
 their summary, one per line: id, last activity, status, repository, title, what is left. `done` marks a session as done; it
 then leaves the list and shows as done in the page until the session continues. You can also do this from the page
-(Mark done in a session's Overview).
+(Mark done in a session's Overview). `stats` prints active time, sessions and cost per project and repository (`--csv` for a
+spreadsheet), `report` prints the same period as Markdown with what is left and the saved period summary, `search` finds past
+sessions, and `limits` prints each agent's usage limits.
+
+To see Claude Code's and Antigravity's limits, set `agent-calendar statusline --agent claude` as Claude Code's status line
+(`"statusLine": {"type": "command", "command": "agent-calendar statusline --agent claude"}` in `~/.claude/settings.json`) and
+`--agent gemini` for Antigravity (`~/.gemini/antigravity-cli/settings.json`). It keeps the limits it receives for the page and
+prints them as the status line (for example `5h 23% · 7d 41%`).
+
+`service install` does not restart the service while agents started from the page are still running in it; add `--force` to
+restart anyway.
 
 `serve` rescans every 5 minutes and summarizes idle sessions every hour (10 per round) between 7:00 and 22:00;
 change the hours and intervals from the settings in the page. The summary language defaults to Japanese when `$LANG` starts with `ja`, English otherwise.
@@ -134,7 +171,8 @@ change the hours and intervals from the settings in the page. The summary langua
 - Working directories are grouped by git repository, so worktrees count as their main repository.
 - **Summaries** are written by `claude -p --no-session-persistence` using your own Claude Code login, so they
   use your Claude plan. Only your prompts and the agent's text replies are sent (no tool input or output).
-  Turn them off with `--no-summarize`.
+  Turn them off with `--no-summarize`, or for some repositories only in Settings. A session that fails to summarize
+  is tried again later, up to 3 times while it does not change, and the reason shows in its details.
 - **Cost** is an estimate at Anthropic API list prices (see `src/pricing.rs`, prices as of 2026-09-25), not your
   subscription bill. It includes advisor calls and subagents. Models without a known price are shown as `+`.
 - **Active time** merges 10-minute buckets across sessions; a pause of up to 30 minutes counts as continuous.
@@ -147,8 +185,10 @@ change the hours and intervals from the settings in the page. The summary langua
 
 - The server binds to `127.0.0.1` and accepts only `Host: 127.0.0.1|localhost|[::1]:<port>`, which blocks DNS
   rebinding. Writes and resume require a JSON body and refuse requests from other origins.
-- Transcripts can contain anything you typed. Nothing leaves your machine except the summary requests to
-  Anthropic through `claude -p`.
+- Transcripts can contain anything you typed. Agent Calendar itself sends them nowhere except: summary requests to
+  Anthropic through `claude -p`; instructions you send from the page or schedules, which run your own `claude` / `codex`;
+  and transcripts served by `share` to the machines you paired. It also checks GitHub Releases once a day (turn this off
+  in Settings) and uses `gh` for the Repositories page. Images in agent replies are shown as links and are not loaded.
 
 ## Compatibility
 
@@ -178,7 +218,8 @@ in the Code list of the Claude app. The button itself is on the local page, so p
 
 ### Does it send my transcripts anywhere?
 
-Only for summaries, and only through your own `claude -p`. Use `--no-summarize` to keep everything local.
+Only for summaries, and only through your own `claude -p` (see Security and privacy for the rest). Use `--no-summarize`, or
+skip summaries for some repositories in Settings.
 
 ### Does it work on Windows?
 

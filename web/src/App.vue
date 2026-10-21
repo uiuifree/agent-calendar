@@ -1,10 +1,11 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { getPins, getSchedules, getUpdate, getWeek, installUpdate, masked, rescan, setMasked, waitForSession } from './api.js'
+import { getPins, getRunning, getSchedules, getStatus, getUpdate, getWeek, installUpdate, masked, rescan, setMasked, waitForSession } from './api.js'
 import { addDays, startOfDay, weekStart } from './layout.js'
 import { lang, locale, setLang, t } from './i18n.js'
 import { CALENDAR_VIEWS, formatRoute, parseRoute } from './route.js'
 import { remembered } from './remembered.js'
+import { askCount, hostErrors, pageTitle, runningMarks } from './running.js'
 import { closeTab, isTabs, keptTabs, openTab, patchTab } from './tabs.js'
 import { MIN_CALENDAR, isWidths, panelWidth, withoutWidth } from './resize.js'
 import TimeGrid from './components/TimeGrid.vue'
@@ -20,8 +21,10 @@ import PlanForm from './components/PlanForm.vue'
 import ReposView from './components/ReposView.vue'
 import SearchBox from './components/SearchBox.vue'
 import StartDialog from './components/StartDialog.vue'
+import LimitsView from './components/LimitsView.vue'
+import RunningMenu from './components/RunningMenu.vue'
 
-const VIEWS = ['day', 'week', 'month', 'stats', 'plans', 'repos']
+const VIEWS = ['day', 'week', 'month', 'stats', 'plans', 'repos', 'limits']
 // 日付で動く表示（前へ・次へと今日のボタンを出す）
 const CALENDAR = ['day', 'week', 'month', 'stats']
 const view = remembered('agent-calendar.view3', 'week', (v) => VIEWS.includes(v))
@@ -126,13 +129,13 @@ function resize(e) {
   detailWidths.value = { ...detailWidths.value, [detailTab.value]: panelWidth(e.clientX, window.innerWidth, sidebarW.value) }
 }
 
-// 集計・予定・リポジトリの画面と開いているセッションは URL に持たせる（戻る・進む・ブックマーク・共有ができるように）。
+// 集計・予定・リポジトリ・利用枠の画面と開いているセッションは URL に持たせる（戻る・進む・ブックマーク・共有ができるように）。
 // カレンダーは URL を変えない（"/"）。"/" に戻ったら、最後に見ていた日・週・月の表示にする
 // サイドバーの小さなカレンダーで日を選ぶ。日付を使わない画面（リポジトリ・予定）にいるときは、
 // 選んでも何も変わらないので、その日のカレンダーへ移る（集計は選んだ週の集計に変わるので、そのまま）
 function pickDay(d) {
   anchor.value = startOfDay(d)
-  if (view.value === 'repos' || view.value === 'plans') view.value = lastCalendar.value
+  if (['repos', 'plans', 'limits'].includes(view.value)) view.value = lastCalendar.value
 }
 const lastCalendar = remembered('agent-calendar.calendarView', 'week', (v) => CALENDAR_VIEWS.includes(v))
 watch(view, (v) => {
@@ -184,6 +187,47 @@ async function openPlan(id) {
     error.value = String(e)
   }
 }
+// いま動いているもの（実行中・許可待ち・動いている予定・返事待ち）。10 秒ごとに取り、画面が隠れているあいだは止める
+const running = ref(null)
+async function loadRunning() {
+  if (document.hidden) return
+  try {
+    running.value = await getRunning()
+  } catch {
+    // 取れなくても画面は使える（前の答えのまま）
+  }
+}
+const runMarks = computed(() => runningMarks(running.value))
+const runningPlans = computed(() => (running.value?.schedules ?? []).map((p) => p.id))
+// 許可待ちがあるあいだは、ページのタブの題の頭に件数を付ける
+watch(
+  () => askCount(running.value),
+  (n) => (document.title = pageTitle(t('appName'), n)),
+)
+const onVisible = () => !document.hidden && loadRunning()
+let runningTimer
+onMounted(() => {
+  loadRunning()
+  runningTimer = setInterval(loadRunning, 10 * 1000)
+  document.addEventListener('visibilitychange', onVisible)
+})
+onUnmounted(() => {
+  clearInterval(runningTimer)
+  document.removeEventListener('visibilitychange', onVisible)
+})
+
+// 裏の処理（読み直し・要約・別マシンの取り込み）の最後の結果。失敗していればヘッダーとホストの一覧に印を出す
+const jobs = ref([])
+async function loadStatus() {
+  try {
+    jobs.value = (await getStatus()).jobs
+  } catch {
+    // 取れなくても画面は使える
+  }
+}
+const jobFailing = computed(() => jobs.value.some((j) => j.error))
+const hostFailures = computed(() => hostErrors(jobs.value))
+
 // 予定はこのマシンで動くので、ホストの絞り込みで手元を外したときは出さない
 const plans = computed(() => (hosts.value == null || hosts.value.includes('') ? (data.value.plans ?? []) : []))
 watch(selectedId, (id) => {
@@ -196,6 +240,7 @@ const version = ref(0)
 // 新しい版。あればヘッダーに出し、押したら入れ替えて（systemd の下なら）再起動を待って読み込み直す
 const updateInfo = ref(null)
 const updating = ref('')
+const RESTART_WAIT_MS = 120_000
 async function loadUpdate() {
   try {
     updateInfo.value = await getUpdate()
@@ -203,7 +248,19 @@ async function loadUpdate() {
     // 確かめられなくても画面は使える
   }
 }
+// 押した直後に立てる印。確かめる問い合わせと確認のあいだに続けて押しても、二度は進まない
+let updatePressed = false
 async function doUpdate() {
+  // 入れ替えの最中に押し直しても、二度は始めない
+  if (updating.value || updatePressed) return
+  updatePressed = true
+  try {
+    await runUpdate()
+  } finally {
+    updatePressed = false
+  }
+}
+async function runUpdate() {
   // 押した時点の状態で判定する（前に取った「エージェントが動いている」のままで断らない）
   await loadUpdate()
   const u = updateInfo.value
@@ -219,12 +276,14 @@ async function doUpdate() {
       return window.alert(t('update.restartYourself', { v: r.installed }))
     }
     updating.value = t('update.restarting')
-    // 再起動して新しい版が答えるまで待つ
-    for (;;) {
+    // 再起動して新しい版が答えるまで待つ。2 分たっても戻らなければ、確かめ方を案内する
+    for (let waited = 0; waited < RESTART_WAIT_MS; waited += 2000) {
       await new Promise((ok) => setTimeout(ok, 2000))
       const now = await getUpdate().catch(() => null)
       if (now?.current === r.installed) return location.reload()
     }
+    updating.value = ''
+    window.alert(t('update.notBack', { v: r.installed }))
   } catch (e) {
     updating.value = ''
     window.alert(String(e.message ?? e))
@@ -257,6 +316,15 @@ async function startOpened(x, id) {
   load()
   openSession(id, 'conversation')
 }
+// 終わったら画面を読み直す（隠れて動いていたものは、そこで片付ける）
+function startRan(x) {
+  if (x.hidden) closeStart(x.key)
+  load()
+}
+// 「ここで始める」の終わりの失敗（会話・リポジトリのどちらから始めたものも）。会話に移ったあとや全画面でも見えるようヘッダーに出す。
+// 読み直し（load）で消える error とは分ける（終わった直後に読み直すので、同じところに出すとすぐ消える）。押したら消す
+const startError = ref('')
+const startFailed = (text) => (startError.value = t('repos.startFailed', { e: text }))
 
 // ピン留めした会話（サイドバーの上）
 const pins = ref([])
@@ -268,14 +336,20 @@ async function loadPins() {
   }
 }
 
+// 週を続けて送ったときなど、前の問い合わせの答えが後から届いても、最新の問い合わせの答えだけを使う
+let loadSeq = 0
 async function load() {
+  const mine = ++loadSeq
   error.value = ''
   loadPins()
+  loadStatus()
   try {
-    data.value = await getWeek(from.value, to.value)
+    const r = await getWeek(from.value, to.value)
+    if (mine !== loadSeq) return
+    data.value = r
     version.value++
   } catch (e) {
-    error.value = String(e)
+    if (mine === loadSeq) error.value = String(e)
   }
 }
 
@@ -364,7 +438,7 @@ function backToCalendar() {
 }
 
 // キーボードのショートカット（Google カレンダーと同じ）。入力中・修飾キー付きでは反応しない
-const KEYS = { d: 'day', w: 'week', m: 'month', s: 'stats', a: 'plans', r: 'repos' }
+const KEYS = { d: 'day', w: 'week', m: 'month', s: 'stats', a: 'plans', r: 'repos', l: 'limits' }
 const SHORTCUT = Object.fromEntries(Object.entries(KEYS).map(([k, v]) => [v, k]))
 const search = ref(null)
 function onKey(e) {
@@ -401,7 +475,9 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
       </template>
       <span class="spacer" />
       <SearchBox ref="search" @open="(id) => openSession(id, 'conversation')" />
+      <RunningMenu :running="running" @open-session="(id) => openSession(id, 'conversation')" @open-plans="view = 'plans'" @changed="loadRunning" />
       <span v-if="error" class="chip warn">{{ error }}</span>
+      <button v-if="startError" class="chip warn dismiss" :title="t('close')" @click="startError = ''">{{ startError }} ✕</button>
       <!-- 表示の単位（日・週・月）はカレンダーのときだけ。集計・予定・リポジトリへはサイドバーから -->
       <div v-if="CALENDAR_VIEWS.includes(view)" class="segmented" role="tablist">
         <button
@@ -424,7 +500,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
       <button class="icon-btn" :title="t('reload')" :aria-label="t('reload')" :disabled="loading" @click="reload">
         <span :class="{ spin: loading }">↻</span>
       </button>
-      <button v-if="updateInfo?.newer" class="btn small update" :title="updateInfo.latest.page" @click="doUpdate">
+      <button v-if="updateInfo?.newer" class="btn small update" :title="updateInfo.latest.page" :disabled="!!updating" @click="doUpdate">
         {{ updating || t('update.available', { v: updateInfo.latest.version }) }}
       </button>
       <button
@@ -437,6 +513,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
       >
         ◐
       </button>
+      <button v-if="jobFailing" class="icon-btn job-warn" :title="t('jobs.warn')" :aria-label="t('jobs.warn')" @click="showSettings = true">⚠</button>
       <button class="icon-btn" :title="t('settings.title')" :aria-label="t('settings.title')" @click="showSettings = true">⚙</button>
     </header>
 
@@ -451,6 +528,8 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
         :machines="machines"
         :repos="repoList"
         :host-counts="hostCounts"
+        :host-errors="hostFailures"
+        :marks="runMarks"
         v-model:hosts="hosts"
         v-model:hidden-repos="hiddenRepos"
         @pick="pickDay"
@@ -462,7 +541,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
         @create="creating = null"
         @select="(id) => (selectedId = id)"
       />
-      <div class="content" :class="{ fixed: !['stats', 'plans', 'repos'].includes(view) }">
+      <div class="content" :class="{ fixed: !['stats', 'plans', 'repos', 'limits'].includes(view) }">
         <div v-for="h in CALENDAR.includes(view) ? emptyHints : []" :key="h.id" class="hint">
           <span v-if="h.when">{{ t('emptyHost', { host: h.label, date: h.when }) }}</span>
           <span v-else>{{ t('neverHost', { host: h.label }) }}</span>
@@ -520,7 +599,15 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
           @open-day="openDay"
           @open-plan="openPlan"
         />
-        <PlansView v-else-if="view === 'plans'" :version="version" @open-session="(id) => (selectedId = id)" @changed="load" />
+        <PlansView
+          v-else-if="view === 'plans'"
+          :version="version"
+          :running="runningPlans"
+          @open-session="(id) => (selectedId = id)"
+          @changed="load"
+          @running="loadRunning"
+        />
+        <LimitsView v-else-if="view === 'limits'" />
         <ReposView
           v-else-if="view === 'repos'"
           v-model:owner="repoOwner"
@@ -529,6 +616,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
           @open-session="openSession"
           @open-settings="showSettings = true"
           @changed="load"
+          @start-failed="startFailed"
         />
         <StatsView
           v-else
@@ -536,6 +624,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
           :day="anchor"
           :version="version"
           :hosts="hosts"
+          :hidden-repos="hiddenRepos"
           @open-session="(id) => (selectedId = id)"
           @changed="load"
         />
@@ -555,7 +644,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
           @lostpointercapture="resizing = false"
           @dblclick="detailWidths = withoutWidth(detailWidths, detailTab)"
         />
-        <DetailTabs :tabs="tabs" :active="selectedId" :titles="tabTitles" @select="(id) => (selectedId = id)" @keep="keepDetailTab" @close="closeDetailTab" />
+        <DetailTabs :tabs="tabs" :active="selectedId" :titles="tabTitles" :marks="runMarks" @select="(id) => (selectedId = id)" @keep="keepDetailTab" @close="closeDetailTab" />
         <SessionDetail
           v-for="x in tabs"
           v-show="x.id === selectedId"
@@ -579,7 +668,13 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
         />
       </section>
     </main>
-    <SettingsDialog v-if="showSettings" @close="showSettings = false" @saved="load" @update="(v) => (updateInfo = v)" />
+    <SettingsDialog
+      v-if="showSettings"
+      :machine-labels="machineLabels"
+      @close="showSettings = false; loadStatus()"
+      @saved="load"
+      @update="(v) => (updateInfo = v)"
+    />
     <PlanForm v-if="creating !== undefined" :at="creating" @close="creating = undefined" @saved="planSaved" />
     <StartDialog
       v-for="x in starts"
@@ -588,10 +683,12 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
       :repo="x.repo"
       :from-session="x.id"
       :recorded-branch="x.branch"
+      :hidden="x.hidden"
       @close="x.hidden || closeStart(x.key)"
+      @hide="x.hidden = true"
       @opened="(id) => startOpened(x, id)"
-      @failed="(text) => (error = t('repos.startFailed', { e: text }))"
-      @ran="x.hidden ? closeStart(x.key) : load()"
+      @failed="startFailed"
+      @ran="startRan(x)"
     />
     <PlanForm v-if="editingPlan" :plan="editingPlan" @close="editingPlan = null" @saved="planSaved" />
   </div>
@@ -602,7 +699,9 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
 .top{display:flex; align-items:center; gap:8px; flex-wrap:wrap; padding:8px 16px 8px 8px; border-bottom:1px solid var(--rule); min-height:64px}
 .brand{display:flex; align-items:center; gap:10px; margin-right:24px; padding:4px 8px 4px 4px; border:0; border-radius:8px; background:none; color:inherit; font:inherit; cursor:pointer}
 .brand:hover{background:var(--hover)}
+.chip.dismiss{background:none; font-family:inherit; cursor:pointer}
 .icon-btn.mask.on{background:var(--accent-soft); color:var(--accent)}
+.icon-btn.job-warn{color:var(--warn)}
 .btn.small.update{height:30px; padding:0 12px; font-size:13px; color:var(--accent); border-color:var(--accent)}
 /* ロゴ（タブのアイコンと同じ絵）: 紫のカレンダーの用紙に、プロンプト「>」から AI の光へ流れる日付のマス。文字は黒・やや太め */
 .logo{display:block; width:32px; height:32px}

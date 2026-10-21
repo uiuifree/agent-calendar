@@ -124,11 +124,11 @@ onMounted(() => {
             class="event"
             :class="{ selected: p.session.id === selectedId }"
             :style="pieceStyle(p)"
-            :title="`${p.session.title || t('untitled')}\n${p.name}${Object.keys(machineLabels).length > 1 ? ` (${machineLabels[p.session.machine] ?? p.session.machine})` : ''}\n${clock(p.start)} – ${clock(p.end)}`"
+            :title="`${p.session.title || t('untitled')}\n${p.name}${Object.keys(machineLabels).length > 1 ? ` (${machineLabels[p.session.machine] ?? p.session.machine})` : ''}\n${clock(p.start)} – ${clock(p.end)}${p.session.running ? `\n${t('running.mark')}` : ''}`"
             @click="emit('select', p.session.id)"
           >
             <template v-if="visible(p)">
-              <span class="title">{{ p.session.title || t('untitled') }}</span>
+              <span class="title"><span v-if="p.session.running" class="live">▶</span> {{ p.session.title || t('untitled') }}</span>
               <span v-if="roomy(p)" class="sub">{{ p.name }}</span>
               <span v-if="roomy(p)" class="sub num">{{ clock(p.start) }} – {{ clock(p.end) }}</span>
             </template>
@@ -165,6 +165,8 @@ onMounted(() => {
 .event.selected{box-shadow:0 1px 3px rgba(60,64,67,.3), 0 4px 8px 3px rgba(60,64,67,.15); z-index:3}
 .title{font-weight:500; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
 .sub{max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; opacity:.9}
+/* 帯は色で塗ってあるので、動いている印は帯の文字色の記号だけにする */
+.event .live{background:none; color:inherit; min-width:0; padding:0; font-size:9px}
 .now{position:absolute; left:0; right:0; border-top:2px solid var(--now); z-index:4; pointer-events:none}
 .now::before{content:""; position:absolute; left:-6px; top:-7px; width:12px; height:12px; border-radius:50%; background:var(--now)}
 </style>

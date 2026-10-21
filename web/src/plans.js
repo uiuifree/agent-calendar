@@ -42,3 +42,13 @@ export function copyOf(plan, now = Date.now()) {
   const { id, runs, next_at, last_session_id, ...rest } = plan
   return { ...rest, name: t('plans.copyName', { name: plan.name }), enabled: true, repeat }
 }
+
+// 予定の実行の履歴を読み直したとき（最初のページだけを取り直す）、「さらに読む」で読んだ分を消さない。
+// fresh は取り直した最初のページ、shown はいま出している一覧（どちらも新しい順＝started_at・id の大きい順）。
+// fresh の最後より古い行は shown のまま後ろに残す
+export function mergeRuns(fresh, shown) {
+  const last = fresh.at(-1)
+  if (!last) return fresh
+  const older = (r) => r.started_at < last.started_at || (r.started_at === last.started_at && r.id < last.id)
+  return [...fresh, ...shown.filter(older)]
+}

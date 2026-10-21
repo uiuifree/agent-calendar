@@ -53,34 +53,64 @@ pub struct Todo {
     pub last_ts: i64,
 }
 
-/// from・to（unix 秒）の間に動きがあったセッションの残タスク（古い順）と、まだ要約していないセッションの数。
-/// machines を渡すとそのホストのものだけ
-pub fn todo(
-    conn: &Connection,
-    from: i64,
-    to: i64,
-    machines: Option<&[String]>,
-) -> Result<(Vec<Todo>, usize)> {
+/// まだ要約していない（か、要約のあとで続けて要約が古い）セッション。残タスクかどうかは分からない
+#[derive(Debug, PartialEq, Serialize)]
+pub struct Pending {
+    pub id: String,
+    pub repo: String,
+    pub machine: String,
+    pub title: String,
+    pub last_ts: i64,
+}
+
+/// 残タスクの絞り込み。range（unix 秒の from・to）を渡すとその間に動きがあったものだけ、None なら期間を問わない。
+/// machines を渡すとそのホストのものだけ、repo を渡すとそのリポジトリ（絶対パス）のものだけ
+#[derive(Default)]
+pub struct Query<'a> {
+    pub range: Option<(i64, i64)>,
+    pub machines: Option<&'a [String]>,
+    pub repo: Option<&'a str>,
+    /// 出さないリポジトリ（サイドバーでチェックを外したもの）
+    pub exclude: &'a [String],
+}
+
+/// 残タスク（古い順）と、まだ要約していないセッション（新しい順）。
+/// 要約のあとで続けたセッションは、要約が「完了」でも古い判定なので、残タスクではなく未要約に数える
+pub fn todo(conn: &Connection, q: &Query) -> Result<(Vec<Todo>, Vec<Pending>)> {
+    let (from, to) = q.range.map_or((None, None), |(f, t)| (Some(f), Some(t)));
     let mut stmt = conn.prepare(&format!(
         "SELECT s.id, s.repo, s.title, m.body,
-                (SELECT text FROM prompts p WHERE p.session_id = s.id ORDER BY seq LIMIT 1), s.last_ts, s.machine
+                (SELECT text FROM prompts p WHERE p.session_id = s.id ORDER BY seq LIMIT 1), s.last_ts, s.machine,
+                m.last_uuid IS NOT NULL AND m.last_uuid != s.last_uuid
          FROM sessions s LEFT JOIN summaries m ON m.session_id = s.id
          WHERE NOT {SQL}
-           AND EXISTS (SELECT 1 FROM activity a WHERE a.session_id = s.id AND a.bucket >= ?1 AND a.bucket < ?2)
+           AND (?1 IS NULL OR EXISTS (SELECT 1 FROM activity a WHERE a.session_id = s.id AND a.bucket >= ?1 AND a.bucket < ?2))
+           AND (?3 IS NULL OR s.repo = ?3)
+           AND s.repo NOT IN (SELECT value FROM json_each(?4))
          ORDER BY s.last_ts"
     ))?;
-    let mut rows = stmt.query([from, to])?;
-    let (mut list, mut unsummarized) = (Vec::new(), 0);
+    let exclude = serde_json::to_string(q.exclude)?;
+    let mut rows = stmt.query(params![from, to, q.repo, exclude])?;
+    let (mut list, mut pending) = (Vec::new(), Vec::new());
     while let Some(r) = rows.next()? {
         let machine: String = r.get(6)?;
-        if machines.is_some_and(|m| !m.contains(&machine)) {
+        if q.machines.is_some_and(|m| !m.contains(&machine)) {
             continue;
         }
-        let Some(summary) = r
+        let stale: bool = r.get(7)?;
+        let summary = r
             .get::<_, Option<String>>(3)?
-            .and_then(|b| summarize::read(&b))
-        else {
-            unsummarized += 1;
+            .and_then(|b| summarize::read(&b));
+        let title = pins::title(summary.as_ref(), r.get(2)?, r.get(4)?);
+        // 要約のあとで続けたものは、途中（残タスクに出す）以外は判定が古いので未要約に数える
+        let Some(summary) = summary.filter(|s| !(stale && s.status != "wip")) else {
+            pending.push(Pending {
+                id: r.get(0)?,
+                repo: r.get(1)?,
+                machine,
+                title,
+                last_ts: r.get(5)?,
+            });
             continue;
         };
         // 要約が完了なら、残っていることが書かれていても出さない
@@ -91,13 +121,14 @@ pub fn todo(
             id: r.get(0)?,
             repo: r.get(1)?,
             machine,
-            title: pins::title(Some(&summary), r.get(2)?, r.get(4)?),
+            title,
             status: summary.status,
             next: summary.next,
             last_ts: r.get(5)?,
         });
     }
-    Ok((list, unsummarized))
+    pending.reverse();
+    Ok((list, pending))
 }
 
 #[cfg(test)]
@@ -106,7 +137,7 @@ mod tests {
 
     fn session(conn: &Connection, id: &str, bucket: i64, body: Option<&str>) {
         conn.execute(
-            "INSERT INTO sessions VALUES (?1, ?1, 0, 0, '/r/app', '/r/app', 'main', '', ?2, ?2, 'u1', 1, 'claude', '')",
+            "INSERT INTO sessions VALUES (?1, ?1, 0, 0, '/r/app', '/r/app', 'main', '', ?2, ?2, 'u1', 1, 'claude', '', 0)",
             params![id, bucket * 1000],
         )
         .unwrap();
@@ -153,7 +184,14 @@ mod tests {
             Some(r#"{"title":"範囲の外","bullets":[],"status":"wip"}"#),
         );
 
-        let (list, unsummarized) = todo(&conn, 0, 3000, None).unwrap();
+        fn range(machines: Option<&[String]>) -> Query<'_> {
+            Query {
+                range: Some((0, 3000)),
+                machines,
+                ..Default::default()
+            }
+        }
+        let (list, unsummarized) = todo(&conn, &range(None)).unwrap();
         let got: Vec<_> = list
             .iter()
             .map(|x| (x.id.as_str(), x.status.as_str(), x.next.as_str()))
@@ -167,13 +205,37 @@ mod tests {
             ),
             ("途中の題", "/r/app", 1_200_000)
         );
-        assert_eq!(unsummarized, 1);
+        assert_eq!(
+            unsummarized
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["raw"]
+        );
+        // 期間を問わなければ、範囲の外の残タスクも出る。リポジトリでも絞れる
+        let all = todo(&conn, &Query::default()).unwrap().0;
+        assert_eq!(all.last().unwrap().id, "later");
+        let other = Query {
+            repo: Some("/r/other"),
+            ..Default::default()
+        };
+        assert!(todo(&conn, &other).unwrap().0.is_empty());
+        let hidden = ["/r/app".to_string()];
+        let without = Query {
+            exclude: &hidden,
+            ..Default::default()
+        };
+        assert!(todo(&conn, &without).unwrap().0.is_empty());
         conn.execute(
             "UPDATE sessions SET machine = 'ai-node' WHERE id = 'left'",
             [],
         )
         .unwrap();
-        let only = |m: &str| todo(&conn, 0, 3000, Some(&[m.to_string()])).unwrap();
+        let only = |m: &str| {
+            let hosts = [m.to_string()];
+            let (list, pending) = todo(&conn, &range(Some(&hosts))).unwrap();
+            (list, pending.len())
+        };
         let (list, unsummarized) = only("ai-node");
         assert_eq!(
             (list.len(), list[0].machine.as_str(), unsummarized),
@@ -190,12 +252,12 @@ mod tests {
         assert!(set(&conn, "raw", true, 3_000_000).unwrap());
         assert!(!set(&conn, "nope", true, 3_000_000).unwrap());
         assert!(is_finished(&conn, "wip").unwrap());
-        let (list, unsummarized) = todo(&conn, 0, 3000, None).unwrap();
+        let (list, unsummarized) = todo(&conn, &range(None)).unwrap();
         assert_eq!(
             list.iter().map(|x| x.id.as_str()).collect::<Vec<_>>(),
             ["left"]
         );
-        assert_eq!(unsummarized, 0);
+        assert!(unsummarized.is_empty());
 
         // 付ける前の記録が、あとの読み直しで入っても外れない
         conn.execute(
@@ -211,7 +273,20 @@ mod tests {
         )
         .unwrap();
         assert!(!is_finished(&conn, "wip").unwrap());
-        assert_eq!(todo(&conn, 0, 3000, None).unwrap().0.len(), 2);
+        assert_eq!(todo(&conn, &range(None)).unwrap().0.len(), 2);
+        // 「完了」と要約したあとで続けたものは、要約が古いので未要約に数える
+        conn.execute("UPDATE sessions SET last_uuid = 'u9' WHERE id = 'done'", [])
+            .unwrap();
+        let pending = todo(&conn, &range(None)).unwrap().1;
+        assert!(pending.iter().any(|p| p.id == "done" && p.title == "済み"));
+        // 「相談のみ」と要約したあとで続けたものも
+        conn.execute(
+            "UPDATE sessions SET last_uuid = 'u9', machine = '' WHERE id = 'left'",
+            [],
+        )
+        .unwrap();
+        let (list, pending) = todo(&conn, &range(None)).unwrap();
+        assert!(pending.iter().any(|p| p.id == "left") && !list.iter().any(|x| x.id == "left"));
 
         assert!(set(&conn, "raw", false, 3_200_000).unwrap());
         assert!(!is_finished(&conn, "raw").unwrap());

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { setLang } from './i18n.js'
 import { renderMarkdown } from './markdown.js'
 
 describe('renderMarkdown', () => {
@@ -20,5 +21,14 @@ describe('renderMarkdown', () => {
   it('リンクは新しいタブ', () => {
     expect(renderMarkdown('https://example.com')).toContain('target="_blank" rel="noopener noreferrer"')
     expect(renderMarkdown(null)).toBe('')
+  })
+  it('画像は読み込まず、新しいタブで開くリンクにする', () => {
+    setLang('ja')
+    const h = renderMarkdown('![図 <1>](https://example.com/a.png?x=1&y=2)')
+    expect(h).not.toContain('<img')
+    expect(h).toContain('<a href="https://example.com/a.png?x=1&amp;y=2" target="_blank" rel="noopener noreferrer">画像: 図 &lt;1&gt;</a>')
+    expect(renderMarkdown('![](https://example.com/b.png)')).toContain('>画像</a>')
+    setLang('en')
+    expect(renderMarkdown('![chart](https://example.com/c.png)')).toContain('>Image: chart</a>')
   })
 })

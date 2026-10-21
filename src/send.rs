@@ -440,11 +440,12 @@ impl Running {
         self.updating.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// 本体の入れ替えを始める。何も動いていなければ、以後の新しい実行を止めて true。
-    /// 動いていれば何も変えずに false。判定と止める切り替えは、実行の印と同じ鍵の中で行う
+    /// 本体の入れ替えを始める。何も動いておらず入れ替えの最中でもなければ、以後の新しい実行を止めて true。
+    /// そうでなければ何も変えずに false。判定と止める切り替えは、実行の印と同じ鍵の中で行う
     pub fn begin_update(&self) -> bool {
         let set = self.set.lock().unwrap_or_else(|e| e.into_inner());
-        let idle = set.is_empty()
+        let idle = !self.updating()
+            && set.is_empty()
             && self
                 .pending
                 .lock()
@@ -488,13 +489,21 @@ impl Running {
         }
     }
 
-    /// そのフォルダでエージェントが動いているか（始めたばかりの実行も、続きの指示も、予定の実行も）
+    /// そのフォルダ（の中のフォルダも）でエージェントが動いているか（始めたばかりの実行も、続きの指示も、予定の実行も）。
+    /// worktree の下のフォルダで動いているセッションもあるので、中も見る
     pub fn busy_in(&self, dir: &str) -> bool {
+        // 空や `/` を渡されても、ほかのフォルダ全部を「中」とみなさない
+        let base = dir.trim_end_matches('/');
+        let inside = if base.is_empty() {
+            String::from("\0")
+        } else {
+            format!("{base}/")
+        };
         self.cwds
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .any(|d| d == dir)
+            .any(|d| d == dir || d.starts_with(&inside))
     }
 
     pub fn contains(&self, id: &str) -> bool {
@@ -568,6 +577,52 @@ impl Running {
             .collect()
     }
 
+    /// いま動いている実行の一覧（画面の「実行中」）。1 つの実行が「始めたときの名前」と「分かったセッション ID」の
+    /// 2 つの印を持つことがあるので、止める合図が同じものはまとめ、セッション ID のほうを出す。
+    /// 予定（schedule:）・clone・片付け（manage:）の印は実行ではないので出さず、動いている予定の番号は別に返す
+    pub fn overview(&self) -> (Vec<RunInfo>, Vec<i64>) {
+        let set = self.set.lock().unwrap_or_else(|e| e.into_inner());
+        let mut runs: Vec<RunInfo> = Vec::new();
+        let mut schedules = Vec::new();
+        let mut keys: Vec<(&String, &Arc<Notify>)> = set.iter().collect();
+        keys.sort_by_key(|(k, _)| k.as_str());
+        for (key, stop) in keys {
+            if let Some(id) = key.strip_prefix("schedule:") {
+                schedules.extend(id.parse::<i64>().ok());
+                continue;
+            }
+            if key.starts_with("clone:") || key.starts_with("manage:") {
+                continue;
+            }
+            let named = !key.starts_with("new:") && !key.starts_with("schedule-new:");
+            match runs.iter_mut().find(|r| Arc::ptr_eq(&r.stop, stop)) {
+                Some(r) if named => r.session = Some(key.clone()),
+                Some(_) => {}
+                None => runs.push(RunInfo {
+                    key: key.clone(),
+                    session: named.then(|| key.clone()),
+                    stop: stop.clone(),
+                }),
+            }
+        }
+        schedules.sort_unstable();
+        (runs, schedules)
+    }
+
+    /// 答えを待っている問い合わせの数（セッションごと）
+    pub fn waiting_asks(&self) -> HashMap<String, usize> {
+        let mut out = HashMap::new();
+        for p in self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+        {
+            *out.entry(p.session.clone()).or_insert(0) += 1;
+        }
+        out
+    }
+
     /// 実行が終わったら、その実行の答えを待っていた問い合わせを捨てる
     fn forget(&self, ids: &[String]) {
         let mut p = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -577,12 +632,26 @@ impl Running {
     }
 }
 
+/// 動いている実行 1 つ。key は最初に付けた印（`new:<フォルダ>` など）、session は分かっていればセッション ID
+pub struct RunInfo {
+    pub key: String,
+    pub session: Option<String>,
+    stop: Arc<Notify>,
+}
+
 /// 終わったら（途中で落ちても）印を外す
 pub struct Claim {
     set: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     id: String,
     /// この実行を止める合図
     stop: Arc<Notify>,
+}
+
+impl Claim {
+    /// この印の止める合図（同じ実行のほかの印にも渡す）
+    pub fn stopper(&self) -> Arc<Notify> {
+        self.stop.clone()
+    }
 }
 
 impl Drop for Claim {
@@ -611,6 +680,8 @@ pub struct Job {
     pub cleanup: Vec<std::path::PathBuf>,
     /// 許可の問い合わせを画面で受ける（attach に ask を渡したとき）。標準入力を閉じずに答えを書き足す
     pub ask: bool,
+    /// 止める合図をほかの印と分け合う（予定の `schedule:<id>` の印から、その回の実行を止めるため）
+    pub stop: Option<Arc<Notify>>,
 }
 
 pub fn start(
@@ -624,7 +695,8 @@ pub fn start(
             let _ = std::fs::remove_file(f);
         }
     };
-    let Some(claim) = running.claim(&job.id) else {
+    let stop = job.stop.clone().unwrap_or_else(|| Arc::new(Notify::new()));
+    let Some(claim) = running.claim_with(&job.id, stop) else {
         discard(&job.cleanup);
         if running.updating() {
             bail!("Agent Calendar is updating; try again in a minute");
@@ -634,6 +706,8 @@ pub fn start(
     let spawned = tokio::process::Command::new(&job.program)
         .args(&job.args)
         .current_dir(&job.cwd)
+        // 自分のプロセスグループで動かす。止めるときに、エージェントが起動したもの（テスト・開発サーバーなど）もまとめて止める
+        .process_group(0)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -739,6 +813,9 @@ pub fn start(
             () = stop.notified() => (false, true),
         };
         if timed_out || stopped {
+            if let Some(pid) = child.id() {
+                kill_group(pid);
+            }
             let _ = child.start_kill();
         }
         let status = child.wait().await;
@@ -776,6 +853,14 @@ pub fn start(
         let _ = tokio::task::spawn_blocking(after).await;
     });
     Ok(rx)
+}
+
+/// プロセスグループごと止める（`process_group(0)` で起動したので、グループの番号は本体の pid と同じ）
+fn kill_group(pid: u32) {
+    // SAFETY: killpg はシグナルを送るだけで、メモリには触らない
+    unsafe {
+        libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+    }
 }
 
 #[cfg(test)]
@@ -1083,6 +1168,7 @@ mod tests {
             timeout: TIMEOUT,
             cleanup: Vec::new(),
             ask: false,
+            stop: None,
         }
     }
 
@@ -1164,6 +1250,28 @@ mod tests {
         assert_eq!(ev, [json!({"kind":"done","ok":true,"text":null})]);
     }
 
+    #[test]
+    fn overview_lists_runs_once() {
+        let running = Running::default();
+        let new = running.claim("new:/r/app").unwrap();
+        let named = running.claim_with("s-real", new.stop.clone()).unwrap();
+        let _other = running.claim("s-2").unwrap();
+        let _schedule = running.claim("schedule:7").unwrap();
+        let _manage = running.claim("manage:/r/app").unwrap();
+        let (runs, schedules) = running.overview();
+        // 始めたときの名前と分かったセッション ID は 1 つの実行。予定・片付けの印は実行ではない
+        let got: Vec<_> = runs
+            .iter()
+            .map(|r| (r.key.as_str(), r.session.as_deref()))
+            .collect();
+        assert_eq!(got, [("new:/r/app", Some("s-real")), ("s-2", Some("s-2"))]);
+        assert_eq!(schedules, [7]);
+        drop((new, named));
+        let (runs, _) = running.overview();
+        assert_eq!(runs.len(), 1);
+        assert!(running.waiting_asks().is_empty());
+    }
+
     #[tokio::test]
     async fn stops_when_asked_from_the_page() {
         let dir = crate::db::temp_dir("send-stop");
@@ -1181,6 +1289,43 @@ mod tests {
             [json!({"kind":"done","ok":false,"text":"stopped from the page","stopped":true})]
         );
         assert!(!running.contains("p1") && !running.stop("p1"));
+        // ほかの印（予定の schedule:<id>）と止める合図を分け合えば、その印からも止められる
+        let shared = running.claim("schedule:9").unwrap();
+        let mut j = job(&slow, "p-shared", &dir, String::new());
+        j.stop = Some(shared.stopper());
+        let rx = start(&running, j, || {}).unwrap();
+        assert!(running.stop("schedule:9"));
+        assert_eq!(collect(rx).await[0]["stopped"], true);
+        drop(shared);
+        // エージェントが起動したもの（孫のプロセス）も止まる
+        let pidfile = dir.join("child.pid");
+        let spawner = fake(
+            &dir,
+            &format!("sleep 300 & echo $! > {}; wait", pidfile.display()),
+        );
+        let rx = start(&running, job(&spawner, "p2", &dir, String::new()), || {}).unwrap();
+        while std::fs::read_to_string(&pidfile).is_err() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(running.stop("p2"));
+        collect(rx).await;
+        let pid = std::fs::read_to_string(&pidfile).unwrap();
+        // シグナル 0 で確かめる（Linux 以外でも同じ）。止めた直後の回収待ち（Z）は止まったとみなす
+        let pid: libc::pid_t = pid.trim().parse().unwrap();
+        let alive = || {
+            // SAFETY: シグナル 0 は届くかを確かめるだけ
+            let exists = unsafe { libc::kill(pid, 0) } == 0;
+            exists
+                && !std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .is_ok_and(|st| st.contains(") Z "))
+        };
+        for _ in 0..100 {
+            if !alive() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!alive());
         // 新しく始めたセッションは、分かった ID でも止められる
         let script = fake(
             &dir,
@@ -1269,6 +1414,7 @@ read rest || true"#,
             assert_eq!(ev["rule"], "Bash(touch:*)");
             // 画面を開き直したときは、そのセッションの待っている問い合わせを取り直せる
             assert_eq!(running.asks("s-ask"), std::slice::from_ref(&ev));
+            assert_eq!(running.waiting_asks().get("s-ask"), Some(&1));
             assert!(running.asks("other").is_empty());
             running.answer("r1", allow, remember).unwrap();
             assert!(running.asks("s-ask").is_empty());
@@ -1289,6 +1435,8 @@ read rest || true"#,
         assert!(running.idle());
         // 入れ替えを始めたら、新しい実行は受け付けない。やめたら戻る
         assert!(running.begin_update());
+        // 入れ替えの最中に押し直しても、二重には始めない
+        assert!(!running.begin_update());
         assert!(running.claim("new").is_none());
         let refused =
             start(&running, job(&script, "s-up", &dir, String::new()), || {}).unwrap_err();

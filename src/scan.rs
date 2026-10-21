@@ -71,62 +71,130 @@ pub fn run(conn: &mut Connection) -> Result<usize> {
     Ok(n)
 }
 
+/// 読んだ記録の印（大きさ・更新時刻）と、セッションにしたもの（依頼が無ければ None）
+type Read = ((i64, i64), Option<Parsed>);
+
+/// 読めなかった記録があっても、ほかの記録は読み続ける（消えた・書きかけ・権限の無いもの）。
+/// 読めなかった数と最初の理由は `job_status` の scan に残して画面に出す
 fn run_at(conn: &mut Connection, roots: &Roots) -> Result<usize> {
     let mut resolver = Resolver::default();
-    let mut n = 0;
+    let (mut n, mut failed) = (0, Vec::new());
     for file in session_files(&roots.claude)? {
         let subagents = subagent_files(&file);
-        let fp = fingerprint(std::iter::once(&file).chain(&subagents))?;
-        if unchanged(conn, &file, fp)? {
-            continue;
-        }
-        let Some(mut p) = parse(&read(&file)?) else {
-            continue;
+        let read_one = |conn: &Connection| -> Result<Option<Read>> {
+            let fp = fingerprint(std::iter::once(&file).chain(&subagents))?;
+            if unchanged(conn, &file, fp)? {
+                return Ok(None);
+            }
+            let Some(mut p) = parse(&read(&file)?) else {
+                return Ok(Some((fp, None)));
+            };
+            for sub in &subagents {
+                add_usage(&mut p.usage, &read(sub)?, Kind::Subagent);
+            }
+            Ok(Some((fp, Some(p))))
         };
-        for sub in &subagents {
-            add_usage(&mut p.usage, &read(sub)?, Kind::Subagent);
+        match read_one(conn) {
+            Ok(Some((fp, Some(p)))) => {
+                let repo = repo_of(conn, &mut resolver, roots, &p)?;
+                store(conn, &file.to_string_lossy(), fp, &repo, &roots.machine, &p)?;
+                n += 1;
+            }
+            Ok(Some((fp, None))) => skip(conn, &file, fp)?,
+            Ok(None) => {}
+            Err(e) => failed.push(format!("{e:#}")),
         }
-        let repo = repo_of(&mut resolver, roots, &p.cwd);
-        store(conn, &file.to_string_lossy(), fp, &repo, &roots.machine, &p)?;
-        n += 1;
     }
     for file in codex::session_files(&roots.codex)? {
-        let fp = fingerprint(std::iter::once(&file))?;
-        if unchanged(conn, &file, fp)? {
-            continue;
-        }
-        let Some(p) = codex::parse(&read(&file)?) else {
-            continue;
+        let read_one = |conn: &Connection| -> Result<Option<Read>> {
+            let fp = fingerprint(std::iter::once(&file))?;
+            if unchanged(conn, &file, fp)? {
+                return Ok(None);
+            }
+            Ok(Some((fp, codex::parse(&read(&file)?))))
         };
-        let repo = repo_of(&mut resolver, roots, &p.cwd);
-        store(conn, &file.to_string_lossy(), fp, &repo, &roots.machine, &p)?;
-        n += 1;
+        match read_one(conn) {
+            Ok(Some((fp, Some(p)))) => {
+                let repo = repo_of(conn, &mut resolver, roots, &p)?;
+                store(conn, &file.to_string_lossy(), fp, &repo, &roots.machine, &p)?;
+                n += 1;
+            }
+            Ok(Some((fp, None))) => skip(conn, &file, fp)?,
+            Ok(None) => {}
+            Err(e) => failed.push(format!("{e:#}")),
+        }
     }
+    if let Some(first) = failed.first() {
+        eprintln!("[scan] could not read {} files: {first}", failed.len());
+    }
+    let error = failed
+        .first()
+        .map(|first| format!("could not read {} files: {first}", failed.len()));
+    crate::status::set(
+        conn,
+        &format!("scan{}", machine_suffix(&roots.machine)),
+        error.as_deref(),
+    )?;
     Ok(n)
 }
 
-/// 手元のセッションは git に聞いて本体に寄せる。別のマシンのものは手元に無いので、パスだけで寄せる
-fn repo_of(resolver: &mut Resolver, roots: &Roots, cwd: &str) -> String {
-    if roots.machine.is_empty() {
-        resolver.resolve(cwd)
+fn machine_suffix(machine: &str) -> String {
+    if machine.is_empty() {
+        String::new()
     } else {
-        repo::without_worktree(cwd)
+        format!(":{machine}")
     }
+}
+
+/// セッションにしなかった記録の印を残す（変わらなければ次から読まない）
+fn skip(conn: &Connection, file: &Path, (size, mtime): (i64, i64)) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO skipped_files (file, file_size, file_mtime) VALUES (?1, ?2, ?3)",
+        params![file.to_string_lossy(), size, mtime],
+    )?;
+    Ok(())
+}
+
+/// 手元のセッションは git に聞いて本体に寄せる。別のマシンのものは手元に無いので、パスだけで寄せる。
+/// 作業場所（worktree）が消えていて寄せ先が分からないときは、前に読んだときに寄せた先を使う
+/// （agent-calendar が切った worktree は置き場所の名前からは本体が分からない）
+fn repo_of(
+    conn: &Connection,
+    resolver: &mut Resolver,
+    roots: &Roots,
+    p: &Parsed,
+) -> Result<String> {
+    let repo = if roots.machine.is_empty() {
+        resolver.resolve(&p.cwd)
+    } else {
+        repo::without_worktree(&p.cwd)
+    };
+    // 別のマシンのセッションはパスだけで寄せている（手元のフォルダがあるかは関係ない）
+    if !roots.machine.is_empty() || repo != p.cwd || Path::new(&p.cwd).is_dir() {
+        return Ok(repo);
+    }
+    Ok(conn
+        .query_row(
+            "SELECT repo FROM sessions WHERE (id = ?1 OR cwd = ?2) AND machine = '' AND repo != cwd LIMIT 1",
+            params![p.id, p.cwd],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(repo))
 }
 
 fn read(file: &Path) -> Result<String> {
     std::fs::read_to_string(file).with_context(|| format!("cannot read {}", file.display()))
 }
 
-fn unchanged(conn: &Connection, file: &Path, fp: (i64, i64)) -> Result<bool> {
-    let known: Option<(i64, i64)> = conn
-        .query_row(
-            "SELECT file_size, file_mtime FROM sessions WHERE file = ?1",
-            [file.to_string_lossy()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    Ok(known == Some(fp))
+/// 前に読んだときと大きさ・更新時刻が同じか（セッションにしたものも、しなかったものも）
+fn unchanged(conn: &Connection, file: &Path, (size, mtime): (i64, i64)) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sessions WHERE file = ?1 AND file_size = ?2 AND file_mtime = ?3)
+             OR EXISTS (SELECT 1 FROM skipped_files WHERE file = ?1 AND file_size = ?2 AND file_mtime = ?3)",
+        params![file.to_string_lossy(), size, mtime],
+        |r| r.get(0),
+    )?)
 }
 
 fn subagent_files(session_file: &Path) -> Vec<PathBuf> {
@@ -185,6 +253,17 @@ pub struct Parsed {
     pub buckets: BTreeMap<i64, i64>,
     pub usage: BTreeMap<UsageKey, Tokens>,
     pub prompts: Vec<(i64, String)>,
+    /// エージェントの返答の文章（検索用。1 つずつ REPLY_CHARS で切る）
+    pub replies: Vec<String>,
+    /// エージェントの返答で終わっている（ツールを動かしている途中ではなく、こちらの次の指示を待っている）
+    pub waiting: bool,
+}
+
+/// 検索に入れる返答 1 つの長さの上限（長い出力で DB が膨らまないように）
+pub const REPLY_CHARS: usize = 2000;
+
+pub fn clip_reply(t: &str) -> String {
+    t.trim().chars().take(REPLY_CHARS).collect()
 }
 
 /// 発言が 1 つも無いファイル（開いてすぐ閉じたもの）は None
@@ -230,10 +309,22 @@ pub fn parse(text: &str) -> Option<Parsed> {
             if let Some(t) = prompt_text(&v) {
                 p.prompts.push((ts, t));
             }
+            p.waiting = false;
             continue;
         }
         if seen_msg.insert(v["message"]["id"].as_str().unwrap_or("").to_string()) {
             usage_rows(&v, ts, Kind::Main, &mut p.usage);
+        }
+        let blocks = v["message"]["content"].as_array();
+        p.waiting = blocks.is_some_and(|b| !b.iter().any(|x| x["type"] == "tool_use"));
+        for t in blocks
+            .into_iter()
+            .flatten()
+            .filter(|x| x["type"] == "text")
+            .filter_map(|x| x["text"].as_str())
+            .filter(|t| !t.trim().is_empty())
+        {
+            p.replies.push(clip_reply(t));
         }
     }
     if p.id.is_empty() || p.prompts.is_empty() {
@@ -339,10 +430,13 @@ pub fn prompt_text(v: &Value) -> Option<String> {
         let args = tag(&raw, "command-args").unwrap_or_default();
         return Some(format!("{cmd} {args}").trim().to_string());
     }
-    // origin を持たない古い記録では、別セッションからのメッセージを書き出しで見分ける
-    if raw.trim_start().starts_with('<')
-        || raw.starts_with("Caveat:")
-        || raw.starts_with("Another Claude session sent a message")
+    // origin を持たない古い記録では、自動で差し込まれた文・別セッションからのメッセージを書き出しで見分ける。
+    // 人が打ったと記録にあるもの（貼り付けだけの依頼は `<pasted_content …>` で始まる）は残す
+    let human = v["origin"]["kind"].as_str() == Some("human");
+    if !human
+        && (raw.trim_start().starts_with('<')
+            || raw.starts_with("Caveat:")
+            || raw.starts_with("Another Claude session sent a message"))
     {
         return None;
     }
@@ -372,18 +466,25 @@ fn store(
     p: &Parsed,
 ) -> Result<()> {
     let tx = conn.transaction()?;
-    for t in ["activity", "prompts", "usage"] {
+    tx.execute("DELETE FROM skipped_files WHERE file = ?1", [file])?;
+    for t in ["activity", "prompts", "usage", "texts"] {
         tx.execute(&format!("DELETE FROM {t} WHERE session_id = ?1"), [&p.id])?;
     }
     tx.execute(
         "INSERT OR REPLACE INTO sessions
-         (id, file, file_size, file_mtime, repo, cwd, branch, title, first_ts, last_ts, last_uuid, prompt_count, source, machine)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+         (id, file, file_size, file_mtime, repo, cwd, branch, title, first_ts, last_ts, last_uuid, prompt_count, source, machine, waiting)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
         params![
             p.id, file, size, mtime, repo, p.cwd, p.branch, p.title, p.first_ts, p.last_ts,
-            p.last_uuid, p.prompts.len() as i64, p.source, machine,
+            p.last_uuid, p.prompts.len() as i64, p.source, machine, p.waiting,
         ],
     )?;
+    for text in p.prompts.iter().map(|(_, t)| t).chain(&p.replies) {
+        tx.execute(
+            "INSERT INTO texts (session_id, text) VALUES (?1, ?2)",
+            params![p.id, text],
+        )?;
+    }
     for (bucket, n) in &p.buckets {
         tx.execute(
             "INSERT INTO activity (session_id, bucket, n) VALUES (?1, ?2, ?3)",
@@ -557,6 +658,86 @@ not json
             .query_row("SELECT COUNT(*) FROM prompts", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 3);
+        // 依頼の無い記録（empty.jsonl）は印だけ残し、変わらなければ読まない
+        let skipped: i64 = conn
+            .query_row("SELECT COUNT(*) FROM skipped_files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(skipped, 1);
+        // 読めない記録（UTF-8 でない）があっても、ほかは読み続け、数と理由を残す
+        std::fs::write(proj.join("broken.jsonl"), [0xff, 0xfe, 0x00]).unwrap();
+        let more = format!(
+            "{SAMPLE}{}\n",
+            r#"{"type":"user","sessionId":"s1","uuid":"u10","timestamp":"2026-10-03T02:00:00.000Z","message":{"content":"さらに続き"}}"#
+        );
+        std::fs::write(proj.join("s1.jsonl"), more).unwrap();
+        assert_eq!(run_at(&mut conn, &roots).unwrap(), 1);
+        let st = crate::status::all(&conn).unwrap();
+        assert_eq!(st[0]["name"], "scan");
+        assert!(
+            st[0]["error"]
+                .as_str()
+                .unwrap()
+                .starts_with("could not read 1 files")
+        );
+        std::fs::remove_file(proj.join("broken.jsonl")).unwrap();
+        run_at(&mut conn, &roots).unwrap();
+        assert!(crate::status::all(&conn).unwrap()[0]["error"].is_null());
+        // 依頼も返答も検索用に入る
+        let texts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM texts WHERE text LIKE '%さらに%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(texts, 1);
+    }
+
+    #[test]
+    fn keeps_the_repo_of_a_removed_worktree() {
+        let dir = db::temp_dir("scan-gone");
+        let proj = dir.join("projects/-x");
+        std::fs::create_dir_all(&proj).unwrap();
+        let gone = "/nonexistent/agent-calendar/worktrees/ab12-feature";
+        let mut conn = db::open_at(&dir.join("t.db")).unwrap();
+        // 前に読んだとき（worktree があったころ）は本体に寄せていた
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s1', 'old', 0, 0, '/r/app', ?1, 'feature', '', 0, 0, 'u', 1, 'claude', '', 0)",
+            [gone],
+        )
+        .unwrap();
+        std::fs::write(proj.join("s1.jsonl"), SAMPLE.replace("/r/a", gone)).unwrap();
+        let roots = Roots {
+            claude: dir.join("projects"),
+            codex: dir.join("codex"),
+            machine: String::new(),
+        };
+        assert_eq!(run_at(&mut conn, &roots).unwrap(), 1);
+        let repo: String = conn
+            .query_row("SELECT repo FROM sessions WHERE id = 's1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(repo, "/r/app");
+    }
+
+    #[test]
+    fn knows_when_the_agent_waits_for_the_next_instruction() {
+        let user = r#"{"type":"user","sessionId":"w","uuid":"a","timestamp":"2026-10-02T21:00:00.000Z","cwd":"/r","message":{"content":"直して"}}"#;
+        let tool = r#"{"type":"assistant","sessionId":"w","uuid":"b","timestamp":"2026-10-02T21:00:01.000Z","message":{"id":"m1","content":[{"type":"text","text":"見ます"},{"type":"tool_use","name":"Bash"}]}}"#;
+        let result = r#"{"type":"user","sessionId":"w","uuid":"c","timestamp":"2026-10-02T21:00:02.000Z","message":{"content":[{"type":"tool_result","content":"ok"}]}}"#;
+        let reply = r#"{"type":"assistant","sessionId":"w","uuid":"d","timestamp":"2026-10-02T21:00:03.000Z","message":{"id":"m2","content":[{"type":"text","text":"直しました"}]}}"#;
+        let p = parse(&[user, tool].join("\n")).unwrap();
+        assert!(!p.waiting); // ツールを動かしている途中
+        let p = parse(&[user, tool, result].join("\n")).unwrap();
+        assert!(!p.waiting);
+        let p = parse(&[user, tool, result, reply].join("\n")).unwrap();
+        assert!(p.waiting);
+        assert_eq!(p.replies, ["見ます", "直しました"]);
+        assert_eq!(
+            clip_reply(&"あ".repeat(REPLY_CHARS + 5)).chars().count(),
+            REPLY_CHARS
+        );
     }
 
     #[test]
@@ -589,6 +770,9 @@ not json
         assert_eq!(prompt_text(&peer), None);
         let human = serde_json::json!({"type":"user","origin":{"kind":"human"},"message":{"content":"直して"}});
         assert_eq!(prompt_text(&human).as_deref(), Some("直して"));
+        // 貼り付けだけの依頼は < で始まるが、人が打ったものなので残す
+        let pasted = serde_json::json!({"type":"user","origin":{"kind":"human"},"message":{"content":"<pasted_content id=\"a\">\n直して\n</pasted_content>"}});
+        assert!(prompt_text(&pasted).unwrap().contains("直して"));
         assert_eq!(
             prompt_text(&v("Another Claude session sent a message: x".into())),
             None

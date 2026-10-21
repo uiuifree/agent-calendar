@@ -14,7 +14,8 @@ const props = defineProps({
   colors: { type: Object, default: () => ({}) }, // リポジトリのパス → { slot }（いまカレンダーに出ている色）
   owner: { type: String, default: null }, // 選んでいる組織（URL に持つので App が覚える）
 })
-const emit = defineEmits(['open-session', 'open-settings', 'changed', 'update:owner'])
+// start-failed: 「ここで始める」が終わりに失敗した（会話に移ったあとや全画面でも見えるよう、App のヘッダーに出してもらう）
+const emit = defineEmits(['open-session', 'open-settings', 'changed', 'update:owner', 'start-failed'])
 
 const data = ref(null)
 const error = ref('')
@@ -22,16 +23,21 @@ const loading = ref(false)
 const query = ref('')
 const cloneRoot = ref('')
 const cloning = ref(null) // clone 中のリポジトリ（owner/name）
-const starting = ref(null) // 「ここで始める」を開いているリポジトリ
 const managing = ref(null) // メニュー（作業場所とブランチの片付け）を開いているリポジトリ
-// 始まって会話の画面へ移ったあとも、終わるまではダイアログを隠したまま残す（終わりの失敗の理由を受け取るため）
-const startHidden = ref(false)
-function closeStart() {
-  starting.value = null
-  startHidden.value = false
+// 「ここで始める」のダイアログ。始まって会話の画面へ移ったあとも、終わるまでは隠したまま残す（終わりの失敗の理由を受け取るため）。
+// 隠れて動いているあいだに別のリポジトリから押しても開けるように、1 つずつ持つ（見えているのは 1 つだけ。App の starts と同じ）
+const starts = ref([]) // [{ key, repo, hidden }]
+let startKey = 0
+function newStart(repo) {
+  starts.value = [...starts.value.filter((x) => x.hidden), { repo, key: ++startKey, hidden: false }]
 }
-function startFailed(text) {
-  error.value = t('repos.startFailed', { e: text })
+function closeStart(key) {
+  starts.value = starts.value.filter((x) => x.key !== key)
+}
+// 終わったら一覧を読み直してもらう（隠れて動いていたものは、そこで片付ける）
+function startRan(x) {
+  if (x.hidden) closeStart(x.key)
+  emit('changed')
 }
 
 const owner = computed({ get: () => props.owner, set: (o) => emit('update:owner', o) })
@@ -113,8 +119,8 @@ async function clone(r) {
 }
 
 // できたセッションを、記録が見えてから開く
-async function opened(id) {
-  startHidden.value = true
+async function opened(x, id) {
+  x.hidden = true
   await waitForSession(id)
   emit('changed')
   emit('open-session', id, 'conversation')
@@ -155,7 +161,10 @@ async function opened(id) {
 
     <template v-if="group">
       <p v-if="group.error" class="chip warn">{{ t('repos.failed', { owner: group.owner, e: group.error }) }}</p>
-      <p v-else-if="!group.repos.length" class="muted">{{ t('repos.empty') }}</p>
+      <template v-else>
+      <!-- 取り直せなかったが前の一覧はある。警告を一覧の上に出し、一覧もそのまま出す -->
+      <p v-if="group.stale" class="stale">{{ t('repos.stale', { e: group.stale }) }}</p>
+      <p v-if="!group.repos.length" class="muted">{{ t('repos.empty') }}</p>
       <template v-else>
         <h3 class="sec">{{ t('repos.onMachine') }} <span class="muted num">{{ shown.local.length }}</span></h3>
         <div v-if="shown.local.length" class="table">
@@ -172,6 +181,7 @@ async function opened(id) {
                 <a :href="r.url" target="_blank" rel="noopener noreferrer" :title="r.local">{{ r.name }}</a>
                 <span v-if="r.private" class="tag private">{{ t('repos.private') }}</span>
                 <span v-if="r.archived" class="tag">{{ t('repos.archived') }}</span>
+                <code v-if="r.current_branch" class="branch" :title="t('repos.currentBranch')">{{ r.current_branch }}</code>
               </span>
               <span v-if="r.description" class="desc">{{ r.description }}</span>
             </span>
@@ -181,7 +191,7 @@ async function opened(id) {
               <button v-if="r.sessions" class="link-btn" :aria-expanded="openRepo === r.local" @click="toggleSessions(r)">
                 {{ t('repos.sessions', { n: r.sessions }) }} {{ openRepo === r.local ? '▾' : '▸' }}
               </button>
-              <button class="btn small accent" @click="starting = r">{{ t('repos.start') }}</button>
+              <button class="btn small accent" @click="newStart(r)">{{ t('repos.start') }}</button>
               <button class="btn small more" :aria-label="t('repos.menu.open')" :title="t('repos.menu.open')" @click="managing = r">⋯</button>
             </span>
           </div>
@@ -221,16 +231,26 @@ async function opened(id) {
           </div>
         </div>
       </template>
+      </template>
     </template>
-    <RepoMenu v-if="managing" :repo="managing" @close="managing = null" @changed="emit('changed')" />
+    <RepoMenu
+      v-if="managing"
+      :repo="managing"
+      @close="managing = null"
+      @changed="emit('changed')"
+      @open-session="(id) => { managing = null; emit('open-session', id) }"
+    />
     <StartDialog
-      v-if="starting"
-      v-show="!startHidden"
-      :repo="starting"
-      @close="startHidden || closeStart()"
-      @opened="opened"
-      @failed="startFailed"
-      @ran="startHidden ? closeStart() : emit('changed')"
+      v-for="x in starts"
+      v-show="!x.hidden"
+      :key="x.key"
+      :repo="x.repo"
+      :hidden="x.hidden"
+      @close="x.hidden || closeStart(x.key)"
+      @hide="x.hidden = true"
+      @opened="(id) => opened(x, id)"
+      @failed="(text) => emit('start-failed', text)"
+      @ran="startRan(x)"
     />
   </div>
 </template>
@@ -263,6 +283,8 @@ async function opened(id) {
 .title a:hover{text-decoration:underline}
 .tag{flex:none; font-size:11px; color:var(--muted); border:1px solid var(--rule); border-radius:4px; padding:0 5px}
 .tag.private{color:var(--talk); border-color:var(--talk)}
+.branch{flex:none; max-width:14em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:11px; color:var(--ink-soft)}
+.stale{margin:0 0 8px; padding:8px 12px; border-radius:8px; background:#fef7e0; color:var(--talk); font-size:13px; white-space:pre-wrap; word-break:break-word}
 .dot{flex:none; width:10px; height:10px; border-radius:50%; border:2px solid var(--rule); box-sizing:border-box}
 .date.fresh{color:var(--accent); font-weight:500}
 .btn.accent{color:var(--accent); border-color:var(--accent)}

@@ -99,17 +99,28 @@ pub fn input(
             })
             .unwrap_or_default()
     };
+    let exclude = crate::settings::load(conn)?.summary_exclude;
     let mut out = vec![format!(
         "period: {} - {}",
         at(from * 1000),
         at(to * 1000 - 1)
     )];
+    let (mut len, mut left_out) = (out[0].chars().count(), 0);
     while let Some(r) = rows.next()? {
         let machine: String = r.get(6)?;
         if machines.is_some_and(|m| !m.contains(&machine)) {
             continue;
         }
         let repo: String = r.get(0)?;
+        // 要約しないと決めたリポジトリは、題も依頼も送らない
+        if exclude.contains(&repo) {
+            continue;
+        }
+        // 長すぎると時間もプランの使用量もかかり、モデルの入力の上限でも失敗するので、そこまでで切る
+        if len >= MAX_INPUT_CHARS {
+            left_out += 1;
+            continue;
+        }
         let summary = r
             .get::<_, Option<String>>(2)?
             .and_then(|b| summarize::read(&b));
@@ -134,10 +145,25 @@ pub fn input(
                 s.push_str(&format!("\n  left: {}", x.next));
             }
         }
+        // 1 件だけで残りを超えるなら、その件を切る（文字数で数える）
+        let room = MAX_INPUT_CHARS - len;
+        let n = s.chars().count();
+        if n > room {
+            s = s.chars().take(room).collect();
+        }
+        len += n.min(room);
         out.push(s);
+    }
+    if left_out > 0 {
+        out.push(format!(
+            "({left_out} more sessions in this period are not listed)"
+        ));
     }
     Ok((out.len() > 1).then(|| out.join("\n")))
 }
+
+/// 期間の要約に渡す本文の長さの目安（セッションの要約の上限と同じくらい）
+const MAX_INPUT_CHARS: usize = 80_000;
 
 /// 要約を作って保存する（同じ期間・同じ絞り込みのものは置き換える）
 pub fn make(
@@ -175,7 +201,7 @@ mod tests {
 
     fn session(conn: &Connection, id: &str, machine: &str, bucket: i64, body: Option<&str>) {
         conn.execute(
-            "INSERT INTO sessions VALUES (?1, ?1, 0, 0, '/r/app', '/r/app', 'main', 'AI の題', ?2, ?2, 'u1', 1, 'claude', ?3)",
+            "INSERT INTO sessions VALUES (?1, ?1, 0, 0, '/r/app', '/r/app', 'main', 'AI の題', ?2, ?2, 'u1', 1, 'claude', ?3, 0)",
             params![id, bucket * 1000, machine],
         )
         .unwrap();
@@ -250,6 +276,36 @@ exit {code}
             text.contains("題A") && text.contains("status: done") && !text.contains("left: push")
         );
         assert!(!text.contains("題B"), "{text}");
+        // 要約しないリポジトリは送らない
+        crate::settings::save(
+            &conn,
+            &crate::settings::Settings {
+                summary_exclude: vec!["/r/app".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(input(&conn, 0, 3000, None).unwrap(), None);
+        crate::settings::save(&conn, &crate::settings::Settings::default()).unwrap();
+        // 長すぎる分は数だけ添えて切る
+        let long = format!(
+            r#"{{"title":"長い","bullets":["{}"],"status":"done"}}"#,
+            "x".repeat(MAX_INPUT_CHARS)
+        );
+        session(&conn, "big", "", 2400, Some(&long));
+        session(&conn, "after", "", 2500, None);
+        let text = input(&conn, 0, 3000, None).unwrap().unwrap();
+        assert!(
+            text.ends_with("(1 more sessions in this period are not listed)"),
+            "{}",
+            &text[text.len() - 80..]
+        );
+        // 1 件だけで上限を超えても、渡す本文は上限まで
+        assert!(
+            text.chars().count() < MAX_INPUT_CHARS + 200,
+            "{}",
+            text.chars().count()
+        );
     }
 
     #[test]

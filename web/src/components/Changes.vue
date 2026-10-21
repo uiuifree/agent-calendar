@@ -1,18 +1,29 @@
 <script setup>
 import { computed, nextTick, ref, watch } from 'vue'
-import { getChanges, getDiff, imageUrl, masked } from '../api.js'
+import { getBranches, getChanges, getDiff, imageUrl, masked } from '../api.js'
 import { t } from '../i18n.js'
-import { isImage, patchRows, splitPath } from '../diffview.js'
+import { defaultBase, isImage, patchRows, splitPath } from '../diffview.js'
 
 // セッションの「変更」タブ。GitHub の Files changed と同じく、左にファイルの一覧、右にファイルごとの差分を並べる（見るだけ）。
-// 見る対象は、まだ commit していない変更か、セッション中のコミットのどれか
+// 見る対象は、まだ commit していない変更か、このブランチ全体（分かれたところから、いまの作業コピーまで。commit していない分も含む）か、
+// セッション中のコミットのどれか
 const props = defineProps({
   id: { type: String, required: true },
   commits: { type: Array, default: () => [] }, // [{ hash, subject, … }]
   github: { type: Object, default: null }, // { repo, … }（GitHub のリポジトリなら）
+  // 選んでいるコミット（v-model）。概要のコミットを押して開いたときは、そのコミットから見せる
+  commit: { type: String, default: '' },
 })
+const emit = defineEmits(['update:commit'])
 
-const source = ref('') // '' = まだ commit していない変更、それ以外はコミットのハッシュ
+// '' = まだ commit していない変更、BRANCH = このブランチ全体、それ以外はコミットのハッシュ
+const BRANCH = ':branch'
+const source = ref(props.commit)
+watch(source, (v) => emit('update:commit', v))
+watch(
+  () => props.commit,
+  (v) => (source.value = v),
+)
 const dir = ref('')
 const files = ref(null)
 const diffs = ref({}) // path → { rows, truncated } | { error }
@@ -20,16 +31,32 @@ const collapsed = ref({}) // path → true
 const failed = ref({}) // `${path}:${side}` → 出せなかったわけ（その側に無い・大きすぎるなど）
 const error = ref('')
 const loading = ref(false)
+// このブランチ全体で比べる相手。候補は作業場所のブランチの一覧（origin のものと手元のもの）。
+// 一覧を取れない（設定の組織のリポジトリでないなど）ときは origin/main だけ。既定は origin の既定のブランチ（default）
+const bases = ref(null)
+const base = ref('')
+async function loadBases(d) {
+  let origin = null
+  try {
+    const r = await getBranches(d)
+    bases.value = r.branches
+    origin = r.default
+  } catch {
+    bases.value = ['origin/main']
+  }
+  if (!bases.value.includes(base.value)) base.value = defaultBase(bases.value, origin) ?? ''
+}
+const against = () => ({ commit: source.value === BRANCH ? null : source.value || null, base: source.value === BRANCH ? base.value : null })
 
 // 差分は並べて取る（ファイルが多くても git を一度に起動しすぎないよう、同時に 6 つまで）。
 // 画像は差分の代わりに前と後を並べるので取らない
-async function loadDiffs(list, commit, token) {
+async function loadDiffs(list, { commit, base }, token) {
   const queue = list.filter((f) => !isImage(f.path))
   const worker = async () => {
     while (queue.length) {
       const f = queue.shift()
       try {
-        const r = await getDiff(props.id, f.path, commit)
+        const r = await getDiff(props.id, f.path, commit, base)
         if (token !== loadToken) return
         diffs.value = { ...diffs.value, [f.path]: { rows: patchRows(r.patch), truncated: r.truncated } }
       } catch (e) {
@@ -45,7 +72,7 @@ async function loadDiffs(list, commit, token) {
 let loadToken = 0
 async function load() {
   const token = ++loadToken
-  const commit = source.value || null
+  const on = against()
   loading.value = true
   error.value = ''
   files.value = null
@@ -53,22 +80,36 @@ async function load() {
   collapsed.value = {}
   failed.value = {}
   try {
-    const r = await getChanges(props.id, commit)
+    // このブランチ全体を見るのに、比べる相手がまだ決まっていなければ（作業場所が分かってから）先に決める
+    if (source.value === BRANCH && !base.value) {
+      if (!dir.value) dir.value = (await getChanges(props.id)).dir
+      await loadBases(dir.value)
+      if (token !== loadToken) return
+      // 比べる相手が 1 つも無ければ取らない（base を付けずに問い合わせると、まだ commit していない差分が返ってしまう）
+      if (!base.value) {
+        files.value = null
+        error.value = t('changes.noBase')
+        return
+      }
+      on.base = base.value
+    }
+    const r = await getChanges(props.id, on.commit, on.base)
     if (token !== loadToken) return
     dir.value = r.dir
     files.value = r.files
-    await loadDiffs(r.files, commit, token)
+    await loadDiffs(r.files, on, token)
   } catch (e) {
     if (token === loadToken) error.value = String(e.message ?? e)
   } finally {
     if (token === loadToken) loading.value = false
   }
 }
-watch([() => props.id, source], load, { immediate: true })
-watch(
-  () => props.id,
-  () => (source.value = ''),
-)
+// セッションが変わると SessionDetail が部品ごと作り直すので、ここで見るのは選び直しだけ
+watch(source, () => load())
+watch(base, (v, old) => old && source.value === BRANCH && load())
+// 作業場所が分かったら、比べる相手の候補を読んでおく（選択肢の文言に既定の相手の名前を出すため）
+watch(dir, (d) => d && !bases.value && loadBases(d))
+load()
 
 const totals = computed(() =>
   (files.value ?? []).reduce((a, f) => ({ added: a.added + (f.added ?? 0), removed: a.removed + (f.removed ?? 0) }), { added: 0, removed: 0 }),
@@ -86,8 +127,18 @@ async function jump(path) {
 // 画像を出せなかったら問い合わせ直して、その側に無い（404）のか、ほかの理由（大きすぎるなど）なのかを出す
 async function imageFailed(path, side) {
   const token = loadToken
-  const r = await fetch(imageUrl(props.id, path, source.value || null, side)).catch((e) => e)
-  const why = r instanceof Response ? (r.status === 404 ? t('changes.noImage') : await r.text()) : String(r.message ?? r)
+  const { commit, base: b } = against()
+  const url = imageUrl(props.id, path, commit, side, b)
+  const r = await fetch(url).catch((e) => e)
+  // サーバーのエラー文にはパスが入るので、スクショ用の表示では中身を出さない（api.js の j() と同じ）
+  const why =
+    r instanceof Response
+      ? r.status === 404
+        ? t('changes.noImage')
+        : masked
+          ? `${url.split('?')[0]}: ${r.status}`
+          : await r.text()
+      : String(r.message ?? r)
   if (token === loadToken) failed.value = { ...failed.value, [`${path}:${side}`]: why || t('changes.imageFailed') }
 }
 const toggle = (path) => (collapsed.value = { ...collapsed.value, [path]: !collapsed.value[path] })
@@ -98,12 +149,16 @@ const toggle = (path) => (collapsed.value = { ...collapsed.value, [path]: !colla
     <div class="bar">
       <select v-model="source" :aria-label="t('changes.source')">
         <option value="">{{ t('changes.working') }}</option>
+        <option :value="BRANCH">{{ t('changes.branch', { base: base || 'origin/main' }) }}</option>
         <option v-for="c in commits" :key="c.hash" :value="c.hash">{{ c.hash }} {{ c.subject }}</option>
+      </select>
+      <select v-if="source === BRANCH && bases?.length" v-model="base" :aria-label="t('changes.base')" :title="t('changes.base')">
+        <option v-for="b in bases" :key="b" :value="b">{{ b }}</option>
       </select>
       <span v-if="files" class="muted small">
         {{ t('changes.files', { n: files.length }) }} · <span class="add">+{{ totals.added }}</span> <span class="del">−{{ totals.removed }}</span>
       </span>
-      <a v-if="source && github" class="link small" :href="`${github.repo}/commit/${source}`" target="_blank" rel="noopener noreferrer">
+      <a v-if="source && source !== BRANCH && github" class="link small" :href="`${github.repo}/commit/${source}`" target="_blank" rel="noopener noreferrer">
         {{ t('changes.onGithub') }} ↗
       </a>
       <span class="spacer" />
@@ -111,7 +166,7 @@ const toggle = (path) => (collapsed.value = { ...collapsed.value, [path]: !colla
     </div>
     <p v-if="dir" class="muted small where"><code>{{ dir }}</code></p>
     <p v-if="error" class="chip warn">{{ error }}</p>
-    <p v-if="files && !files.length" class="muted">{{ source ? t('changes.emptyCommit') : t('changes.clean') }}</p>
+    <p v-if="files && !files.length" class="muted">{{ source === BRANCH ? t('changes.branchClean', { base }) : source ? t('changes.emptyCommit') : t('changes.clean') }}</p>
 
     <div v-if="files?.length" class="split">
       <nav class="tree" :aria-label="t('changes.files', { n: files.length })">
@@ -142,9 +197,9 @@ const toggle = (path) => (collapsed.value = { ...collapsed.value, [path]: !colla
                 <figcaption class="muted tiny">{{ t(`changes.${side}`) }}</figcaption>
                 <p v-if="failed[`${f.path}:${side}`]" class="muted small">{{ failed[`${f.path}:${side}`] }}</p>
                 <!-- 押すと原寸を別のタブで開く -->
-                <a v-else :href="imageUrl(id, f.path, source || null, side)" target="_blank" rel="noopener noreferrer">
+                <a v-else :href="imageUrl(id, f.path, against().commit, side, against().base)" target="_blank" rel="noopener noreferrer">
                   <img
-                    :src="imageUrl(id, f.path, source || null, side)"
+                    :src="imageUrl(id, f.path, against().commit, side, against().base)"
                     :alt="`${t(`changes.${side}`)}: ${f.path}`"
                     loading="lazy"
                     @error="imageFailed(f.path, side)"

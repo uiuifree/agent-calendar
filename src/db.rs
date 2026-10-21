@@ -19,7 +19,7 @@ pub fn open() -> Result<Connection> {
 /// 表の形の版。形を変えるときは **表を消さずに** ALTER で足し、読み直しが要るなら
 /// `UPDATE sessions SET file_size = -1` で次の scan に読ませる。Claude Code は古い記録を消す（cleanupPeriodDays）ので、
 /// 消した表は元の記録からは作り直せない
-const VERSION: i64 = 5;
+const VERSION: i64 = 6;
 
 pub fn open_at(p: &Path) -> Result<Connection> {
     if let Some(dir) = p.parent() {
@@ -57,6 +57,27 @@ pub fn open_at(p: &Path) -> Result<Connection> {
         if !has_column(&conn, "sessions", "machine")? {
             conn.execute(
                 "ALTER TABLE sessions ADD COLUMN machine TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        // 版 6: 返事待ちの印と検索用の文章を持つ。貼り付けだけの依頼を取りこぼしていたのも直したので、全部読み直す
+        if !has_column(&conn, "sessions", "waiting")? {
+            conn.execute(
+                "ALTER TABLE sessions ADD COLUMN waiting INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+            conn.execute("UPDATE sessions SET file_size = -1", [])?;
+            // 元の記録がもう消えたセッションは読み直せないので、残っている依頼を検索用の表に移す
+            // （読み直せたセッションは、読み直しのときに依頼と返答で入れ替わる）
+            conn.execute(
+                "INSERT INTO texts (session_id, text) SELECT session_id, text FROM prompts",
+                [],
+            )?;
+        }
+        // 版 6: 予定ごとに新しく始めるときのモデルを選べる（空なら CLI の既定）
+        if !has_column(&conn, "schedules", "model")? {
+            conn.execute(
+                "ALTER TABLE schedules ADD COLUMN model TEXT NOT NULL DEFAULT ''",
                 [],
             )?;
         }
@@ -125,9 +146,34 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_uuid     TEXT NOT NULL,   -- 最後の記録の印（Codex は行番号）。増えていれば要約し直す
     prompt_count  INTEGER NOT NULL,
     source        TEXT NOT NULL DEFAULT 'claude', -- claude / codex
-    machine       TEXT NOT NULL DEFAULT ''        -- 手元は空文字、--remote は ssh のホスト名
+    machine       TEXT NOT NULL DEFAULT '',       -- 手元は空文字、--remote は ssh のホスト名
+    waiting       INTEGER NOT NULL DEFAULT 0      -- エージェントの返答で終わっている（次の指示を待っている）
 );
 CREATE INDEX IF NOT EXISTS sessions_last ON sessions(last_ts);
+CREATE INDEX IF NOT EXISTS sessions_file ON sessions(file);
+-- 依頼とエージェントの返答の文章（検索用）。trigram なので日本語の途中の語でも LIKE で引ける
+CREATE VIRTUAL TABLE IF NOT EXISTS texts USING fts5(session_id UNINDEXED, text, tokenize = 'trigram');
+-- 読んだがセッションにしなかった記録（依頼が無い・Codex のサブエージェント）。変わらなければ読み直さない
+CREATE TABLE IF NOT EXISTS skipped_files (
+    file       TEXT PRIMARY KEY,
+    file_size  INTEGER NOT NULL,
+    file_mtime INTEGER NOT NULL
+);
+-- 要約に失敗したセッション。同じ記録のままなら、間を空けてからしかやり直さない
+CREATE TABLE IF NOT EXISTS summary_failures (
+    session_id TEXT PRIMARY KEY,
+    last_uuid  TEXT NOT NULL,
+    error      TEXT NOT NULL,
+    failed_at  INTEGER NOT NULL, -- unix ms
+    attempts   INTEGER NOT NULL
+);
+-- 裏の処理（読み直し・要約・別マシンの取り込み）の最後の結果。画面に出す
+CREATE TABLE IF NOT EXISTS job_status (
+    name     TEXT PRIMARY KEY,  -- scan / summarize / remote:<名前>
+    ok_at    INTEGER,           -- 最後にうまくいった時刻（unix ms）
+    error    TEXT,              -- 最後の失敗の理由。うまくいったら消す
+    error_at INTEGER
+);
 -- 10 分ごとの記録件数。帯の位置と濃さ、作業時間に使う（本体の記録だけ）
 CREATE TABLE IF NOT EXISTS activity (
     session_id TEXT NOT NULL,
@@ -192,7 +238,8 @@ CREATE TABLE IF NOT EXISTS schedules (
     enabled          INTEGER NOT NULL,
     next_at          INTEGER,
     last_session_id  TEXT,
-    created_at       INTEGER NOT NULL
+    created_at       INTEGER NOT NULL,
+    model            TEXT NOT NULL DEFAULT ''
 );
 -- 予定の実行の記録。status は running / ok / failed / missed / skipped
 CREATE TABLE IF NOT EXISTS schedule_runs (
@@ -267,7 +314,7 @@ mod tests {
         let p = temp_dir("db").join("t.db");
         let conn = open_at(&p).unwrap();
         conn.execute(
-            "INSERT INTO sessions VALUES ('t','',0,0,'','','','',0,0,'',0,'claude','')",
+            "INSERT INTO sessions VALUES ('t','',0,0,'','','','',0,0,'',0,'claude','',0)",
             [],
         )
         .unwrap();
@@ -302,6 +349,49 @@ mod tests {
             .query_row("SELECT source FROM sessions", [], |r| r.get(0))
             .unwrap();
         assert_eq!(src, "claude");
+    }
+
+    #[test]
+    fn migrates_v5_to_v6() {
+        let p = temp_dir("db-v5").join("t.db");
+        let old = Connection::open(&p).unwrap();
+        old.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, file TEXT NOT NULL, file_size INTEGER NOT NULL,
+             file_mtime INTEGER NOT NULL, repo TEXT NOT NULL, cwd TEXT NOT NULL, branch TEXT NOT NULL,
+             title TEXT NOT NULL, first_ts INTEGER NOT NULL, last_ts INTEGER NOT NULL,
+             last_uuid TEXT NOT NULL, prompt_count INTEGER NOT NULL,
+             source TEXT NOT NULL DEFAULT 'claude', machine TEXT NOT NULL DEFAULT '');
+             INSERT INTO sessions VALUES ('s','f',10,0,'','','','',0,0,'',1,'claude','');
+             CREATE TABLE prompts (session_id TEXT NOT NULL, seq INTEGER NOT NULL, ts INTEGER NOT NULL,
+             text TEXT NOT NULL, PRIMARY KEY (session_id, seq));
+             INSERT INTO prompts VALUES ('s', 0, 0, '消えた記録の依頼');
+             CREATE TABLE schedules (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, dir TEXT NOT NULL,
+             agent TEXT NOT NULL, mode TEXT NOT NULL, worktree INTEGER NOT NULL, continue_session INTEGER NOT NULL,
+             prompt TEXT NOT NULL, repeat TEXT NOT NULL, enabled INTEGER NOT NULL, next_at INTEGER,
+             last_session_id TEXT, created_at INTEGER NOT NULL);
+             PRAGMA user_version = 5;",
+        )
+        .unwrap();
+        drop(old);
+        let conn = open_at(&p).unwrap();
+        // 全部読み直させ、残っている依頼は検索できるようにする。予定にはモデルの列が増える
+        let (size, found, model): (i64, i64, bool) = conn
+            .query_row(
+                "SELECT (SELECT file_size FROM sessions),
+                        (SELECT COUNT(*) FROM texts WHERE text LIKE '%消えた%'),
+                        EXISTS (SELECT 1 FROM pragma_table_info('schedules') WHERE name = 'model')",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((size, found, model), (-1, 1, true));
+        // 開き直しても二重には移さない
+        drop(conn);
+        let conn = open_at(&p).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM texts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]

@@ -60,6 +60,24 @@ pub fn branches(dir: &str) -> Result<Vec<Branch>> {
         .collect())
 }
 
+/// base（`origin/main` など）にもう取り込まれている手元のブランチ（消してよいかの目安）
+pub fn merged(dir: &str, base: &str) -> Result<Vec<String>> {
+    if base.starts_with('-') {
+        anyhow::bail!("not a branch name: {base}");
+    }
+    let out = git(
+        dir,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "--merged",
+            base,
+            "refs/heads",
+        ],
+    )?;
+    Ok(out.lines().map(str::to_string).collect())
+}
+
 /// 予定用の作業場所のブランチ（`agent-calendar/schedule-<予定の ID>`）なら、その予定の ID
 pub fn schedule_of(branch: &str) -> Option<i64> {
     branch
@@ -130,6 +148,12 @@ mod tests {
         commit(&ahead, "y"); // main に取り込まれていない commit
         std::fs::write(Path::new(&dirty).join("left.txt"), "作業の途中").unwrap();
 
+        // main に取り込み済みのブランチ（ahead は main に無い commit がある）
+        let m = super::merged(r, "main").unwrap();
+        assert!(
+            m.contains(&"feature/merged".to_string()) && !m.contains(&"feature/ahead".to_string())
+        );
+        assert!(super::merged(r, "--evil").is_err());
         // 一覧: どこに出ているブランチかが分かる
         let list = branches(r).unwrap();
         let at = |name: &str| {

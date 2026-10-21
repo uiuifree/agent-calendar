@@ -61,6 +61,16 @@ pub fn find(cwd: &str, repo: &str) -> Option<Place> {
     pick(cwd, repo, &worktrees, &branches)
 }
 
+/// そのフォルダでいま出ているブランチ。ブランチの上にいない（detached）か git でなければ None
+pub fn current_branch(dir: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["-C", dir, "symbolic-ref", "--quiet", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !b.is_empty()).then_some(b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,12 +152,12 @@ mod tests {
         let conn = crate::db::open_at(&d.join("t.db")).unwrap();
         let here = d.to_str().unwrap();
         conn.execute(
-            "INSERT INTO sessions VALUES ('s', 's', 0, 0, ?1, ?1, '', '', 0, 0, 'u', 1, 'claude', '')",
+            "INSERT INTO sessions VALUES ('s', 's', 0, 0, ?1, ?1, '', '', 0, 0, 'u', 1, 'claude', '', 0)",
             [here],
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO sessions VALUES ('r', 'r', 0, 0, ?1, ?1, '', '', 0, 0, 'u', 1, 'claude', 'ai-node')",
+            "INSERT INTO sessions VALUES ('r', 'r', 0, 0, ?1, ?1, '', '', 0, 0, 'u', 1, 'claude', 'ai-node', 0)",
             [here],
         )
         .unwrap();

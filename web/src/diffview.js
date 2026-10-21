@@ -45,3 +45,10 @@ export function splitPath(path) {
   const i = path.lastIndexOf('/')
   return i < 0 ? { dir: '', name: path } : { dir: path.slice(0, i + 1), name: path.slice(i + 1) }
 }
+
+// 「このブランチ全体」で比べる相手の既定: origin の既定のブランチ（/api/repos/branches の default）が一覧にあればそれ、
+// 無ければ origin/main、origin/master、それも無ければ一覧の最初
+export function defaultBase(branches, origin = null) {
+  const first = origin ? [`origin/${origin}`] : []
+  return [...first, 'origin/main', 'origin/master'].find((b) => branches.includes(b)) ?? branches[0] ?? null
+}

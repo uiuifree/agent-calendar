@@ -1,6 +1,6 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
-import { getDirs, saveSchedule } from '../api.js'
+import { computed, onMounted, ref, watch } from 'vue'
+import { getDirs, getModels, saveSchedule } from '../api.js'
 import { useEscape } from '../dialog.js'
 import { locale, t } from '../i18n.js'
 import { ALL_DAYS, WEEKDAYS } from '../plans.js'
@@ -34,6 +34,7 @@ const form = ref({
   name: p?.name ?? '',
   dir: p?.dir ?? '',
   agent: p?.agent ?? 'claude',
+  model: p?.model ?? '', // 空なら CLI の既定
   mode: p?.mode ?? 'read',
   worktree: p?.worktree ?? false,
   continue_session: p?.continue_session ?? false,
@@ -47,6 +48,21 @@ const form = ref({
   from_hour: r.from_hour ?? 7,
   to_hour: r.to_hour ?? 22,
 })
+
+// モデルの候補（「ここで始める」と同じ。エージェントごと）。取れなくても既定のまま保存できる
+const models = ref({})
+onMounted(async () => {
+  try {
+    models.value = await getModels()
+  } catch {
+    models.value = {}
+  }
+})
+// エージェントを変えたら消す（Claude のモデル名を Codex に渡さない）
+watch(
+  () => form.value.agent,
+  () => (form.value.model = ''),
+)
 
 const dirs = ref([])
 onMounted(async () => {
@@ -83,6 +99,7 @@ async function save() {
       name: f.name,
       dir: f.dir,
       agent: f.agent,
+      model: f.model,
       mode: f.mode,
       worktree: f.worktree,
       continue_session: f.continue_session,
@@ -131,6 +148,16 @@ async function save() {
           </select>
         </label>
       </div>
+      <label class="field">
+        <span>{{ t('plans.form.model') }}</span>
+        <select v-model="form.model">
+          <option value="">{{ models[form.agent]?.cli_default ? t('repos.modelDefault', { name: models[form.agent].cli_default }) : t('repos.modelDefaultUnknown') }}</option>
+          <!-- 保存してある名前が候補に無くても選んだまま出す -->
+          <option v-if="form.model && !(models[form.agent]?.models ?? []).includes(form.model)" :value="form.model">{{ form.model }}</option>
+          <option v-for="m in models[form.agent]?.models ?? []" :key="m" :value="m">{{ m }}</option>
+        </select>
+        <small v-if="form.continue_session" class="muted small">{{ t('plans.form.modelContinue') }}</small>
+      </label>
       <label class="field">
         <span>{{ t('plans.form.prompt') }}</span>
         <textarea v-model="form.prompt" rows="4" />

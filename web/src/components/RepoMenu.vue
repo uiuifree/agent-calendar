@@ -9,10 +9,10 @@ import { locale, t } from '../i18n.js'
 const props = defineProps({
   repo: { type: Object, required: true }, // { name, local, … }
 })
-const emit = defineEmits(['close', 'changed'])
+const emit = defineEmits(['close', 'changed', 'open-session'])
 useEscape(() => emit('close'))
 
-const data = ref(null) // { worktrees, branches }
+const data = ref(null) // { worktrees, branches, base }
 const error = ref('')
 const note = ref('')
 const busy = ref(false)
@@ -71,6 +71,9 @@ async function del(b) {
   error.value = refused
 }
 
+const when = (ms) => new Date(ms).toLocaleString(locale(), { month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+const mergedTitle = () => (data.value?.base ? t('repos.menu.mergedInto', { base: data.value.base }) : null)
+
 // 消せない理由（消せるなら空）
 const worktreeBlock = (w) =>
   w.running ? t('repos.menu.running') : w.schedule != null ? t('repos.menu.usedBySchedule', { id: w.schedule }) : ''
@@ -95,6 +98,14 @@ const worktreeBlock = (w) =>
           <span class="what">
             <span class="name">{{ w.branch || t('repos.detached') }}</span>
             <code>{{ w.path }}</code>
+            <!-- 消してよいかの目安: 残っている変更・取り込み済みか・最後のセッション -->
+            <span class="facts small">
+              <span v-if="w.changes != null" :class="w.changes ? 'chip talk' : 'muted'">{{ w.changes ? t('repos.menu.changes', { n: w.changes }) : t('repos.menu.clean') }}</span>
+              <span v-if="w.merged" class="chip done" :title="mergedTitle()">{{ t('repos.menu.merged') }}</span>
+              <button v-if="w.last_session" class="link" @click="emit('open-session', w.last_session.id)">
+                {{ t('repos.menu.lastSession', { when: when(w.last_session.last_ts) }) }}
+              </button>
+            </span>
             <span v-if="worktreeBlock(w)" class="muted small">{{ worktreeBlock(w) }}</span>
           </span>
           <button class="btn small" :disabled="busy || !!worktreeBlock(w)" @click="remove(w)">{{ t('repos.menu.remove') }}</button>
@@ -103,7 +114,7 @@ const worktreeBlock = (w) =>
         <h3>{{ t('repos.menu.branches') }} <span class="muted num">{{ data.branches.length }}</span></h3>
         <div v-for="b in data.branches" :key="b.branch" class="item">
           <span class="what">
-            <span class="name">{{ b.branch }}</span>
+            <span class="name">{{ b.branch }} <span v-if="b.merged" class="chip done" :title="mergedTitle()">{{ t('repos.menu.merged') }}</span></span>
             <span v-if="b.checked_out" class="muted small">{{ t('repos.menu.checkedOut', { path: b.checked_out }) }}</span>
           </span>
           <button class="btn small" :disabled="busy || !!b.checked_out" @click="del(b)">{{ t('repos.menu.delete') }}</button>
@@ -133,5 +144,8 @@ h3{font-size:14px; font-weight:500; margin:20px 0 8px}
 .what{display:flex; flex-direction:column; gap:2px; min-width:0}
 .what code{font-size:12px; color:var(--ink-soft); overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
 .name{font-size:13px; font-weight:500; word-break:break-all}
+.facts{display:flex; flex-wrap:wrap; align-items:center; gap:6px}
+.facts .chip,.name .chip{height:20px; font-size:11px; padding:0 6px}
+.link{border:0; background:none; padding:0; color:var(--accent); font:inherit; cursor:pointer; text-decoration:underline; text-underline-offset:.2em}
 .actions{display:flex; justify-content:flex-end; gap:8px; margin-top:16px}
 </style>

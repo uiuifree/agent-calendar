@@ -73,6 +73,25 @@ pub fn parse(text: &str) -> Option<Parsed> {
                 {
                     p.prompts.push((ts, t));
                 }
+                // 返答（文章）で終わっていれば、こちらの次の指示を待っている。ツールの呼び出しや結果なら動いている途中
+                let reply = pl["type"] == "message" && pl["role"] == "assistant";
+                if pl["type"] == "message"
+                    || pl["type"].as_str().is_some_and(|t| t.contains("call"))
+                {
+                    p.waiting = reply;
+                }
+                if reply {
+                    for t in pl["content"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|c| c["type"] == "output_text")
+                        .filter_map(|c| c["text"].as_str())
+                        .filter(|t| !t.trim().is_empty())
+                    {
+                        p.replies.push(crate::scan::clip_reply(t));
+                    }
+                }
             }
             "event_msg" if pl["type"] == "token_count" => {
                 let total = tokens(&pl["info"]["total_token_usage"]);
@@ -213,6 +232,20 @@ mod tests {
         );
         assert_eq!(p.last_uuid, "9");
         assert_eq!(p.buckets.values().sum::<i64>(), 4);
+        // 返答で終わっているので次の指示を待っている。返答は検索用に入る
+        assert!(p.waiting);
+        assert_eq!(p.replies, ["直しました"]);
+        let calling = format!(
+            "{}\n{}",
+            sample(),
+            line(
+                "2026-09-16T23:26:00.000Z",
+                10,
+                "response_item",
+                serde_json::json!({"type": "function_call", "name": "shell"})
+            )
+        );
+        assert!(!parse(&calling).unwrap().waiting);
         // 累計の差分を枠ごとに。キャッシュ分は cache_read に分ける。同じ累計の繰り返しは数えない
         let mut all = Tokens::default();
         for t in p.usage.values() {

@@ -49,7 +49,7 @@ const day = computed(() => {
         <button class="row" @click="emit('select', e.session.id)">
           <i class="dot" :style="{ background: e.color }" />
           <span class="main">
-            <span class="title">{{ e.session.title || t('untitled') }}</span>
+            <span class="title"><span v-if="e.session.running" class="live" :title="t('running.mark')">▶</span> {{ e.session.title || t('untitled') }}</span>
             <span class="meta">
               <span class="num">{{ clock(e.start) }} – {{ clock(e.end) }}</span> · {{ e.name }}
             </span>

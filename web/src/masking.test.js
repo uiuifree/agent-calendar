@@ -126,3 +126,28 @@ it('レビューで見つかった漏れ: 案件・設定・大文字の名前�
   expect(cmd).toMatch(/^cd \/home\/me\/projects\/\S+ && claude --resume abc$/)
   expect(unmask(cmd.split(' ')[1])).toBe('/home/me/Secret Client')
 })
+
+it('利用枠・裏の処理・リポジトリの新しい項目', () => {
+  const limits = maskData({ agents: [{ agent: 'claude', plan: 'Max', windows: [{ kind: 'model', label: 'claude-opus-4', used_percent: 40 }] }] })
+  // 枠の名前（モデル名）は残す。ホストの label のように server にしない
+  expect(limits.agents[0].windows[0]).toEqual({ kind: 'model', label: 'claude-opus-4', used_percent: 40 })
+  expect(limits.agents[0].plan).toBe('Max')
+  // 裏の処理の名前は残し（ホストの id で突き合わせる）、失敗の理由は作り物にする
+  const status = maskData({ jobs: [{ name: 'remote:ai-node', ok_at: 1, error: 'ssh: secret-host refused', error_at: 2 }] })
+  expect(status.jobs[0].name).toBe('remote:ai-node')
+  expect(status.jobs[0].error).not.toContain('secret')
+  const repos = maskData({ groups: [{ owner: 'secret-org', stale: 'secret-org: rate limited', repos: [{ name: 'x', current_branch: 'secret-topic' }] }] })
+  expect(repos.groups[0].stale).not.toContain('secret')
+  expect(repos.groups[0].repos[0].current_branch).toMatch(/^feature\//)
+  expect(maskData({ base: 'origin/secret-main' }).base).toMatch(/^origin\/feature\//)
+  expect(maskData({ base: 'main' }).base).toBe('main')
+  expect(maskData({ summary_exclude: ['/home/u/secret-client'] }).summary_exclude[0]).not.toContain('secret')
+})
+
+it('作り物のブランチ名も本物に戻せる（「このブランチ全体」の比べる相手に選んだとき）', () => {
+  const b = maskData({ branches: ['origin/client-zeta/topic', 'client-zeta/topic', 'origin/main'] }).branches
+  expect(b[0]).toMatch(/^origin\/feature\//)
+  expect(unmask(b[0])).toBe('origin/client-zeta/topic')
+  expect(unmask(b[1])).toBe('client-zeta/topic')
+  expect(unmask(b[2])).toBe('origin/main')
+})

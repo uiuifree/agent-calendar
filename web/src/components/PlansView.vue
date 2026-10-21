@@ -1,15 +1,20 @@
 <script setup>
 import { onMounted, onUnmounted, ref, watch } from 'vue'
-import { deleteSchedule, getSchedules, runSchedule } from '../api.js'
+import { deleteSchedule, getSchedules, runSchedule, stopSchedule } from '../api.js'
 import { locale, t } from '../i18n.js'
 import { copyOf, describe } from '../plans.js'
 import PlanForm from './PlanForm.vue'
+import PlanHistory from './PlanHistory.vue'
 
 // 予定の一覧。最近の実行の結果から、そのセッション（会話）を開ける
 const props = defineProps({
   version: { type: Number, required: true }, // 読み直すたびに増える
+  running: { type: Array, default: () => [] }, // いま動いている予定の id（App が /api/running から）
 })
-const emit = defineEmits(['open-session', 'changed']) // changed: 予定が変わった（カレンダーを読み直す）
+// changed: 予定が変わった（カレンダーを読み直す）。running: 動いているものが変わった（App に取り直してもらう）
+const emit = defineEmits(['open-session', 'changed', 'running'])
+// 「すべての実行」を開いている予定
+const history = ref({})
 
 const plans = ref([])
 const error = ref('')
@@ -37,10 +42,24 @@ onUnmounted(() => clearInterval(timer))
 const when = (ms) => new Date(ms).toLocaleString(locale(), { month: 'numeric', day: 'numeric', weekday: 'short', hour: 'numeric', minute: '2-digit' })
 const shortDir = (d) => d.split('/').filter(Boolean).slice(-2).join('/')
 
+// 前の回がまだ動いている・端末で開いているなどで動かさなかったときは、サーバーの理由がそのまま出る
 async function runNow(p) {
   try {
     await runSchedule(p.id)
     notice.value = t('plans.started')
+    emit('running')
+    await load()
+  } catch (e) {
+    error.value = String(e.message ?? e)
+  }
+}
+
+async function stop(p) {
+  if (!window.confirm(t('plans.stopConfirm', { name: p.name }))) return
+  try {
+    await stopSchedule(p.id)
+    notice.value = t('plans.stopped')
+    emit('running')
     await load()
   } catch (e) {
     error.value = String(e.message ?? e)
@@ -49,8 +68,12 @@ async function runNow(p) {
 
 async function remove(p) {
   if (!window.confirm(t('plans.removeConfirm', { name: p.name }))) return
-  await deleteSchedule(p.id)
-  emit('changed')
+  try {
+    await deleteSchedule(p.id)
+    emit('changed')
+  } catch (e) {
+    error.value = String(e.message ?? e)
+  }
 }
 
 async function saved() {
@@ -78,6 +101,7 @@ async function saved() {
           </div>
         </div>
         <div class="actions">
+          <button v-if="running.includes(p.id)" class="btn stop" @click="stop(p)">{{ t('plans.stop') }}</button>
           <button class="btn" @click="runNow(p)">{{ t('plans.runNow') }}</button>
           <button class="btn" @click="editing = p">{{ t('plans.edit') }}</button>
           <button class="btn" @click="editing = copyOf(p)">{{ t('plans.copy') }}</button>
@@ -87,6 +111,7 @@ async function saved() {
       <div class="meta">
         <code :title="p.dir">{{ shortDir(p.dir) }}</code>
         <span class="chip src">{{ t(`source.${p.agent}`) }}</span>
+        <span v-if="p.model" class="chip src">{{ p.model }}</span>
         <span class="chip src">{{ t({ read: 'conv.modeRead', edit: 'conv.modeEdit', auto: 'conv.modeAuto' }[p.mode] ?? 'conv.modeRead') }}</span>
         <span v-if="p.worktree" class="chip src">worktree</span>
         <span class="chip src">{{ p.continue_session ? t('plans.form.continueSession') : t('plans.form.newSession') }}</span>
@@ -99,10 +124,18 @@ async function saved() {
         <div v-for="r in p.runs" :key="r.id" class="run">
           <span class="muted num">{{ when(r.started_at) }}</span>
           <span class="chip" :class="r.status">{{ t(`plans.status.${r.status}`) }}</span>
-          <span class="sum">{{ r.summary }}</span>
+          <!-- 1 行に収まらない結果も読めるように、押すと全文を開く -->
+          <details v-if="r.summary" class="sum">
+            <summary :title="r.summary">{{ r.summary }}</summary>
+          </details>
+          <span v-else />
           <span v-if="r.branch && r.changes" class="muted small">{{ t('plans.changes', { n: r.changes, branch: r.branch }) }}</span>
           <button v-if="r.session_id" class="link" @click="emit('open-session', r.session_id)">{{ t('plans.openSession') }}</button>
         </div>
+      </details>
+      <details class="runs" @toggle="history = { ...history, [p.id]: $event.target.open }">
+        <summary>{{ t('plans.history') }}</summary>
+        <PlanHistory v-if="history[p.id]" :id="p.id" :key="p.id" :version="version" @open-session="(id) => emit('open-session', id)" />
       </details>
     </article>
 
@@ -121,11 +154,15 @@ h3{font-size:16px; font-weight:500; margin:0}
 .when b{font-weight:500; color:var(--accent)}
 .actions{display:flex; gap:6px}
 .actions .btn{height:32px; padding:0 12px}
+.actions .btn.stop{color:var(--warn); border-color:var(--warn)}
 .meta{display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin:8px 0 4px; font-size:12px}
 .prompt{margin:6px 0; white-space:pre-wrap; color:var(--ink-soft); font-size:13px; max-height:4.8em; overflow:hidden}
 .runs summary{cursor:pointer; font-size:13px; font-weight:500; display:flex; align-items:center; gap:8px}
 .run{display:grid; grid-template-columns:auto auto minmax(0, 1fr) auto auto; gap:10px; align-items:center; padding:6px 0; border-top:1px solid var(--rule-soft); font-size:13px}
-.run .sum{min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.run .sum{min-width:0}
+.run .sum summary{display:block; font-weight:400; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; cursor:pointer; list-style:none}
+.run .sum summary::-webkit-details-marker{display:none}
+.run .sum[open] summary{white-space:pre-wrap; word-break:break-word}
 .chip.ok{color:var(--done)}
 .chip.running{color:var(--wip)}
 .chip.failed,.chip.missed{color:var(--warn)}

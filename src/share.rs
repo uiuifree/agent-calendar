@@ -89,6 +89,28 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
 }
 
+/// 先頭 len バイトのハッシュ。少しずつ読む（画像の入った大きな記録を丸ごとメモリに載せない）
+pub fn sha256_prefix(r: &mut impl Read, len: u64) -> std::io::Result<String> {
+    let mut h = Sha256::new();
+    let copied = std::io::copy(&mut r.take(len), &mut HashWriter(&mut h))?;
+    if copied < len {
+        return Err(std::io::ErrorKind::UnexpectedEof.into());
+    }
+    Ok(hex(&h.finalize()))
+}
+
+struct HashWriter<'a>(&'a mut Sha256);
+
+impl std::io::Write for HashWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// PEM の証明書から DER を取り出す（指紋は DER のハッシュ）
 fn rustls_pemfile_der(pem: &str) -> Result<Vec<u8>> {
     use rustls::pki_types::{CertificateDer, pem::PemObject};
@@ -225,17 +247,24 @@ fn list(home: &Path) -> Result<Vec<Entry>> {
     Ok(out)
 }
 
+/// 読めないフォルダ・途中で消えたファイルは飛ばす（1 つのせいで一覧ごと失敗して、取り込みが全部止まらないように）
 fn walk(root: &Path, dir: &Path, name: &str, out: &mut Vec<Entry>) -> Result<()> {
-    for e in std::fs::read_dir(dir)? {
-        let e = e?;
-        let ft = e.file_type()?;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for e in entries.flatten() {
+        let Ok(ft) = e.file_type() else {
+            continue;
+        };
         let p = e.path();
         // シンボリックリンクはたどらない（外に出られないように）
         if ft.is_dir() {
             walk(root, &p, name, out)?;
-        } else if ft.is_file() && p.extension().is_some_and(|x| x == "jsonl") {
+        } else if ft.is_file()
+            && p.extension().is_some_and(|x| x == "jsonl")
+            && let Ok(meta) = e.metadata()
+        {
             let rel = p.strip_prefix(root)?.to_string_lossy().into_owned();
-            let meta = e.metadata()?;
             out.push(Entry {
                 path: format!("{name}/{rel}"),
                 size: meta.len(),
@@ -315,12 +344,8 @@ fn read_from(home: &Path, q: &FileQuery) -> std::result::Result<Vec<u8>, ReadErr
     if q.offset > len {
         return Err(ReadError::Mismatch);
     }
-    if q.offset > 0 {
-        let mut head = vec![0u8; q.offset as usize];
-        f.read_exact(&mut head)?;
-        if sha256_hex(&head) != q.prefix {
-            return Err(ReadError::Mismatch);
-        }
+    if q.offset > 0 && sha256_prefix(&mut f, q.offset)? != q.prefix {
+        return Err(ReadError::Mismatch);
     }
     f.seek(SeekFrom::Start(q.offset))?;
     let mut out = Vec::new();
@@ -427,6 +452,12 @@ mod tests {
             read_from(&h, &q(99, "")),
             Err(ReadError::Mismatch)
         ));
+        // 先頭のハッシュは少しずつ読んで求める。足りなければ失敗
+        assert_eq!(
+            sha256_prefix(&mut &b"line1\nline2\n"[..], 6).unwrap(),
+            sha256_hex(b"line1\n")
+        );
+        assert!(sha256_prefix(&mut &b"li"[..], 6).is_err());
         let bad = FileQuery {
             path: "x".into(),
             offset: 0,

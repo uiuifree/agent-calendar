@@ -1,9 +1,23 @@
+<script>
+import { reactive } from 'vue'
+
+// 書きかけの指示と付けた画像（セッション ID ごと）。概要・変更のタブへ切り替えると会話の部品は作り直されるので、
+// 部品の外に持って、戻ったときに続きから書けるようにする。送ったら空にする。
+// sending は送っている最中の数（その間は空でも捨てない。作り直された部品が捨てると、断られたときに戻す先が無くなる）
+const drafts = new Map() // id → { text, attachments: [{ file, url }], sending }
+function draftFor(id) {
+  if (!drafts.has(id)) drafts.set(id, reactive({ text: '', attachments: [], sending: 0 }))
+  return drafts.get(id)
+}
+</script>
+
 <script setup>
 import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import { getAsks, getTranscript, sendInstruction, stopInstruction } from '../api.js'
 import { locale, t } from '../i18n.js'
 import { renderMarkdown } from '../markdown.js'
 import { MAX_IMAGES, pickImages, toPayload } from '../images.js'
+import { canDrop, restoredText, sendOutcome } from '../drafts.js'
 import { rememberedMode } from '../remembered.js'
 import PermissionAsk from './PermissionAsk.vue'
 
@@ -18,6 +32,10 @@ const props = defineProps({
   remote: { type: Boolean, default: false },
   // セッションの最後の記録の時刻。変わったら履歴を読み直す（隠れていたタブに戻ったとき、見ていないあいだに進んだ分を出す）
   stamp: { type: Number, default: 0 },
+  // 表示中のタブ（ほかのタブを見ているあいだは隠れているだけ）。許可の問い合わせは表示中のときだけ見に行く
+  active: { type: Boolean, default: true },
+  // 送ったときに動く場所 { path, gone, branch }（gone = 記録の作業場所が消えていて、path はリポジトリの本体）。古いサーバー・別のマシンでは無い
+  workdir: { type: Object, default: null },
 })
 const emit = defineEmits(['sent'])
 
@@ -92,7 +110,8 @@ watch(
 )
 
 // 送る
-const prompt = ref('')
+const draft = computed(() => draftFor(props.id))
+const prompt = computed({ get: () => draft.value.text, set: (v) => (draft.value.text = v) })
 // ここから送っている最中は読み直さない（終わったときに読み直す）。書きかけの指示はそのまま残る
 watch(
   () => props.stamp,
@@ -101,10 +120,11 @@ watch(
 const mode = rememberedMode() // 許可の範囲。既定は自動判定で、前回選んだものを覚えている
 const running = ref(false)
 const live = ref([]) // 実行中に届いた途中経過
-const canSend = computed(() => !props.blocked && !running.value && prompt.value.trim().length > 0)
+// 送っている最中かは預かりで見る（タブを切り替えて作り直された部品からも、二重に送らない）
+const canSend = computed(() => !props.blocked && !running.value && !draft.value.sending && prompt.value.trim().length > 0)
 
-// 付ける画像。貼り付け（Ctrl+V）とドロップで足し、× で外す。送ったら空にする
-const attachments = ref([]) // [{ file, url }]
+// 付ける画像。貼り付け（Ctrl+V）とドロップで足し、× で外す。送ったら空にする（書きかけの指示と一緒に部品の外に持つ）
+const attachments = computed({ get: () => draft.value.attachments, set: (v) => (draft.value.attachments = v) }) // [{ file, url }]
 const attachError = ref('')
 function addImages(files) {
   const { accepted, error } = pickImages([...files], attachments.value.length)
@@ -123,16 +143,24 @@ function removeImage(i) {
   URL.revokeObjectURL(attachments.value[i].url)
   attachments.value.splice(i, 1)
 }
-function clearImages() {
-  for (const a of attachments.value) URL.revokeObjectURL(a.url)
-  attachments.value = []
-  attachError.value = ''
+// 部品が外れても書きかけは残す（画像の URL も戻ったときに使うので revoke しない）。空なら預かりを捨てる。
+// 送っている最中は捨てない（預かりの sending を見るので、送った部品とは別の、作り直された部品からでも捨てない）
+function leave(id) {
+  const d = drafts.get(id)
+  if (d && canDrop(d)) drafts.delete(id)
 }
-watch(() => props.id, clearImages)
-onUnmounted(clearImages)
+watch(
+  () => props.id,
+  (_, old) => {
+    leave(old)
+    attachError.value = ''
+  },
+)
+onUnmounted(() => leave(props.id))
 
 // 答えを待っている許可の問い合わせ。画面を切り替えたり別のタブから送ったりして、途中経過の流れを
-// 持っていないときも答えられるように、開いているあいだは数秒おきに見に行く（いま流れている分は除く）
+// 持っていないときも答えられるように、開いているあいだは数秒おきに見に行く（いま流れている分は除く）。
+// 隠れているタブと、別のマシンのセッション（ここでは答えられない）では見に行かない
 const waiting = ref([])
 async function pollAsks() {
   try {
@@ -142,11 +170,22 @@ async function pollAsks() {
     // 見に行けなくても会話は読める
   }
 }
-const askTimer = setInterval(pollAsks, 3000)
-watch(() => props.id, pollAsks, { immediate: true })
+let askTimer = null
+watch(
+  [() => props.active, () => props.remote, () => props.id],
+  ([on, remote]) => {
+    clearInterval(askTimer)
+    askTimer = null
+    if (!on || remote) return
+    pollAsks()
+    askTimer = setInterval(pollAsks, 3000)
+  },
+  { immediate: true },
+)
 onUnmounted(() => {
   clearInterval(askTimer)
   clearInterval(follow)
+  clearTimeout(copiedTimer)
 })
 
 async function send() {
@@ -155,12 +194,17 @@ async function send() {
   const chosen = mode.value // 実行中に選び直しても、送った指示の許可の範囲は変えない
   running.value = true
   // 送る画像は入力欄から外し、送り終わるまで会話の側に見せておく。実行中も次の指示を書いて画像を足せる
-  const sending = attachments.value
-  attachments.value = []
+  const id = props.id // 送っているあいだにタブを切り替えて部品が作り直されても、戻す先はこのセッションの書きかけ
+  const d = draft.value
+  d.sending++
+  const sending = d.attachments
+  d.attachments = []
   attachError.value = ''
   live.value = [{ kind: 'user', text, images: sending.map((a) => a.url) }]
-  prompt.value = ''
+  d.text = ''
   await scrollDown()
+  // サーバーから途中経過（session・text・tool など、終わりの知らせ以外）が届いたか。届かずに失敗したら、断られたものとして入力欄に戻す
+  let progressed = false
   try {
     const images = await Promise.all(sending.map((a) => toPayload(a.file)))
     await sendInstruction(
@@ -168,6 +212,7 @@ async function send() {
       text,
       chosen,
       async (ev) => {
+        if (ev.kind !== 'done') progressed = true
         live.value.push(ev)
         await scrollDown()
       },
@@ -179,10 +224,33 @@ async function send() {
     running.value = false
     // 記録に追記された分を読み直す（途中経過の表示は履歴に置き換わる）
     const ended = live.value.at(-1)
+    const { failed, rejected } = sendOutcome(ended, progressed)
+    d.sending--
+    // 送れなかった指示と画像は入力欄に戻す（画像の URL はそのまま使うので revoke しない）。実行中に書き足した分は後ろに残す。
+    // 戻す先は預かりにある今のもの（送っている最中は捨てないので、ふつうは送ったときと同じもの）
+    if (rejected) {
+      const now = draftFor(id)
+      now.text = restoredText(text, now.text)
+      now.attachments = [...sending, ...now.attachments]
+    }
     await load()
-    live.value = ended?.kind === 'done' && !ended.ok ? [ended] : []
-    for (const a of sending) URL.revokeObjectURL(a.url)
+    live.value = failed ? [ended] : []
+    if (!rejected) for (const a of sending) URL.revokeObjectURL(a.url)
     emit('sent')
+  }
+}
+
+// エージェントの返答をコピーする。押したら少しのあいだ「コピーしました」にする
+const copiedKey = ref(null)
+let copiedTimer
+async function copyReply(key, text) {
+  try {
+    await navigator.clipboard.writeText(text)
+    copiedKey.value = key
+    clearTimeout(copiedTimer)
+    copiedTimer = setTimeout(() => (copiedKey.value = null), 2000)
+  } catch (e) {
+    error.value = t('detail.copyFailed', { e })
   }
 }
 
@@ -229,6 +297,7 @@ function onKey(e) {
         </div>
         <div v-else-if="it.kind === 'assistant'" class="msg agent">
           <div class="md" v-html="renderMarkdown(it.text)" />
+          <button class="copy" @click="copyReply(`h${start + i}`, it.text)">{{ copiedKey === `h${start + i}` ? t('conv.copied') : t('conv.copy') }}</button>
         </div>
         <details v-else-if="it.kind === 'tool_use'" class="tool">
           <summary><span class="name">{{ it.name }}</span> <span class="arg">{{ it.text.split('\n')[0] }}</span></summary>
@@ -246,7 +315,10 @@ function onKey(e) {
           <div class="bubble">{{ ev.text }}</div>
           <div v-if="ev.images?.length" class="thumbs sent"><img v-for="u in ev.images" :key="u" :src="u" alt="" /></div>
         </div>
-        <div v-else-if="ev.kind === 'text'" class="msg agent"><div class="md" v-html="renderMarkdown(ev.text)" /></div>
+        <div v-else-if="ev.kind === 'text'" class="msg agent">
+          <div class="md" v-html="renderMarkdown(ev.text)" />
+          <button class="copy" @click="copyReply(`l${i}`, ev.text)">{{ copiedKey === `l${i}` ? t('conv.copied') : t('conv.copy') }}</button>
+        </div>
         <div v-else-if="ev.kind === 'tool'" class="tool flat"><span class="name">{{ ev.name }}</span> <span class="arg">{{ ev.text }}</span></div>
         <PermissionAsk v-else-if="ev.kind === 'permission'" :ask="ev" />
         <p v-else-if="ev.kind === 'done' && ev.stopped" class="chip">{{ t('conv.stopped') }}</p>
@@ -260,6 +332,9 @@ function onKey(e) {
       <p v-if="blocked" class="muted small">{{ blocked }}</p>
       <!-- 送れないあいだも書ける（実行中に次の指示やメモを書きためておく）。送るのは終わってから -->
       <template v-if="!remote">
+        <p v-if="workdir?.gone" class="chip warn gone">
+          {{ workdir.branch ? t('conv.workdirGone', { branch: workdir.branch }) : t('conv.workdirGoneNoBranch') }}
+        </p>
         <textarea v-model="prompt" rows="3" :placeholder="t('conv.placeholder')" @keydown="onKey" @paste="onPaste" />
         <div v-if="attachments.length" class="thumbs">
           <span v-for="(a, i) in attachments" :key="a.url" class="thumb">
@@ -323,6 +398,11 @@ function onKey(e) {
 .tool.result summary{background:none; border:1px solid var(--rule-soft)}
 .tool pre{margin:4px 0 0; padding:8px; max-height:320px; overflow:auto; background:var(--panel); border-radius:6px; white-space:pre-wrap; word-break:break-word; font-size:12px}
 .running{margin:8px 0}
+/* 返答のコピー。乗せたときだけ目立たせる（読む邪魔をしない） */
+.copy{border:0; background:none; padding:2px 0; margin-top:4px; font:inherit; font-size:12px; color:var(--muted); cursor:pointer}
+.copy:hover{color:var(--accent); text-decoration:underline}
+/* 作業場所が消えている知らせ。長い文なので折り返す */
+.gone{height:auto; padding:4px 10px; margin:0 0 8px; white-space:normal; line-height:1.5}
 .thumbs{display:flex; flex-wrap:wrap; gap:8px; margin-top:8px}
 .thumbs.sent{justify-content:flex-end; margin-top:4px}
 .thumbs img{display:block; width:72px; height:72px; object-fit:cover; border:1px solid var(--rule); border-radius:8px}

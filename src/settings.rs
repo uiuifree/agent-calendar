@@ -25,7 +25,13 @@ pub struct Settings {
     /// 新しい版があれば、エージェントが何も動いていないときに勝手に入れ替えて再起動する
     #[serde(default)]
     pub auto_update: bool,
+    /// 要約しない（記録を `claude -p` に送らない）リポジトリの絶対パス。カレンダーと集計には出る
+    #[serde(default)]
+    pub summary_exclude: Vec<String>,
 }
+
+/// 要約しないリポジトリはこの数まで
+const MAX_EXCLUDE: usize = 200;
 
 fn yes() -> bool {
     true
@@ -45,6 +51,7 @@ impl Default for Settings {
             repo_roots: Vec::new(),
             update_check: true,
             auto_update: false,
+            summary_exclude: Vec::new(),
         }
     }
 }
@@ -72,6 +79,22 @@ impl Settings {
         }
         if self.github_owners.len() > MAX_LIST || self.repo_roots.len() > MAX_LIST {
             bail!("up to {MAX_LIST} owners and {MAX_LIST} folders");
+        }
+        // `.` や `..` を含むパスは、記録のパスとそろわず効かないので断る
+        let plain = |r: &str| {
+            let p = std::path::Path::new(r);
+            p.is_absolute()
+                && p.components().all(|c| {
+                    !matches!(
+                        c,
+                        std::path::Component::CurDir | std::path::Component::ParentDir
+                    )
+                })
+        };
+        if self.summary_exclude.len() > MAX_EXCLUDE
+            || !self.summary_exclude.iter().all(|r| plain(r))
+        {
+            bail!("up to {MAX_EXCLUDE} repositories, each as an absolute path, can skip summaries");
         }
         let mut seen = std::collections::HashSet::new();
         for o in &self.github_owners {
@@ -123,6 +146,17 @@ pub fn load(conn: &Connection) -> Result<Settings> {
 }
 
 pub fn save(conn: &Connection, s: &Settings) -> Result<()> {
+    // 要約しないリポジトリは、記録のリポジトリのパスと文字のまま比べるので、末尾の / を落としてそろえる
+    let mut s = s.clone();
+    for r in &mut s.summary_exclude {
+        let trimmed = r.trim().trim_end_matches('/');
+        *r = if trimmed.is_empty() {
+            r.trim().to_string()
+        } else {
+            trimmed.to_string()
+        };
+    }
+    let s = &s;
     s.validate()?;
     conn.execute(
         "INSERT INTO settings (key, value) VALUES ('auto', ?1)
@@ -182,9 +216,21 @@ mod tests {
             repo_roots: vec![root.to_string_lossy().into_owned()],
             update_check: false,
             auto_update: true,
+            summary_exclude: vec!["/home/u/secret-client".into()],
         };
         save(&conn, &mine).unwrap();
         assert_eq!(load(&conn).unwrap(), mine);
+        // 末尾の / は落としてそろえる
+        let slash = Settings {
+            summary_exclude: vec!["/home/u/secret-client/ ".into()],
+            ..mine.clone()
+        };
+        save(&conn, &slash).unwrap();
+        assert_eq!(
+            load(&conn).unwrap().summary_exclude,
+            ["/home/u/secret-client"]
+        );
+        save(&conn, &mine).unwrap();
         for bad in [
             Settings {
                 start_hour: 24,
@@ -220,6 +266,18 @@ mod tests {
             },
             Settings {
                 github_owners: (0..21).map(|i| format!("o{i}")).collect(),
+                ..mine.clone()
+            },
+            Settings {
+                summary_exclude: vec!["relative/repo".into()],
+                ..mine.clone()
+            },
+            Settings {
+                summary_exclude: vec!["/home/u/../secret".into()],
+                ..mine.clone()
+            },
+            Settings {
+                summary_exclude: (0..201).map(|i| format!("/r{i}")).collect(),
                 ..mine.clone()
             },
             Settings {
